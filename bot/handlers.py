@@ -1,6 +1,7 @@
 """Telegram update handlers."""
 
 import logging
+import os
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.error import Conflict, NetworkError, TimedOut
@@ -40,7 +41,8 @@ HELP_TEXT = """Available commands:
 /start - Start the bot
 /help - Show help
 /about - Show bot information
-/ping - Check bot status"""
+/ping - Check bot status
+/gold - Gold (XAUUSD) analysis"""
 
 DYNAMIC_CALLBACK_PREFIX = "command:"
 
@@ -134,13 +136,16 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
     message = update.effective_message
     if message is None:
         return
 
-    del context
     await message.reply_text("pong")
-async def gold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+
+async def gold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
     message = update.effective_message
     if message is None:
         return
@@ -149,6 +154,25 @@ async def gold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🥇 Gold Analysis\n"
         "Send me an XAUUSD chart screenshot and I will analyze it."
     )
+
+
+async def gold_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Receive a chart screenshot. Plug your analysis logic in here."""
+    del context
+    message = update.effective_message
+    if message is None or not message.photo:
+        return
+
+    # message.photo is a list of sizes; the last one is the largest.
+    photo = message.photo[-1]
+    logger.info("Received chart photo file_id=%s", photo.file_id)
+
+    # TODO: download the file (await photo.get_file()) and send it to your
+    # analysis service / vision API, then reply with the result.
+    await message.reply_text(
+        "Chart received ✅\nThe analysis engine is not connected yet."
+    )
+
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -180,6 +204,8 @@ async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await ping(update, context)
         elif target == "start":
             await start(update, context)
+        elif target == "gold":
+            await gold_command(update, context)
         else:
             command = commands.lookup(target)
             if command is None:
@@ -251,7 +277,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.warning("Transient Telegram error: %s", error)
         return
 
-    logger.exception("Error while processing update: %s", update, exc_info=error)
+    logger.error("Error while processing update: %s", update, exc_info=error)
 
     if isinstance(update, Update) and update.effective_message:
         await update.effective_message.reply_text(
@@ -261,9 +287,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def set_bot_commands(application: Application) -> None:
     """Publish the built-in commands plus any panel-managed ones to Telegram."""
-    menu = list(BOT_COMMANDS) + commands.menu_commands()
+    menu = list(BOT_COMMANDS) + list(commands.menu_commands())
     await application.bot.set_my_commands(menu)
-
 
 
 def register_handlers(application: Application) -> None:
@@ -283,15 +308,30 @@ def register_handlers(application: Application) -> None:
     application.add_handler(
         MessageHandler(filters.Regex(f"^({MENU_HELP}|{MENU_ABOUT}|{MENU_PING})$"), menu_button)
     )
+    application.add_handler(MessageHandler(filters.PHOTO, gold_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_message))
+    application.add_error_handler(error_handler)
 
 
 def main() -> None:
-        
-    application = Application.builder().token(BOT_TOKEN).build()    
-    register(application)    
-    application.run_polling()
+    logging.basicConfig(
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+        level=logging.INFO,
+    )
 
-if  __name__ == "__main__":
-    
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("BOT_TOKEN environment variable is not set.")
+
+    application = (
+        Application.builder()
+        .token(token)
+        .post_init(set_bot_commands)
+        .build()
+    )
+    register_handlers(application)
+    application.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
     main()
