@@ -288,10 +288,10 @@ def register_handlers(application: Application) -> None:
 
     def main() -> None:
 
-    application = Application.builder().token(BOT_TOKEN).build()
-    register(application)
-    application.run_polling()
+        application = Application.builder().token(BOT_TOKEN).build()
+        register(application)
+        application.run_polling()
 
-if __name__ == "__main__":
+    if  __name__ == "__main__":
 
     main()
