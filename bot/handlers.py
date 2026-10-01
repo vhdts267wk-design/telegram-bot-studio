@@ -285,11 +285,11 @@ def register_handlers(application: Application) -> None:
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_message))
 
-    
+
 def main() -> None:
-    
-    application = Application.builder().token(BOT_TOKEN).build()
-    register(application)
+        
+    application = Application.builder().token(BOT_TOKEN).build()    
+    register(application)    
     application.run_polling()
 
 if  __name__ == "__main__":
