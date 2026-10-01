@@ -265,12 +265,13 @@ async def set_bot_commands(application: Application) -> None:
     await application.bot.set_my_commands(menu)
 
 
+
 def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("about", about))
     application.add_handler(CommandHandler("ping", ping))
-    application.add_handler(CommandHandler("gold", gold))
+    application.add_handler(CommandHandler("gold", gold_command))
     application.add_handler(
         CallbackQueryHandler(
             dynamic_command_button,
@@ -283,3 +284,14 @@ def register_handlers(application: Application) -> None:
         MessageHandler(filters.Regex(f"^({MENU_HELP}|{MENU_ABOUT}|{MENU_PING})$"), menu_button)
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_message))
+
+
+    def main() -> None:
+
+    application = Application.builder().token(BOT_TOKEN).build()
+    register(application)
+    application.run_polling()
+
+if __name__ == "__main__":
+
+    main()
