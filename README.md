@@ -12,6 +12,7 @@ Docker, and Railway.
 
 - Persistent chat menu buttons after `/start`
 - `/start`, `/help`, `/about`, and `/ping` commands
+- `/gold` and screenshot explanations for XAUUSD chart education (OpenAI required)
 - Echo replies for normal text messages
 - Fallback handler for unknown commands
 - Error logging
@@ -58,9 +59,19 @@ Telegram bots cannot display custom buttons before a user starts or messages the
 | `/help`  | Show available commands          |
 | `/about` | Show short bot information       |
 | `/ping`  | Check whether the bot is running |
+| `/gold`  | Explain a visible XAUUSD chart for education |
 
 The built-in commands above always take precedence. Any other `/command` is
 resolved dynamically from commands you create in Telegram Bot Studio.
+
+For chart explanations, set `OPENAI_API_KEY` in Railway's service variables or
+your local `.env`, then send a clear XAUUSD screenshot. Every photo sent to the
+bot is handled as a chart request and is sent to OpenAI when the key is configured.
+The bot uses the async Responses API with `gpt-4.1-mini` by default, a documented
+[vision model](https://developers.openai.com/api/docs/models/gpt-4.1-mini).
+It explains visible trends, support/resistance, and conditional scenarios for
+education, without trade instructions or live-price claims. Unreadable labels
+must be acknowledged. Never paste credentials into Telegram or commit `.env`.
 
 ## Telegram Bot Studio
 
@@ -126,6 +137,8 @@ and all state-changing forms are CSRF-protected. Always use a strong
 | Name           | Required | Default | Description                                        |
 | -------------- | -------- | ------- | -------------------------------------------------- |
 | `BOT_TOKEN`        | Yes | -       | Bot token from `@BotFather`                                   |
+| `OPENAI_API_KEY`   | For charts | - | OpenAI API key; missing key disables chart explanations only |
+| `OPENAI_MODEL`     | No | `gpt-4.1-mini` | Image-capable Responses API model available to your OpenAI project |
 | `DATABASE_URL`     | For panel | -  | PostgreSQL connection string; required when `PANEL_PASSWORD` is set |
 | `PANEL_PASSWORD`   | No  | -       | Enables Telegram Bot Studio when set; password to sign in     |
 | `PANEL_USERNAME`   | No  | `admin` | Username for Telegram Bot Studio                              |
