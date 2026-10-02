@@ -2,6 +2,8 @@
 
 import logging
 import os
+import base64
+from openai import OpenAI
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.error import Conflict, NetworkError, TimedOut
@@ -167,11 +169,21 @@ async def gold_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     photo = message.photo[-1]
     logger.info("Received chart photo file_id=%s", photo.file_id)
 
-    # TODO: download the file (await photo.get_file()) and send it to your
-    # analysis service / vision API, then reply with the result.
-    await message.reply_text(
-        "Chart received ✅\nThe analysis engine is not connected yet."
-    )
+   telegram_file = await photo.get_file()
+image_bytes = await telegram_file.download_as_bytearray()
+image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+response = client.responses.create(
+    model="gpt-6-luna",
+    input=[
+        {"role": "user", "content": [
+            {"type": "input_text", "text": "Analyze this XAUUSD chart for educational purposes. Identify the visible trend, support and resistance, and bullish and bearish scenarios. Do not give personalized buy or sell instructions."},
+            {"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_b64}"},
+            ]},
+        ],
+)
+analysis = response.output_text
+await message.reply_text(analysis)
 
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
