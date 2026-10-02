@@ -27,6 +27,10 @@ def configure_logging(level_name: str) -> None:
         format="%(asctime)s %(name)s [%(levelname)s] %(message)s",
         level=level,
     )
+    # HTTP request logs can include Telegram URLs containing BOT_TOKEN.
+    # SDK debug logs can include uploaded image contents.
+    for name in ("httpx", "httpcore", "httpx2", "httpcore2", "openai"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 async def _connect_database(url: str, *, required: bool):
