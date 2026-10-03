@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs
 
 import httpx
-from openai import APIConnectionError
+import httpx2
+from openai import APIConnectionError, InternalServerError, RateLimitError
 from telegram import Update
 from telegram.error import NetworkError, TelegramError
 from telegram.request import HTTPXRequest
@@ -177,6 +178,123 @@ class GoldPhotoTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(sensitive_detail, output)
         self.assertNotIn(self.api_key, output)
         self.client_manager.__aexit__.assert_awaited_once()
+
+    def provider_status_error(self, code, *, status=429):
+        request = httpx2.Request(
+            "POST",
+            "https://private-user:private-password@local.invalid/PRIVATE_REQUEST_URL",
+            headers={"Authorization": "Bearer PRIVATE_REQUEST_TOKEN"},
+        )
+        response = httpx2.Response(
+            status,
+            request=request,
+            headers={
+                "x-request-id": "PRIVATE_REQUEST_ID",
+                "x-private": "PRIVATE_RESPONSE_HEADER",
+            },
+        )
+        error_class = RateLimitError if status == 429 else InternalServerError
+        return error_class(
+            "PRIVATE_ERROR_MESSAGE test-only-api-key",
+            response=response,
+            body={
+                "message": "PRIVATE_RESPONSE_BODY test-only-api-key",
+                "code": code,
+                "type": "PRIVATE_ERROR_TYPE",
+                "param": "PRIVATE_ERROR_PARAM",
+            },
+        )
+
+    def assert_provider_content_is_private(self, output):
+        for private in (
+            "PRIVATE_",
+            "private-user",
+            "private-password",
+            "local.invalid",
+            self.api_key,
+        ):
+            self.assertNotIn(private, output)
+
+    async def test_documented_quota_codes_are_safe_and_do_not_suggest_waiting(self):
+        for code in (
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+        ):
+            with self.subTest(code=code):
+                self.context.bot_data.clear()
+                self.message.reply_text.reset_mock()
+                self.client.responses.create.side_effect = self.provider_status_error(code)
+                with self.assertLogs(handlers.logger, level="WARNING") as captured:
+                    await handlers.gold_photo(self.update, self.context)
+                self.assert_nonempty_fallback()
+                log = "\n".join(captured.output)
+                self.assertIn("RateLimitError; status=429; code=" + code, log)
+                reply = self.replies()[0]
+                self.assertIn("credits or usage limits", reply)
+                self.assertNotIn("try again later", reply)
+                self.assert_provider_content_is_private(log + reply)
+
+    async def test_documented_throttle_codes_recommend_waiting_safely(self):
+        for code in ("rate_limit_exceeded", "slow_down"):
+            with self.subTest(code=code):
+                self.context.bot_data.clear()
+                self.message.reply_text.reset_mock()
+                self.client.responses.create.side_effect = self.provider_status_error(code)
+                with self.assertLogs(handlers.logger, level="WARNING") as captured:
+                    await handlers.gold_photo(self.update, self.context)
+                self.assert_nonempty_fallback()
+                log = "\n".join(captured.output)
+                self.assertIn("RateLimitError; status=429; code=" + code, log)
+                reply = self.replies()[0]
+                self.assertIn("temporarily rate limited", reply)
+                self.assert_provider_content_is_private(log + reply)
+
+    async def test_documented_overload_code_retains_generic_feedback(self):
+        self.client.responses.create.side_effect = self.provider_status_error(
+            "server_is_overloaded", status=503
+        )
+        with self.assertLogs(handlers.logger, level="WARNING") as captured:
+            await handlers.gold_photo(self.update, self.context)
+        log = "\n".join(captured.output)
+        self.assertIn("InternalServerError; status=503; code=server_is_overloaded", log)
+        self.assertIn("temporarily unavailable", self.replies()[0])
+        self.assert_provider_content_is_private(log + self.replies()[0])
+
+    async def test_unexpected_provider_codes_are_not_logged_or_echoed(self):
+        for code in (
+            "rate_limit_exceeded\nPRIVATE_MALICIOUS_CODE test-only-api-key",
+            "PRIVATE_UNRECOGNIZED_CODE",
+            {"PRIVATE_BODY_CODE": self.api_key},
+            None,
+        ):
+            with self.subTest(code_type=type(code).__name__):
+                self.context.bot_data.clear()
+                self.message.reply_text.reset_mock()
+                self.client.responses.create.side_effect = self.provider_status_error(code)
+                with self.assertLogs(handlers.logger, level="WARNING") as captured:
+                    await handlers.gold_photo(self.update, self.context)
+                log = "\n".join(captured.output)
+                self.assertIn("RateLimitError; status=429; code=unavailable", log)
+                self.assertIn("temporarily unavailable", self.replies()[0])
+                self.assert_provider_content_is_private(log + self.replies()[0])
+
+    async def test_invalid_status_metadata_is_not_logged_or_used_for_feedback(self):
+        for status in ("PRIVATE_STATUS", 9999, True, None):
+            with self.subTest(status_type=type(status).__name__):
+                self.context.bot_data.clear()
+                self.message.reply_text.reset_mock()
+                error = self.provider_status_error("insufficient_quota")
+                error.status_code = status
+                self.client.responses.create.side_effect = error
+                with self.assertLogs(handlers.logger, level="WARNING") as captured:
+                    await handlers.gold_photo(self.update, self.context)
+                log = "\n".join(captured.output)
+                self.assertIn("status=unavailable; code=insufficient_quota", log)
+                self.assertIn("temporarily unavailable", self.replies()[0])
+                self.assert_provider_content_is_private(log + self.replies()[0])
 
     async def test_telegram_download_failure_redacts_private_file_url(self):
         private_url = "https://api.telegram.org/file/botFAKE_BOT_TOKEN/private.jpg"
