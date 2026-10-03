@@ -23,7 +23,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: codestorm-official/telegram-bot-studio
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   publish:
@@ -52,6 +52,8 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
             type=semver,pattern={{version}}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
       - name: Build and push image
         id: build
