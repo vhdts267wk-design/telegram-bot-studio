@@ -12,11 +12,16 @@ class AuthRedirect(Exception):
     """Raised by login_required to bounce unauthenticated users to /login."""
 
 
+def _constant_time_equals(left: str, right: str) -> bool:
+    """Compare UTF-8 bytes so non-ASCII input cannot crash authentication."""
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
 def check_credentials(request: Request, username: str, password: str) -> bool:
     """Constant-time check of submitted credentials against configured ones."""
     settings = request.app.state.settings
-    user_ok = hmac.compare_digest(username or "", settings.panel_username)
-    pass_ok = hmac.compare_digest(password or "", settings.panel_password)
+    user_ok = _constant_time_equals(username or "", settings.panel_username)
+    pass_ok = _constant_time_equals(password or "", settings.panel_password)
     # Evaluate both before returning to avoid short-circuit timing differences.
     return user_ok and pass_ok
 
@@ -39,5 +44,5 @@ def get_csrf_token(request: Request) -> str:
 def verify_csrf(request: Request, submitted: str | None) -> None:
     """Validate a submitted CSRF token against the session token."""
     expected = request.session.get("csrf", "")
-    if not expected or not hmac.compare_digest(expected, submitted or ""):
+    if not expected or not _constant_time_equals(expected, submitted or ""):
         raise HTTPException(status_code=400, detail="Invalid CSRF token. Reload and retry.")

@@ -5,13 +5,14 @@ table in Postgres and, after every change, refreshes the in-process command
 registry and the Telegram command menu so updates take effect immediately.
 """
 
+import asyncio
 import logging
 import re
 from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
@@ -34,7 +35,7 @@ _BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
 
 NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
-BUILTIN_COMMANDS = ("start", "help", "about", "ping")
+BUILTIN_COMMANDS = commands.BUILTIN_COMMANDS
 login_limiter = LoginRateLimiter()
 
 
@@ -79,8 +80,8 @@ async def _refresh(request: Request) -> None:
     await commands.reload(application.bot_data.get(DB_KEY))
     try:
         await set_bot_commands(application)
-    except Exception:  # menu refresh is best-effort; never fail the request on it
-        logger.exception("Failed to refresh Telegram command menu.")
+    except Exception as exc:  # menu refresh is best-effort; never fail the request on it
+        logger.warning("Failed to refresh Telegram command menu (%s).", type(exc).__name__)
 
 
 def _validate(
@@ -150,6 +151,18 @@ def create_app(application, settings) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz():
+        updater = application.updater
+        if not application.running or updater is None or not updater.running:
+            return JSONResponse({"status": "unavailable"}, status_code=503)
+        pool = application.bot_data.get(DB_KEY)
+        if pool is None:
+            return JSONResponse({"status": "unavailable"}, status_code=503)
+        try:
+            async with asyncio.timeout(3):
+                await pool.fetchval("SELECT 1")
+        except Exception as exc:
+            logger.warning("Readiness database check failed (%s).", type(exc).__name__)
+            return JSONResponse({"status": "unavailable"}, status_code=503)
         return {"status": "ok"}
 
     @app.get("/login", response_class=HTMLResponse)
