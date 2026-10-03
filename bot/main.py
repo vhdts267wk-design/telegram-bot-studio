@@ -9,9 +9,9 @@ from telegram.ext import Application, ApplicationBuilder
 
 from bot import commands, db
 from bot.config import Settings
+from bot.logging_utils import configure_logging
 from bot.handlers import (
     DB_KEY,
-    error_handler,
     register_handlers,
     set_bot_commands,
 )
@@ -19,18 +19,6 @@ from bot.panel.app import create_app
 
 
 logger = logging.getLogger(__name__)
-
-
-def configure_logging(level_name: str) -> None:
-    level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(
-        format="%(asctime)s %(name)s [%(levelname)s] %(message)s",
-        level=level,
-    )
-    # HTTP request logs can include Telegram URLs containing BOT_TOKEN.
-    # SDK debug logs can include uploaded image contents.
-    for name in ("httpx", "httpcore", "httpx2", "httpcore2", "openai"):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 async def _connect_database(url: str, *, required: bool):
@@ -49,8 +37,11 @@ async def _connect_database(url: str, *, required: bool):
             raise RuntimeError(
                 "PostgreSQL connection failed. Check DATABASE_URL in the bot "
                 "service and confirm the Railway Postgres service is running."
-            ) from exc
-        logger.exception("PostgreSQL unavailable - running without persistence.")
+            ) from None
+        logger.warning(
+            "PostgreSQL unavailable - running without persistence (%s).",
+            type(exc).__name__,
+        )
         return None
 
 
@@ -63,9 +54,11 @@ def build_application(settings: Settings) -> Application:
         await commands.reload(application.bot_data[DB_KEY])
         try:
             await set_bot_commands(application)
-        except Exception:
+        except Exception as exc:
             # A rejected menu must not stop the bot from starting.
-            logger.exception("Failed to publish command menu on startup.")
+            logger.warning(
+                "Failed to publish command menu on startup (%s).", type(exc).__name__
+            )
 
     async def on_shutdown(application: Application) -> None:
         pool = application.bot_data.get(DB_KEY)
@@ -80,7 +73,6 @@ def build_application(settings: Settings) -> Application:
         .build()
     )
     register_handlers(application)
-    application.add_error_handler(error_handler)
     return application
 
 
@@ -106,6 +98,7 @@ async def _run_with_panel(application: Application, settings: Settings) -> None:
             host="0.0.0.0",
             port=settings.port,
             log_level=settings.log_level.lower(),
+            log_config=None,
             access_log=False,
         )
         server = uvicorn.Server(config)
@@ -136,4 +129,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    configure_logging()
+    try:
+        main()
+    except Exception as exc:
+        logger.error("Bot stopped (%s). Check the service configuration.", type(exc).__name__)
+        raise SystemExit(1) from None

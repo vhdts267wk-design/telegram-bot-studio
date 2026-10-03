@@ -3,6 +3,8 @@
 import base64
 import logging
 import os
+from dataclasses import dataclass, field
+from time import monotonic
 
 from openai import AsyncOpenAI, OpenAIError
 
@@ -18,14 +20,18 @@ from telegram.ext import (
 )
 
 from bot import commands, db
+from bot.logging_utils import configure_logging
 
 
 logger = logging.getLogger(__name__)
 
 # Keys used to read shared connections from Application.bot_data.
 DB_KEY = "db"
+GOLD_ADMISSION_KEY = "gold_admission"
 
 GOLD_MODEL = "gpt-4.1-mini"
+GOLD_MAX_ACTIVE = 2
+GOLD_COOLDOWN_SECONDS = 30.0
 # 2,000 Python characters stay below Telegram's limit even with emoji
 # represented by two UTF-16 code units.
 TELEGRAM_TEXT_CHUNK_SIZE = 2000
@@ -43,6 +49,13 @@ Use concise plain text, and end with an educational, not financial advice notice
 
 # Message counts are intentionally process-local and reset after a redeploy.
 _LOCAL_MESSAGE_COUNTS: dict[int, int] = {}
+
+
+@dataclass
+class _GoldAdmission:
+    active_users: set[int] = field(default_factory=set)
+    request_times: dict[int, float] = field(default_factory=dict)
+
 
 BOT_COMMANDS = (
     ("start", "Show the main menu"),
@@ -179,7 +192,6 @@ async def gold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def gold_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Download a Telegram photo and explain its chart using async vision."""
-    del context
     message = update.effective_message
     if message is None or not message.photo:
         return
@@ -192,6 +204,41 @@ async def gold_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
+    # Admission is per application and checked before the first await, so
+    # background photo tasks cannot oversubscribe the provider or the same user.
+    admission = context.bot_data.setdefault(GOLD_ADMISSION_KEY, _GoldAdmission())
+    user = update.effective_user
+    actor_id = user.id if user is not None else message.chat_id
+    now = monotonic()
+    admission.request_times = {
+        actor: stamp
+        for actor, stamp in admission.request_times.items()
+        if now - stamp < GOLD_COOLDOWN_SECONDS
+    }
+    if actor_id in admission.active_users:
+        await message.reply_text(
+            "Your previous chart is still being analyzed. Please wait for its reply."
+        )
+        return
+    if actor_id in admission.request_times:
+        await message.reply_text("Please wait 30 seconds between chart requests.")
+        return
+    if len(admission.active_users) >= GOLD_MAX_ACTIVE:
+        await message.reply_text(
+            "Chart analysis is busy. Please try again in a moment."
+        )
+        return
+
+    admission.active_users.add(actor_id)
+    admission.request_times[actor_id] = now
+    try:
+        await _analyze_gold_photo(message, api_key)
+    finally:
+        # Release even if a task is canceled during shutdown or a reply fails.
+        admission.active_users.discard(actor_id)
+
+
+async def _analyze_gold_photo(message, api_key: str) -> None:
     # Telegram photo sizes are JPEGs; the last entry is the largest.
     try:
         telegram_file = await message.photo[-1].get_file()
@@ -240,6 +287,13 @@ async def gold_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await message.reply_text(
             "Chart analysis is temporarily unavailable. Please try again later. "
             "If it persists, the bot owner should check OpenAI access and billing."
+        )
+        return
+
+    if response.status != "completed":
+        logger.warning("Chart analysis did not complete.")
+        await message.reply_text(
+            "The chart explanation could not be completed. Please try again later."
         )
         return
 
@@ -365,9 +419,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Error while processing update (%s).", type(error).__name__)
 
     if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text(
-            "Sorry, an error occurred while processing your message."
-        )
+        try:
+            await update.effective_message.reply_text(
+                "Sorry, an error occurred while processing your message."
+            )
+        except TelegramError as reply_error:
+            logger.warning("Could not send error reply (%s).", type(reply_error).__name__)
 
 
 async def set_bot_commands(application: Application) -> None:
@@ -393,19 +450,15 @@ def register_handlers(application: Application) -> None:
     application.add_handler(
         MessageHandler(filters.Regex(f"^({MENU_HELP}|{MENU_ABOUT}|{MENU_PING})$"), menu_button)
     )
-    application.add_handler(MessageHandler(filters.PHOTO, gold_photo))
+    application.add_handler(
+        MessageHandler(filters.PHOTO & filters.UpdateType.MESSAGE, gold_photo, block=False)
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_message))
     application.add_error_handler(error_handler)
 
 
 def main() -> None:
-    logging.basicConfig(
-        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
-        level=logging.INFO,
-    )
-    # HTTP request logs can include Telegram URLs containing BOT_TOKEN.
-    for name in ("httpx", "httpcore", "httpx2", "httpcore2", "openai"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+    configure_logging("INFO")
 
     token = os.environ.get("BOT_TOKEN")
     if not token:

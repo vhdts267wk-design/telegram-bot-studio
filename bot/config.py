@@ -53,7 +53,14 @@ class Settings:
         panel_secure_cookie = (
             secure_cookie_value in {"1", "true", "yes", "on"}
             if secure_cookie_value
-            else bool(os.getenv("RAILWAY_ENVIRONMENT"))
+            else any(
+                os.getenv(name, "").strip()
+                for name in (
+                    "RAILWAY_ENVIRONMENT_ID",
+                    "RAILWAY_ENVIRONMENT_NAME",
+                    "RAILWAY_ENVIRONMENT",
+                )
+            )
         )
         if panel_password and not database_url:
             raise RuntimeError(

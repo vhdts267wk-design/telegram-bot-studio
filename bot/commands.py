@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 # Reply types supported by the panel / dispatcher.
 REPLY_TYPES = ("text", "photo", "document")
 
-# Built-in commands handled in code; dynamic commands must not shadow them.
-RESERVED_NAMES = frozenset({"start", "help", "about", "ping"})
+# Built-in names are shared with the panel's command and button validation.
+BUILTIN_COMMANDS = ("start", "help", "about", "ping", "gold")
+RESERVED_NAMES = frozenset(BUILTIN_COMMANDS)
 
 # name -> command dict (enabled commands only).
 _REGISTRY: dict[str, dict] = {}
