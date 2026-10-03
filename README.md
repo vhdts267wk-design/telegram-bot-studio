@@ -67,6 +67,9 @@ resolved dynamically from commands you create in Telegram Bot Studio.
 For chart explanations, set `OPENAI_API_KEY` in Railway's service variables or
 your local `.env`, then send a clear XAUUSD screenshot. Every photo sent to the
 bot is handled as a chart request and is sent to OpenAI when the key is configured.
+Only new photo messages are analyzed; editing a caption does not run analysis again.
+Chart requests run in the background, with at most two active analyses, one per
+user at a time, and a 30-second interval between a user's requests.
 The bot uses the async Responses API with `gpt-4.1-mini` by default, a documented
 [vision model](https://developers.openai.com/api/docs/models/gpt-4.1-mini).
 It explains visible trends, support/resistance, and conditional scenarios for
@@ -91,6 +94,12 @@ no extra service required. Use it to manage dynamic commands at runtime:
 requires `DATABASE_URL` (Postgres is the command store). Without `PANEL_PASSWORD`
 the bot runs as a plain poller. Once enabled, open your Railway service URL (or
 `http://localhost:8080` locally) and sign in with `PANEL_USERNAME` / `PANEL_PASSWORD`.
+
+For a service with the panel enabled, configure Railway's health check as
+`/healthz`. It reports ready only while the bot is running, polling is active,
+and PostgreSQL responds. Leave this health check unset for a plain poller,
+which does not serve HTTP. Run only one polling deployment for each bot token;
+disconnect automatic deployments on any retired duplicate service.
 
 Security: credentials are checked in constant time, sessions use signed cookies,
 and all state-changing forms are CSRF-protected. Always use a strong
@@ -166,7 +175,7 @@ docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
 
 ## Install and Run Locally
 
-Make sure Python 3.10 or newer is installed.
+Make sure Python 3.12 or newer is installed.
 
 ```bash
 python -m venv .venv
@@ -202,7 +211,7 @@ docker compose up --build
 Prebuilt images are published to GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/codestorm-official/telegram-bot-studio:latest
+docker pull ghcr.io/vhdts267wk-design/telegram-bot-studio:latest
 ```
 
 Available tags include `latest`, semantic release tags such as `1.0.0`, and
@@ -213,7 +222,7 @@ Bot-only mode:
 ```bash
 docker run --rm \
   -e BOT_TOKEN="your_bot_token" \
-  ghcr.io/codestorm-official/telegram-bot-studio:latest
+  ghcr.io/vhdts267wk-design/telegram-bot-studio:latest
 ```
 
 Studio mode with an existing PostgreSQL database:
@@ -226,7 +235,7 @@ docker run --rm \
   -e PANEL_USERNAME="admin" \
   -e PANEL_PASSWORD="change-me" \
   -e PANEL_SECRET_KEY="replace-with-a-random-secret" \
-  ghcr.io/codestorm-official/telegram-bot-studio:latest
+  ghcr.io/vhdts267wk-design/telegram-bot-studio:latest
 ```
 
 ## Deploy the GHCR image on Railway
@@ -234,7 +243,7 @@ docker run --rm \
 Create an image-based Railway service using:
 
 ```text
-ghcr.io/codestorm-official/telegram-bot-studio:latest
+ghcr.io/vhdts267wk-design/telegram-bot-studio:latest
 ```
 
 Minimum variables for bot-only mode:
@@ -277,9 +286,9 @@ git push origin v1.0.0
 After the workflow completes, verify the tags:
 
 ```bash
-docker pull ghcr.io/codestorm-official/telegram-bot-studio:latest
-docker pull ghcr.io/codestorm-official/telegram-bot-studio:1.0.0
-docker image inspect ghcr.io/codestorm-official/telegram-bot-studio:1.0.0
+docker pull ghcr.io/vhdts267wk-design/telegram-bot-studio:latest
+docker pull ghcr.io/vhdts267wk-design/telegram-bot-studio:1.0.0
+docker image inspect ghcr.io/vhdts267wk-design/telegram-bot-studio:1.0.0
 ```
 
 The package must have public visibility in the repository or organization

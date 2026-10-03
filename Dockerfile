@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.source="https://github.com/codestorm-official/telegram-bot-studio" \
+LABEL org.opencontainers.image.source="https://github.com/vhdts267wk-design/telegram-bot-studio" \
       org.opencontainers.image.description="Telegram Bot Studio — easily manage commands and buttons for a Telegram bot." \
       org.opencontainers.image.licenses="MIT"
 
