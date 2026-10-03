@@ -9,6 +9,7 @@ import asyncio
 import logging
 import re
 from pathlib import Path
+from time import monotonic
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Form, Request
@@ -37,6 +38,8 @@ templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
 NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 BUILTIN_COMMANDS = commands.BUILTIN_COMMANDS
 login_limiter = LoginRateLimiter()
+READINESS_TIMEOUT_SECONDS = 3.0
+TELEGRAM_READINESS_CACHE_SECONDS = 10.0
 
 
 def _get_pool(request: Request):
@@ -133,6 +136,31 @@ def create_app(application, settings) -> FastAPI:
     app.state.application = application
     app.state.settings = settings
 
+    # Updater.running can remain true after polling aborts on an invalid token.
+    # A short, serialized auth probe bounds both stale readiness and public traffic.
+    telegram_probe_lock = asyncio.Lock()
+    telegram_probe_expires_at = 0.0
+    telegram_probe_ok = False
+
+    async def _telegram_ready() -> bool:
+        nonlocal telegram_probe_expires_at, telegram_probe_ok
+        if monotonic() < telegram_probe_expires_at:
+            return telegram_probe_ok
+        async with telegram_probe_lock:
+            if monotonic() < telegram_probe_expires_at:
+                return telegram_probe_ok
+            try:
+                async with asyncio.timeout(READINESS_TIMEOUT_SECONDS):
+                    identity = await application.bot.get_me()
+            except Exception as exc:
+                logger.warning("Readiness Telegram check failed (%s).", type(exc).__name__)
+                telegram_probe_ok = False
+            else:
+                telegram_probe_ok = identity is not None
+            # Cache failures too, so unavailable Telegram cannot trigger a request flood.
+            telegram_probe_expires_at = monotonic() + TELEGRAM_READINESS_CACHE_SECONDS
+            return telegram_probe_ok
+
     secret = settings.panel_secret_key or secrets_fallback(settings)
     app.add_middleware(
         SessionMiddleware,
@@ -158,10 +186,12 @@ def create_app(application, settings) -> FastAPI:
         if pool is None:
             return JSONResponse({"status": "unavailable"}, status_code=503)
         try:
-            async with asyncio.timeout(3):
+            async with asyncio.timeout(READINESS_TIMEOUT_SECONDS):
                 await pool.fetchval("SELECT 1")
         except Exception as exc:
             logger.warning("Readiness database check failed (%s).", type(exc).__name__)
+            return JSONResponse({"status": "unavailable"}, status_code=503)
+        if not await _telegram_ready():
             return JSONResponse({"status": "unavailable"}, status_code=503)
         return {"status": "ok"}
 
