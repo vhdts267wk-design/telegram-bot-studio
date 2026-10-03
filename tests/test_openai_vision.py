@@ -13,7 +13,7 @@ from bot import handlers
 
 
 class OpenAIVisionIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_photo_request_serializes_and_response_text_reaches_telegram(self):
+    async def exercise_photo_request(self, *, status="completed"):
         requests = []
         observation = "The visible screenshot shows a consolidation area."
         image_bytes = bytearray(b"local-test-image")
@@ -26,7 +26,7 @@ class OpenAIVisionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     "id": "resp_local_vision",
                     "object": "response",
                     "created_at": 0.0,
-                    "status": "completed",
+                    "status": status,
                     "model": handlers.GOLD_MODEL,
                     "output": [
                         {
@@ -65,12 +65,21 @@ class OpenAIVisionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         message = SimpleNamespace(photo=[photo], reply_text=AsyncMock())
-        update = SimpleNamespace(effective_message=message)
+        update = SimpleNamespace(
+            effective_message=message, effective_user=SimpleNamespace(id=101)
+        )
 
         with patch.dict(
             handlers.os.environ, {"OPENAI_API_KEY": "local-test-key"}, clear=True
         ), patch.object(handlers, "AsyncOpenAI", side_effect=create_client):
-            await handlers.gold_photo(update, SimpleNamespace())
+            await handlers.gold_photo(update, SimpleNamespace(bot_data={}))
+
+        return requests, message, clients, observation, image_bytes
+
+    async def test_photo_request_serializes_and_response_text_reaches_telegram(self):
+        requests, message, clients, observation, image_bytes = (
+            await self.exercise_photo_request()
+        )
 
         self.assertEqual(len(requests), 1)
         request = requests[0]
@@ -91,6 +100,22 @@ class OpenAIVisionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(message.reply_text.await_args.args[0].startswith(observation))
         self.assertIsNone(message.reply_text.await_args.kwargs["parse_mode"])
         self.assertTrue(clients[0].is_closed)
+
+    async def test_incomplete_and_failed_sdk_responses_do_not_publish_partial_text(self):
+        for status in ("incomplete", "failed"):
+            with self.subTest(status=status), self.assertLogs(
+                handlers.logger, level="WARNING"
+            ) as captured:
+                requests, message, clients, observation, _ = (
+                    await self.exercise_photo_request(status=status)
+                )
+                self.assertEqual(len(requests), 1)
+                message.reply_text.assert_awaited_once()
+                reply = message.reply_text.await_args.args[0]
+                self.assertIn("could not be completed", reply)
+                self.assertNotIn(observation, reply)
+                self.assertNotIn(observation, "\n".join(captured.output))
+                self.assertTrue(clients[0].is_closed)
 
 
 if __name__ == "__main__":

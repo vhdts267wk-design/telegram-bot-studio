@@ -1,10 +1,15 @@
+import asyncio
 import base64
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs
 
+import httpx
 from openai import APIConnectionError
+from telegram import Update
 from telegram.error import NetworkError, TelegramError
+from telegram.request import HTTPXRequest
 
 from bot import handlers
 
@@ -29,13 +34,17 @@ class GoldPhotoTests(unittest.IsolatedAsyncioTestCase):
         self.message = SimpleNamespace(
             photo=[self.small_photo, self.large_photo], reply_text=AsyncMock()
         )
-        self.update = SimpleNamespace(effective_message=self.message)
-        self.context = SimpleNamespace()
+        self.update = SimpleNamespace(
+            effective_message=self.message, effective_user=SimpleNamespace(id=101)
+        )
+        self.context = SimpleNamespace(bot_data={})
 
         self.client = SimpleNamespace(
             responses=SimpleNamespace(
                 create=AsyncMock(
-                    return_value=SimpleNamespace(output_text="Visible chart observations.")
+                    return_value=SimpleNamespace(
+                        status="completed", output_text="Visible chart observations."
+                    )
                 )
             )
         )
@@ -145,7 +154,9 @@ class GoldPhotoTests(unittest.IsolatedAsyncioTestCase):
         self.client_factory.assert_not_called()
 
     async def test_empty_output_returns_readable_fallback(self):
-        self.client.responses.create.return_value = SimpleNamespace(output_text="   ")
+        self.client.responses.create.return_value = SimpleNamespace(
+            status="completed", output_text="   "
+        )
 
         await handlers.gold_photo(self.update, self.context)
 
@@ -195,7 +206,9 @@ class GoldPhotoTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_unicode_output_is_preserved_in_telegram_sized_chunks(self):
         analysis = "📈 ملاحظات تعليمية على الرسم البياني.\n" * 180
-        self.client.responses.create.return_value = SimpleNamespace(output_text=analysis)
+        self.client.responses.create.return_value = SimpleNamespace(
+            status="completed", output_text=analysis
+        )
 
         await handlers.gold_photo(self.update, self.context)
 
@@ -238,6 +251,228 @@ class GoldPhotoTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(private_error, output)
         self.assertNotIn(private_update, output)
         self.assertNotIn(self.api_key, output)
+
+    async def test_error_reply_failure_is_safely_handled(self):
+        self.context.error = RuntimeError("private original detail")
+        self.message.reply_text.side_effect = TelegramError("private reply token")
+        update = MagicMock(spec=handlers.Update)
+        update.effective_message = self.message
+
+        with self.assertLogs(handlers.logger, level="WARNING") as captured:
+            await handlers.error_handler(update, self.context)
+
+        self.message.reply_text.assert_awaited_once()
+        output = "\n".join(captured.output)
+        self.assertIn("TelegramError", output)
+        self.assertNotIn("private original detail", output)
+        self.assertNotIn("private reply token", output)
+
+    async def test_chart_admission_limits_concurrency_before_work_starts(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        running = []
+
+        async def slow_analysis(message, api_key):
+            running.append(message)
+            if len(running) == 2:
+                started.set()
+            await release.wait()
+
+        def another_update(user_id):
+            message = SimpleNamespace(
+                photo=[SimpleNamespace(get_file=AsyncMock())], reply_text=AsyncMock()
+            )
+            return SimpleNamespace(
+                effective_message=message, effective_user=SimpleNamespace(id=user_id)
+            )
+
+        second = another_update(102)
+        duplicate = another_update(101)
+        excess = another_update(103)
+        with patch.object(handlers, "_analyze_gold_photo", side_effect=slow_analysis):
+            tasks = [
+                asyncio.create_task(handlers.gold_photo(self.update, self.context)),
+                asyncio.create_task(handlers.gold_photo(second, self.context)),
+            ]
+            try:
+                await asyncio.wait_for(started.wait(), timeout=1)
+                await handlers.gold_photo(duplicate, self.context)
+                await handlers.gold_photo(excess, self.context)
+                self.assertEqual(len(running), 2)
+                duplicate.effective_message.reply_text.assert_awaited_once()
+                excess.effective_message.reply_text.assert_awaited_once()
+                duplicate.effective_message.photo[0].get_file.assert_not_awaited()
+                excess.effective_message.photo[0].get_file.assert_not_awaited()
+            finally:
+                release.set()
+                await asyncio.gather(*tasks)
+
+        self.assertEqual(
+            self.context.bot_data[handlers.GOLD_ADMISSION_KEY].active_users, set()
+        )
+
+    async def test_cancellation_releases_chart_slot(self):
+        started = asyncio.Event()
+
+        async def slow_analysis(message, api_key):
+            started.set()
+            await asyncio.Event().wait()
+
+        with patch.object(handlers, "_analyze_gold_photo", side_effect=slow_analysis):
+            task = asyncio.create_task(handlers.gold_photo(self.update, self.context))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(
+            self.context.bot_data[handlers.GOLD_ADMISSION_KEY].active_users, set()
+        )
+
+    async def test_cooldown_expires_and_prunes_previous_users(self):
+        with patch.object(handlers, "monotonic", return_value=100.0):
+            await handlers.gold_photo(self.update, self.context)
+            await handlers.gold_photo(self.update, self.context)
+        self.client.responses.create.assert_awaited_once()
+        admission = self.context.bot_data[handlers.GOLD_ADMISSION_KEY]
+        self.assertEqual(admission.request_times, {101: 100.0})
+
+        # An expired timestamp from a different user must also be removed.
+        admission.request_times[202] = 100.0
+        with patch.object(handlers, "monotonic", return_value=131.0):
+            await handlers.gold_photo(self.update, self.context)
+        self.assertEqual(self.client.responses.create.await_count, 2)
+        self.assertEqual(admission.request_times, {101: 131.0})
+
+    async def test_chart_admission_is_isolated_between_applications(self):
+        await handlers.gold_photo(self.update, self.context)
+        await handlers.gold_photo(self.update, SimpleNamespace(bot_data={}))
+        self.assertEqual(self.client.responses.create.await_count, 2)
+
+    async def test_provider_failure_releases_chart_slot(self):
+        self.client.responses.create.side_effect = APIConnectionError(
+            message="private test detail", request=MagicMock()
+        )
+        with self.assertLogs(handlers.logger, level="WARNING"):
+            await handlers.gold_photo(self.update, self.context)
+        self.assertEqual(
+            self.context.bot_data[handlers.GOLD_ADMISSION_KEY].active_users, set()
+        )
+
+
+class GoldPhotoRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_chart_does_not_block_ping_and_edited_photos_are_ignored(self):
+        sent_texts = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        def telegram_response(request):
+            if request.url.path.endswith("/getMe"):
+                result = {
+                    "id": 999,
+                    "is_bot": True,
+                    "first_name": "Local test bot",
+                    "username": "local_test_bot",
+                }
+            elif request.url.path.endswith("/sendMessage"):
+                params = parse_qs(request.content.decode())
+                text = params["text"][0]
+                sent_texts.append(text)
+                result = {
+                    "message_id": len(sent_texts),
+                    "date": 1,
+                    "chat": {"id": 101, "type": "private"},
+                    "text": text,
+                }
+            else:
+                raise AssertionError("Unexpected local Telegram request")
+            return httpx.Response(200, json={"ok": True, "result": result})
+
+        def local_request():
+            return HTTPXRequest(
+                httpx_kwargs={"transport": httpx.MockTransport(telegram_response)}
+            )
+
+        application = (
+            handlers.Application.builder()
+            .token("123:local-test-token")
+            .request(local_request())
+            .get_updates_request(local_request())
+            .build()
+        )
+        handlers.register_handlers(application)
+
+        def photo_update(*, edited=False):
+            key = "edited_message" if edited else "message"
+            return Update.de_json(
+                {
+                    "update_id": 1 if edited else 2,
+                    key: {
+                        "message_id": 1,
+                        "date": 1,
+                        "chat": {"id": 101, "type": "private"},
+                        "from": {"id": 101, "is_bot": False, "first_name": "User"},
+                        "photo": [
+                            {
+                                "file_id": "local-photo",
+                                "file_unique_id": "local-unique-photo",
+                                "width": 100,
+                                "height": 100,
+                            }
+                        ],
+                    },
+                },
+                application.bot,
+            )
+
+        ping_update = Update.de_json(
+            {
+                "update_id": 3,
+                "message": {
+                    "message_id": 2,
+                    "date": 1,
+                    "chat": {"id": 101, "type": "private"},
+                    "from": {"id": 101, "is_bot": False, "first_name": "User"},
+                    "text": "/ping",
+                    "entities": [{"type": "bot_command", "offset": 0, "length": 5}],
+                },
+            },
+            application.bot,
+        )
+
+        async def slow_analysis(message, api_key):
+            started.set()
+            await release.wait()
+
+        with patch.dict(
+            handlers.os.environ, {"OPENAI_API_KEY": "local-test-key"}, clear=True
+        ), patch.object(
+            handlers, "_analyze_gold_photo", side_effect=slow_analysis
+        ) as analyze:
+            await application.initialize()
+            await application.start()
+            try:
+                await application.process_update(photo_update(edited=True))
+                await asyncio.sleep(0)
+                analyze.assert_not_awaited()
+                await asyncio.wait_for(
+                    application.process_update(photo_update()), timeout=1
+                )
+                await asyncio.wait_for(started.wait(), timeout=1)
+                await asyncio.wait_for(
+                    application.process_update(ping_update), timeout=1
+                )
+                self.assertEqual(sent_texts, ["pong"])
+                self.assertFalse(release.is_set())
+                analyze.assert_awaited_once()
+            finally:
+                release.set()
+                await application.stop()
+                await application.shutdown()
+
+        self.assertEqual(
+            application.bot_data[handlers.GOLD_ADMISSION_KEY].active_users, set()
+        )
 
 
 if __name__ == "__main__":

@@ -10,10 +10,10 @@ class TemplateSyntaxTests(unittest.TestCase):
         templates = Path("bot/panel/templates").glob("*.html")
         for template in templates:
             with self.subTest(template=template.name):
-                environment.parse(template.read_text())
+                environment.parse(template.read_text(encoding="utf-8"))
 
     def test_keyboard_refresh_guidance_exists(self):
-        base = Path("bot/panel/templates/base.html").read_text()
+        base = Path("bot/panel/templates/base.html").read_text(encoding="utf-8")
         self.assertIn("run <code>/start</code> again", base)
 
 
