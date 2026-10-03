@@ -86,7 +86,7 @@ BOT_COMMANDS = (
     ("help", "Show help"),
     ("about", "Show bot information"),
     ("ping", "Check bot status"),
-    ("gold", "Gold analysis"),
+    ("gold", "XAUUSD chart education"),
 )
 
 MENU_HELP = "Help"
@@ -98,7 +98,13 @@ HELP_TEXT = """Available commands:
 /help - Show help
 /about - Show bot information
 /ping - Check bot status
-/gold - Gold (XAUUSD) analysis"""
+/gold - Explain an XAUUSD chart for education"""
+
+GOLD_PHOTO_GUIDANCE = (
+    "Send a clear XAUUSD screenshot using Telegram's Photo option, with the "
+    "timeframe and price scale visible. Wait 30 seconds between chart requests. "
+    "Educational only. Not financial advice or a buy/sell signal."
+)
 
 DYNAMIC_CALLBACK_PREFIX = "command:"
 
@@ -157,7 +163,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = user.first_name if user.first_name else "friend"
     greeting = "Welcome" if is_new else "Welcome back"
     await message.reply_text(
-        f"{greeting}, {name}! The bot is running.\n\n"
+        f"{greeting}, {name}!\n\n"
+        "I can explain XAUUSD chart screenshots for education. Send a clear "
+        "screenshot as a Telegram photo with the timeframe and price scale "
+        "visible, or use /gold for guidance.\n\n"
         "Choose a menu button below or type /help to see the available commands.",
         reply_markup=_main_menu_keyboard(),
     )
@@ -175,6 +184,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await message.reply_text(
         HELP_TEXT
         + _dynamic_commands_text()
+        + "\n\n"
+        + GOLD_PHOTO_GUIDANCE
         + "\n\nSend a normal text message and the bot will echo it back.",
         reply_markup=_dynamic_commands_keyboard(),
     )
@@ -187,7 +198,9 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await message.reply_text(
-        "This bot is built with python-telegram-bot and is ready to deploy on Railway."
+        "I explain visible XAUUSD chart trends, support and resistance, and "
+        "conditional scenarios for education. Screenshots show historical "
+        "information. This is not financial advice or a buy/sell signal."
     )
 
 
@@ -206,11 +219,19 @@ async def gold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if message is None:
         return
 
+    await message.reply_text("🥇 XAUUSD Chart Education\n" + GOLD_PHOTO_GUIDANCE)
+
+
+async def gold_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Explain how to resend image files through the supported photo flow."""
+    del context
+    message = update.effective_message
+    if message is None or message.document is None:
+        return
+
     await message.reply_text(
-        "🥇 Gold Chart Education\n"
-        "Send a clear XAUUSD chart screenshot with its timeframe and price scale. "
-        "I can explain visible trends and support/resistance for education. "
-        "This is not financial advice or a buy/sell signal."
+        "That image arrived as a file.\n\n" + GOLD_PHOTO_GUIDANCE,
+        parse_mode=None,
     )
 
 
@@ -494,6 +515,9 @@ def register_handlers(application: Application) -> None:
     )
     application.add_handler(
         MessageHandler(filters.PHOTO & filters.UpdateType.MESSAGE, gold_photo, block=False)
+    )
+    application.add_handler(
+        MessageHandler(filters.Document.IMAGE & filters.UpdateType.MESSAGE, gold_document)
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_message))
     application.add_error_handler(error_handler)
