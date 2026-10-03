@@ -32,6 +32,19 @@ GOLD_ADMISSION_KEY = "gold_admission"
 GOLD_MODEL = "gpt-4.1-mini"
 GOLD_MAX_ACTIVE = 2
 GOLD_COOLDOWN_SECONDS = 30.0
+_GOLD_QUOTA_CODES = frozenset(
+    {
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "organization_usage_limit_exceeded",
+    }
+)
+_GOLD_THROTTLE_CODES = frozenset({"rate_limit_exceeded", "slow_down"})
+_GOLD_SAFE_ERROR_CODES = (
+    _GOLD_QUOTA_CODES | _GOLD_THROTTLE_CODES | {"server_is_overloaded"}
+)
 # 2,000 Python characters stay below Telegram's limit even with emoji
 # represented by two UTF-16 code units.
 TELEGRAM_TEXT_CHUNK_SIZE = 2000
@@ -55,6 +68,17 @@ _LOCAL_MESSAGE_COUNTS: dict[int, int] = {}
 class _GoldAdmission:
     active_users: set[int] = field(default_factory=set)
     request_times: dict[int, float] = field(default_factory=dict)
+
+
+def _safe_provider_error_details(error: OpenAIError) -> tuple[int | None, str | None]:
+    """Extract a fixed diagnostic vocabulary without exposing provider content."""
+    status = getattr(error, "status_code", None)
+    if type(status) is not int or not 100 <= status <= 599:
+        status = None
+    code = getattr(error, "code", None)
+    if type(code) is not str or code not in _GOLD_SAFE_ERROR_CODES:
+        code = None
+    return status, code
 
 
 BOT_COMMANDS = (
@@ -283,11 +307,29 @@ async def _analyze_gold_photo(message, api_key: str) -> None:
             )
     except OpenAIError as exc:
         # Do not expose provider error bodies, credentials, or image contents.
-        logger.warning("Chart analysis request failed (%s).", type(exc).__name__)
-        await message.reply_text(
+        status, code = _safe_provider_error_details(exc)
+        logger.warning(
+            "Chart analysis request failed (%s; status=%s; code=%s).",
+            type(exc).__name__,
+            status if status is not None else "unavailable",
+            code if code is not None else "unavailable",
+        )
+        feedback = (
             "Chart analysis is temporarily unavailable. Please try again later. "
             "If it persists, the bot owner should check OpenAI access and billing."
         )
+        if status == 429 and code in _GOLD_QUOTA_CODES:
+            feedback = (
+                "Chart analysis is unavailable because OpenAI credits or usage "
+                "limits have been reached. The bot owner needs to check API "
+                "billing and limits."
+            )
+        elif status == 429 and code in _GOLD_THROTTLE_CODES:
+            feedback = (
+                "Chart analysis is temporarily rate limited. Please wait a moment "
+                "before trying again."
+            )
+        await message.reply_text(feedback)
         return
 
     if response.status != "completed":
