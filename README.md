@@ -97,7 +97,10 @@ the bot runs as a plain poller. Once enabled, open your Railway service URL (or
 
 For a service with the panel enabled, configure Railway's health check as
 `/healthz`. It reports ready only while the bot is running, polling is active,
-and PostgreSQL responds. Leave this health check unset for a plain poller,
+PostgreSQL responds, and Telegram accepts the bot token. Telegram checks time
+out after three seconds and are cached for ten seconds. A rejected token needs
+to be replaced privately in the active bot service, followed by a redeploy.
+Leave this health check unset for a plain poller,
 which does not serve HTTP. Run only one polling deployment for each bot token;
 disconnect automatic deployments on any retired duplicate service.
 
