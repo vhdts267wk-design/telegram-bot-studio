@@ -5,6 +5,7 @@ import logging
 
 import uvicorn
 from telegram import Update
+from telegram.error import InvalidToken
 from telegram.ext import Application, ApplicationBuilder
 
 from bot import commands, db
@@ -76,13 +77,49 @@ def build_application(settings: Settings) -> Application:
     return application
 
 
+async def _shutdown_application(
+    application: Application, *, suppress_errors: bool
+) -> None:
+    """Attempt every cleanup step, preserving an earlier startup/run error."""
+    first_error = None
+
+    async def attempt(step: str, callback) -> None:
+        nonlocal first_error
+        try:
+            await callback()
+        except BaseException as exc:
+            # Continue closing other resources even after a stop/cancellation
+            # failure. Never log raw exception text, which may contain tokens.
+            if first_error is None:
+                first_error = exc
+            logger.warning("Bot cleanup failed during %s (%s).", step, type(exc).__name__)
+
+    if application.updater is not None and application.updater.running:
+        await attempt("polling stop", application.updater.stop)
+    if application.running:
+        await attempt("application stop", application.stop)
+    await attempt("application shutdown", application.shutdown)
+    # Application.shutdown returns early after an incomplete initialize(),
+    # whereas Bot.shutdown closes HTTP requests opened before getMe failed.
+    # It is safe to call again after a complete application shutdown.
+    await attempt("bot shutdown", application.bot.shutdown)
+    if application.post_shutdown is not None:
+        await attempt(
+            "database shutdown", lambda: application.post_shutdown(application)
+        )
+
+    if first_error is not None and not suppress_errors:
+        raise first_error
+
+
 async def _run_with_panel(application: Application, settings: Settings) -> None:
     """Run Telegram polling and the admin panel together in one event loop."""
     # Application.initialize()/shutdown() deliberately do not invoke the
     # builder's post_init/post_shutdown callbacks. run_polling() normally does
     # that for us, but this custom runner must execute them explicitly.
-    await application.initialize()
+    failed = False
     try:
+        await application.initialize()
         if application.post_init is not None:
             await application.post_init(application)
 
@@ -103,14 +140,11 @@ async def _run_with_panel(application: Application, settings: Settings) -> None:
         )
         server = uvicorn.Server(config)
         await server.serve()  # blocks until SIGTERM/SIGINT
+    except BaseException:
+        failed = True
+        raise
     finally:
-        if application.updater is not None and application.updater.running:
-            await application.updater.stop()
-        if application.running:
-            await application.stop()
-        await application.shutdown()
-        if application.post_shutdown is not None:
-            await application.post_shutdown(application)
+        await _shutdown_application(application, suppress_errors=failed)
 
 
 def main() -> None:
@@ -128,10 +162,22 @@ def main() -> None:
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Run the service with static, credential-safe startup diagnostics."""
     configure_logging()
     try:
         main()
+    except InvalidToken:
+        logger.error(
+            "Telegram rejected BOT_TOKEN. Replace it in the active Railway bot "
+            "service with the current BotFather token, then redeploy. "
+            "Do not send the token in chat."
+        )
+        raise SystemExit(1) from None
     except Exception as exc:
         logger.error("Bot stopped (%s). Check the service configuration.", type(exc).__name__)
         raise SystemExit(1) from None
+
+
+if __name__ == "__main__":
+    run()
