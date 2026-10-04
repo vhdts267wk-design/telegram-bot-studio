@@ -19,7 +19,7 @@ class GoldPhotoTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.api_key = "test-only-api-key"
         self.environment = patch.dict(
-            handlers.os.environ, {"OPENAI_API_KEY": self.api_key}, clear=True
+            handlers.os.environ, {"OPENAI_API_KEY": self.api_key, "OPENAI_ENABLED": "true"}, clear=True
         )
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -563,7 +563,7 @@ class GoldPhotoRoutingTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
 
         with patch.dict(
-            handlers.os.environ, {"OPENAI_API_KEY": "local-test-key"}, clear=True
+            handlers.os.environ, {"OPENAI_API_KEY": "local-test-key", "OPENAI_ENABLED": "true"}, clear=True
         ), patch.object(
             handlers, "_analyze_gold_photo", side_effect=slow_analysis
         ) as analyze:
