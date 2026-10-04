@@ -12,7 +12,7 @@ Docker, and Railway.
 
 - Persistent chat menu buttons after `/start`
 - `/start`, `/help`, `/about`, and `/ping` commands
-- `/gold` and screenshot explanations for XAUUSD chart education (OpenAI required)
+- `/gold`, `/market`, `/signals`, `/reviews` and `/news` work without OpenAI or screenshots
 - `/market` and `/news` work without screenshots; `/watch` sends a report every 15 minutes
 - Echo replies for normal text messages
 - Fallback handler for unknown commands
@@ -51,6 +51,7 @@ The bot shows a persistent reply keyboard after `/start` with these buttons:
 | `Ping`  | Check whether the bot is running |
 | `Market` | XAUUSD prices and observed M15 data |
 | `News` | Cited political and economic news |
+| `Signals` | Experimental paper BUY/SELL setups |
 
 Telegram bots cannot display custom buttons before a user starts or messages the bot. The keyboard appears after the bot replies, then stays available in supported Telegram clients.
 
@@ -65,23 +66,22 @@ Telegram bots cannot display custom buttons before a user starts or messages the
 | `/gold`  | Market report when connected; optional chart-photo guidance otherwise |
 | `/market` | XAUUSD data without screenshots |
 | `/news` | Cited political and macroeconomic developments |
+| `/signals` | Inspect the current experimental setup; no journal entry is opened |
+| `/reviews` | Recent 15-minute paper outcomes and review notes |
 | `/watch` | Opt in to a report every 15 minutes in a private chat |
 | `/unwatch` | Stop automatic reports |
 
 The built-in commands above always take precedence. Any other `/command` is
 resolved dynamically from commands you create in Telegram Bot Studio.
 
-For chart explanations, set `OPENAI_API_KEY` in Railway's service variables or
-your local `.env`, then send a clear XAUUSD screenshot. Every photo sent to the
-bot is handled as a chart request and is sent to OpenAI when the key is configured.
-Only new photo messages are analyzed; editing a caption does not run analysis again.
-Chart requests run in the background, with at most two active analyses, one per
-user at a time, and a 30-second interval between a user's requests.
-The bot uses the async Responses API with `gpt-4.1-mini` by default, a documented
-[vision model](https://developers.openai.com/api/docs/models/gpt-4.1-mini).
-It explains visible trends, support/resistance, and conditional scenarios for
-education, without trade instructions or live-price claims. Unreadable labels
-must be acknowledged. Never paste credentials into Telegram or commit `.env`.
+The default configuration makes no OpenAI requests, even when an API key is
+already present. `OPENAI_ENABLED=false` and `NEWS_SOURCE=rss` keep price
+collection, signals, reviews and public news independent of OpenAI billing.
+Photo messages point users to the screenshot-free commands.
+
+The legacy chart-photo feature is disabled unless an owner explicitly sets
+`OPENAI_ENABLED=true` and an API key. Paid web search additionally requires
+`NEWS_SOURCE=openai`; an RSS error never falls back to a paid provider.
 
 ## Market and news monitoring without screenshots
 
@@ -90,6 +90,31 @@ Send `/market` or `/news` for a report. `/watch` enables automatic reports every
 Subscriptions, delivery leases, collected prices and search usage survive restarts
 in PostgreSQL. Reports are private-chat opt-ins. A report already being delivered
 can finish its in-flight Telegram request when unsubscribing.
+
+Reports also include **experimental paper signals**, requested with `/signals`.
+The fixed rule is EMA9/EMA21 on consecutive completed M15 candles: BUY only when
+the fast EMA crosses from at/below to above the slow EMA, SELL on the inverse,
+otherwise no new setup. EMAs use SMA seeds; ATR14 uses true ranges and Wilder
+smoothing. The reference entry is the triggering candle's close, the stop is
+1.5 ATR away, and the target is 3 ATR away (a nominal 2:1 ratio). Levels rounded
+to $0.01 must remain positive and correctly ordered; zero/tiny ATR suppresses
+the setup.
+
+At least **22 sufficiently covered, consecutive completed M15 candles** are
+required, roughly 5.5 hours of collection plus an initial partial period or any
+gaps. A fresh quote and a recent completed candle are also required. Reports
+never force a BUY/SELL every 15 minutes, fill missing bars or use a forming
+candle. Reference samples are not broker OHLC; spreads, fees, slippage and fills
+are unmodelled. The rules have correctness tests with synthetic data, **not
+historical profitability validation**, and are not ready for live trading.
+The bot executes no orders and reads no balances or positions.
+
+The setup identity includes source, exact symbol, strategy version, triggering
+bar and direction. Its initially computed levels are saved. Worker delivery
+remembers the last setup per chat across restarts; `/signals` deliberately lets
+the user inspect the current result again. The same at-least-once delivery
+limitation described below applies if a crash occurs after Telegram accepts a
+message and before its acknowledgement. No paper fills or profits are claimed.
 
 By default `MARKET_SOURCE=reference` uses keyless USD gold reference prices from
 [GoldAPI](https://gold-api.com/llms.txt). This independent reference feed is not a
@@ -105,22 +130,37 @@ comparisons require contiguous sufficiently covered intervals. GoldAPI's
 [terms](https://gold-api.com/terms) provide reference data as-is; availability or a
 fresh provider timestamp does not establish that a market is open.
 
-News uses live [OpenAI web search](https://developers.openai.com/api/docs/guides/tools-web-search)
-with `gpt-4.1-mini`, up to three political or macroeconomic developments relevant
-to gold, and clickable source citations. Publication dates come from source
-content; retrieval time is displayed separately. Unverified recency is acknowledged,
-and no news or prices are invented when retrieval fails. Search results are
-shared for 15 minutes and capped at **96 attempts per bot per UTC day**, including
-failed attempts, with no hidden retries. This consumes the existing OpenAI API
-balance; at current [pricing](https://developers.openai.com/api/docs/pricing), a
-full day of one search per 15 minutes costs approximately **$1.40** including the
-brief output, with actual tokens affecting the amount. The cap survives redeploys.
+News defaults to public official RSS from the [Federal Reserve](https://www.federalreserve.gov/feeds/feeds.htm),
+[ECB](https://www.ecb.europa.eu/rss/press.html), and [UN News](https://news.un.org/feed/subscribe/en/news/all/rss.xml).
+The bot shares at most six linked headlines with publication dates within the
+last 24 hours. Headlines remain in the source language; no AI translation or
+price-impact prediction is made. The UN feed is filtered for politics and
+macroeconomics. This is limited coverage, not a comprehensive news service.
+An empty or unavailable bulletin is reported explicitly; older headlines are
+never presented as new. Results are cached for 15 minutes by provider.
+
+Successfully delivered automatic signals open immutable paper journals in
+PostgreSQL. The observation window starts after Telegram accepts the signal and
+lasts **15 minutes**. The worker checks collected reference samples every minute;
+it reports the first observed SL/TP crossing or reviews expiry. A missing gap
+of more than three minutes or an old expiry sample produces an inconclusive
+review. Sampled observations cannot rule out an earlier unobserved crossing and
+are not order fills. `/reviews` displays recent records and outcome-specific
+notes; `/signals` only inspects a setup and does not open a journal record.
+
+A fixed experimental risk policy pauses new automatic signals for **45 minutes**
+after three consecutive fully covered observed stops for the same source and
+strategy in a chat. An inconclusive, expired or target result breaks the streak.
+This cutoff adapts alert availability to the recorded results; it does not
+optimize EMA/ATR values, alter previous levels, or establish better returns.
 
 Price/news failures do not block Telegram polling, `/ping`, or Railway readiness.
 Telegram rate limits delay deliveries rather than retrying continuously.
 Delivery leases reduce duplicate reports during deployment overlap, but a crash
 between Telegram accepting a message and database acknowledgement can cause a
-duplicate; delivery is not an exactly-once guarantee.
+duplicate; delivery is not an exactly-once guarantee. Paper-review delivery
+also assumes one polling replica. A failure after a signal is accepted but
+before journal persistence can leave that signal without a review record.
 
 An optional [read-only Windows MT5 bridge](bridge/README.md) can use a connected
 broker terminal later. Keep the Windows-only dependency out of Railway's server
@@ -203,7 +243,9 @@ and all state-changing forms are CSRF-protected. Always use a strong
 | Name           | Required | Default | Description                                        |
 | -------------- | -------- | ------- | -------------------------------------------------- |
 | `BOT_TOKEN`        | Yes | -       | Bot token from `@BotFather`                                   |
-| `OPENAI_API_KEY`   | For charts/news | - | OpenAI API key; missing key disables chart explanations and news searches |
+| `OPENAI_ENABLED` | No | `false` | Explicit opt-in for legacy paid features; all OpenAI requests disabled by default |
+| `NEWS_SOURCE` | No | `rss` | Public official headlines; `openai` requires explicit paid opt-in |
+| `OPENAI_API_KEY` | Legacy paid features only | - | Not needed for prices, paper signals, reviews or RSS |
 | `OPENAI_MODEL`     | No | `gpt-4.1-mini` | Image-capable Responses API model available to your OpenAI project |
 | `DATABASE_URL`     | For panel | -  | PostgreSQL connection string; required when `PANEL_PASSWORD` is set |
 | `PANEL_PASSWORD`   | No  | -       | Enables Telegram Bot Studio when set; password to sign in     |
