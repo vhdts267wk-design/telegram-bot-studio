@@ -49,7 +49,7 @@ async def _connect_database(url: str, *, required: bool):
 def build_application(settings: Settings) -> Application:
     async def on_startup(application: Application) -> None:
         application.bot_data[DB_KEY] = await _connect_database(
-            settings.database_url, required=settings.panel_enabled
+            settings.database_url, required=settings.http_enabled
         )
         # Load panel-managed commands before publishing the Telegram menu.
         await commands.reload(application.bot_data[DB_KEY])
@@ -130,7 +130,7 @@ async def _run_with_panel(application: Application, settings: Settings) -> None:
         await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await application.start()
         logger.info(
-            "Bot polling started; admin panel listening on port %d.", settings.port
+            "Bot polling started; HTTP service listening on port %d.", settings.port
         )
 
         web = create_app(application, settings)
@@ -157,7 +157,7 @@ def main() -> None:
 
     application = build_application(settings)
 
-    if settings.panel_enabled:
+    if settings.http_enabled:
         asyncio.run(_run_with_panel(application, settings))
     else:
         logger.info(

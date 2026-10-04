@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 REPLY_TYPES = ("text", "photo", "document")
 
 # Built-in names are shared with the panel's command and button validation.
-BUILTIN_COMMANDS = ("start", "help", "about", "ping", "gold", "market", "news", "signals", "reviews", "watch", "unwatch")
+BUILTIN_COMMANDS = ("start", "help", "about", "ping", "gold", "market", "news", "signals", "reviews", "watch", "unwatch", "connect_mt5")
 RESERVED_NAMES = frozenset(BUILTIN_COMMANDS)
 
 # name -> command dict (enabled commands only).

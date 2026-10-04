@@ -10,13 +10,14 @@ import math
 import os
 import re
 from time import monotonic
+from uuid import UUID
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CommandHandler
 
-from bot import free_news, journal_store, market_news, market_store, paper_journal, paper_policy, paper_signals, reference_market
+from bot import free_news, journal_store, market_news, market_store, mt5_api, mt5_notifications, paper_journal, paper_policy, paper_signals, reference_market, trade_store
 
 
 logger = logging.getLogger(__name__)
@@ -56,10 +57,12 @@ def _number(value):
 
 def validate_feed(payload, now, expected_symbol=None):
     """Accept completed M15 broker bars only; never fabricate or fill gaps."""
-    if not isinstance(payload, dict) or set(payload) != {
-        "symbol", "timeframe", "source", "quote", "candles"
-    }:
+    required = {"symbol", "timeframe", "source", "quote", "candles"}
+    if not isinstance(payload, dict) or not required <= set(payload) or not set(payload) <= required | {"device_id", "execution"}:
         raise ValueError("Invalid feed")
+    device_id = payload.get("device_id")
+    if "device_id" in payload and (type(device_id) is not str or str(UUID(device_id)) != device_id):
+        raise ValueError("Invalid market device")
     symbol = payload["symbol"]
     if (
         not isinstance(symbol, str)
@@ -106,13 +109,31 @@ def validate_feed(payload, now, expected_symbol=None):
         previous = start
     if _utc(clean_bars[-1]["time"]) > stamp:
         raise ValueError("Quote predates history")
-    return {
+    cleaned = {
         "symbol": symbol,
         "timeframe": "M15",
         "source": "MetaTrader 5",
         "quote": {"bid": bid, "ask": ask, "time": stamp.isoformat()},
         "candles": clean_bars,
     }
+    if device_id is not None:
+        cleaned["device_id"] = device_id
+    if "execution" in payload:
+        execution = payload["execution"]
+        if type(execution) is not dict or set(execution) != {"tick_size", "point", "digits", "stops_level"}:
+            raise ValueError("Invalid execution metadata")
+        digits, stops = execution["digits"], execution["stops_level"]
+        if type(digits) is not int or not 0 <= digits <= 10 or type(stops) is not int or not 0 <= stops <= 1000000:
+            raise ValueError("Invalid execution metadata")
+        cleaned["execution"] = {"tick_size": _number(execution["tick_size"]), "point": _number(execution["point"]), "digits": digits, "stops_level": stops}
+    return cleaned
+
+
+def _mt5_identity(payload):
+    identity = "mt5:" + payload["symbol"]
+    if payload.get("device_id") is not None:
+        identity += ":" + str(UUID(payload["device_id"]))
+    return identity
 
 
 def _stamp(value):
@@ -272,7 +293,7 @@ def paper_result(snapshot, now, source):
             stamp = _utc(payload["quote"]["time"])
             bars = payload["candles"]
             label = f"MetaTrader 5 — {payload['symbol']}"
-            identity = "mt5:" + payload["symbol"]
+            identity = _mt5_identity(payload)
         else:
             payload = snapshot["payload"]
             _number(payload["price"])
@@ -317,6 +338,7 @@ class MarketService:
         self.reference_lock = asyncio.Lock()
         self.next_reference_at = 0.0
         self.journal_enabled = False
+        self.trading_enabled = False
         self.review_lock = asyncio.Lock()
         self.news_source = os.getenv("NEWS_SOURCE", "rss").strip().lower()
         if self.news_source not in {"rss", "openai"}:
@@ -457,7 +479,7 @@ class MarketService:
                         observations = payload["samples"]
                     else:
                         payload = validate_feed(snapshot["payload"], now)
-                        identity = "mt5:" + payload["symbol"]
+                        identity = _mt5_identity(payload)
                         quote = payload["quote"]
                         observations = [{"time": quote["time"], "price": quote["bid"]}]
                 except (KeyError, ValueError, TypeError, OverflowError):
@@ -504,9 +526,20 @@ class MarketService:
     async def risk_pause(self, chat_id):
         if not self.journal_enabled:
             return None
-        identity = "mt5:" + os.getenv("MARKET_GOLD_SYMBOL", "XAUUSD").strip() if self.source == "mt5" else "reference:XAUUSD"
+        identity = await self.source_identity()
         history = await journal_store.recent_trades(self.pool, self.bot_id, chat_id, limit=20)
         return paper_policy.pause_until(history, identity, paper_signals.STRATEGY_ID, utc_now())
+
+    async def source_identity(self):
+        if self.source != "mt5":
+            return "reference:XAUUSD"
+        snapshot = await market_store.get_cache(self.pool, self.bot_id, "broker_feed")
+        if snapshot is not None:
+            try:
+                return _mt5_identity(validate_feed(snapshot["payload"], utc_now()))
+            except (KeyError, ValueError, TypeError, OverflowError):
+                pass
+        return "mt5:" + os.getenv("MARKET_GOLD_SYMBOL", "XAUUSD").strip()
 
     async def telegram_backoff(self, error):
         delay = error.retry_after
@@ -544,7 +577,7 @@ class MarketService:
             signal_text = "الإشارات التجريبية: سبق إرسال إعداد هذه الشمعة؛ لا توجد إشارة جديدة."
         trade = None
         if signal_id is not None and not repeated and self.journal_enabled:
-            identity = "mt5:" + os.getenv("MARKET_GOLD_SYMBOL", "XAUUSD").strip() if self.source == "mt5" else "reference:XAUUSD"
+            identity = await self.source_identity()
             trade = paper_journal.create_trade(signal_id, result, identity, utc_now(), self.trade_minutes)
             signal_text += "\n\nمدة الاختبار: 15 دقيقة من إرسال الإشارة؛ تُرسل مراجعة عند رصد الوقف أو الهدف أو انتهاء المدة."
         await bot.send_message(chat_id, signal_text, parse_mode=None)
@@ -607,6 +640,12 @@ async def _worker(application, service):
                     pass
             if not await service.send_reviews(application.bot):
                 continue
+            if service.trading_enabled:
+                await trade_store.expire_offers(service.pool, service.bot_id, utc_now())
+                if not await mt5_notifications.send_results(service, application.bot):
+                    continue
+                if not await mt5_notifications.send_offers(service, application.bot):
+                    continue
             due = await market_store.claim_due(service.pool, service.bot_id, utc_now(), limit=5)
             for subscription in due:
                 chat_id, lease_id = subscription["chat_id"], subscription["lease_id"]
@@ -646,8 +685,13 @@ async def setup(application):
     try:
         await market_store.initialize_schema(pool)
         await journal_store.initialize_schema(pool)
+        await trade_store.initialize_schema(pool)
         service = MarketService(pool, application.bot.id)
         service.journal_enabled = True
+        service.trading_enabled = (
+            service.source == "mt5"
+            and os.getenv("MT5_TRADING_ENABLED", "false").strip().lower() == "true"
+        )
         application.bot_data[SERVICE_KEY] = service
         # Do not use Application.create_task for an endless worker: stop() waits
         # for those tasks. This task is explicitly canceled before client shutdown.
@@ -811,10 +855,16 @@ async def unwatch_command(update, context):
     await market_store.disable_subscription(
         service.pool, service.bot_id, update.effective_chat.id
     )
-    await message.reply_text("تم إيقاف التقارير التلقائية. /watch لإعادة التفعيل.")
+    if service.trading_enabled:
+        await trade_store.cancel_offers(service.pool, service.bot_id, update.effective_chat.id, utc_now())
+    text = "تم إيقاف التقارير التلقائية. /watch لإعادة التفعيل."
+    if service.trading_enabled:
+        text += "\nأُلغيت طلبات MT5 المعلقة. الطلب الذي بدأ تنفيذه والصفقات المفتوحة يجب متابعتها داخل MT5؛ سيصلك إشعار نتيجة التنفيذ."
+    await message.reply_text(text)
 
 
 def register_handlers(application):
+    mt5_notifications.register_handlers(application)
     application.add_handler(CommandHandler("market", market_command, block=False))
     application.add_handler(CommandHandler("news", news_command, block=False))
     application.add_handler(CommandHandler("signals", signals_command, block=False))
@@ -824,6 +874,7 @@ def register_handlers(application):
 
 
 def install_feed_route(app, application, settings):
+    mt5_api.install_routes(app, application, settings)
     async def ingest(request: Request):
         key = getattr(settings, "market_bridge_key", "")
         if len(key) < 32:
@@ -846,6 +897,12 @@ def install_feed_route(app, application, settings):
             cleaned = validate_feed(
                 payload, utc_now(), os.getenv("MARKET_GOLD_SYMBOL", "XAUUSD").strip()
             )
+            if cleaned.get("device_id") is not None:
+                device = await trade_store.get_device(
+                    service.pool, service.bot_id, UUID(cleaned["device_id"])
+                )
+                if device is None or device["symbol"] != cleaned["symbol"]:
+                    raise ValueError("Unregistered market device")
         except (ValueError, TypeError, UnicodeDecodeError, OverflowError):
             return JSONResponse({"detail": "Invalid M15 broker data"}, status_code=422)
         accepted = await market_store.save_feed_cache(

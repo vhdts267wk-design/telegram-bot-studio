@@ -26,6 +26,11 @@ class Settings:
         """The admin panel is served only when a password is configured."""
         return bool(self.panel_password)
 
+    @property
+    def http_enabled(self) -> bool:
+        """A configured private bridge also needs HTTP, without an admin login."""
+        return self.panel_enabled or len(self.market_bridge_key) >= 32
+
     @classmethod
     def from_env(cls) -> "Settings":
         bot_token = os.getenv("BOT_TOKEN", "").strip()
@@ -63,9 +68,10 @@ class Settings:
                 )
             )
         )
-        if panel_password and not database_url:
+        market_bridge_key = os.getenv("MARKET_BRIDGE_KEY", "").strip()
+        if (panel_password or len(market_bridge_key) >= 32) and not database_url:
             raise RuntimeError(
-                "DATABASE_URL is required when PANEL_PASSWORD enables the admin panel. "
+                "DATABASE_URL is required when PANEL_PASSWORD or MARKET_BRIDGE_KEY enables HTTP. "
                 "On Railway, add DATABASE_URL=${{ Postgres.DATABASE_URL }} to the "
                 "bot service variables."
             )
@@ -79,5 +85,5 @@ class Settings:
             panel_password=panel_password,
             panel_secret_key=panel_secret_key,
             panel_secure_cookie=panel_secure_cookie,
-            market_bridge_key=os.getenv("MARKET_BRIDGE_KEY", "").strip(),
+            market_bridge_key=market_bridge_key,
         )
