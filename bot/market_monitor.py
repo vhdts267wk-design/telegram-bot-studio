@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 import hmac
+import hashlib
 import json
 import logging
 import math
@@ -15,7 +16,7 @@ from fastapi.responses import JSONResponse
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CommandHandler
 
-from bot import market_news, market_store, reference_market
+from bot import free_news, journal_store, market_news, market_store, paper_journal, paper_policy, paper_signals, reference_market
 
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,53 @@ def reference_text(snapshot, now):
     return "\n".join(lines)
 
 
+def paper_result(snapshot, now, source):
+    """Gate a paper strategy on fresh quotes and sufficiently covered real bars."""
+    label = "GoldAPI — عينات سعر مرجعي مستقل"
+    identity = "reference:XAUUSD"
+    if source == "mt5":
+        symbol = os.getenv("MARKET_GOLD_SYMBOL", "XAUUSD").strip()
+        label, identity = f"MetaTrader 5 — {symbol}", "mt5:" + symbol
+    if snapshot is None:
+        return {"state": "warmup", "candle_count": 0, "remaining_bars": 22}, label, identity
+    try:
+        received = snapshot["updated_at"]
+        if not isinstance(received, datetime) or received.tzinfo is None:
+            raise ValueError("Invalid receipt time")
+        if source == "mt5":
+            payload = validate_feed(snapshot["payload"], now)
+            stamp = _utc(payload["quote"]["time"])
+            bars = payload["candles"]
+            label = f"MetaTrader 5 — {payload['symbol']}"
+            identity = "mt5:" + payload["symbol"]
+        else:
+            payload = snapshot["payload"]
+            _number(payload["price"])
+            stamp = _utc(payload["as_of"])
+            observed = reference_market.aggregate_samples(payload["samples"], now)
+            bars = []
+            for bar in reversed(observed):
+                if not bar["coverage_ok"]:
+                    break
+                if bars and _utc(bars[0]["time"]) - _utc(bar["time"]) != timedelta(minutes=15):
+                    break
+                bars.insert(0, {key: bar[key] for key in ("time", "open", "high", "low", "close")})
+        if not (
+            timedelta(0) <= now - stamp <= timedelta(seconds=QUOTE_FRESH_SECONDS)
+            and timedelta(0) <= now - received <= timedelta(minutes=3)
+        ):
+            return {"state": "stale", "candle_count": len(bars)}, label, identity
+        # A missing interval ends the usable history; never fill a strategy gap.
+        contiguous = []
+        for bar in reversed(bars):
+            if contiguous and _utc(contiguous[0]["time"]) - _utc(bar["time"]) != timedelta(minutes=15):
+                break
+            contiguous.insert(0, bar)
+        return paper_signals.analyze_paper_signal(contiguous, now=now), label, identity
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return {"state": "invalid", "candle_count": 0}, label, identity
+
+
 class MarketService:
     def __init__(self, pool, bot_id):
         self.pool = pool
@@ -268,6 +316,13 @@ class MarketService:
         self.reference_client = None
         self.reference_lock = asyncio.Lock()
         self.next_reference_at = 0.0
+        self.journal_enabled = False
+        self.review_lock = asyncio.Lock()
+        self.news_source = os.getenv("NEWS_SOURCE", "rss").strip().lower()
+        if self.news_source not in {"rss", "openai"}:
+            raise ValueError("Unsupported news source")
+        self.openai_enabled = os.getenv("OPENAI_ENABLED", "false").strip().lower() == "true"
+        self.trade_minutes = 15
 
     async def refresh_reference(self):
         async with self.reference_lock:
@@ -315,6 +370,30 @@ class MarketService:
         snapshot = await market_store.get_cache(self.pool, self.bot_id, "reference_feed")
         return reference_text(snapshot, utc_now())
 
+    async def signals(self):
+        if self.source == "reference":
+            await self.refresh_reference()
+        key = "broker_feed" if self.source == "mt5" else "reference_feed"
+        snapshot = await market_store.get_cache(self.pool, self.bot_id, key)
+        result, source, identity = paper_result(snapshot, utc_now(), self.source)
+        signal_id = None
+        if result.get("state") == "signal":
+            token = "|".join((identity, result["strategy_id"], result["bar_time"], result["direction"]))
+            signal_id = hashlib.sha256(token.encode()).hexdigest()
+            # Preserve levels once a setup is first computed. A rolling window
+            # must not silently change a previously shown paper setup.
+            previous = await market_store.get_cache(self.pool, self.bot_id, "paper_setup")
+            if previous is not None and previous["payload"].get("id") == signal_id:
+                frozen = previous["payload"].get("result")
+                if isinstance(frozen, dict) and frozen.get("state") == "signal":
+                    result = frozen
+            else:
+                await market_store.save_cache(
+                    self.pool, self.bot_id, "paper_setup",
+                    {"id": signal_id, "result": result}, utc_now(),
+                )
+        return result, paper_signals.format_paper_signal(result, source=source), signal_id
+
     async def news(self):
         async with self.news_lock:
             now = utc_now()
@@ -325,7 +404,8 @@ class MarketService:
                     fetched = _utc(payload["fetched_at"])
                     chunks = payload["html_chunks"]
                     if (
-                        timedelta(0) <= now - fetched < REPORT_INTERVAL
+                        payload.get("source") == self.news_source
+                        and timedelta(0) <= now - fetched < REPORT_INTERVAL
                         and isinstance(chunks, list) and 1 <= len(chunks) <= 8
                         and all(
                             isinstance(c, str) and 0 < len(c.encode("utf-16-le")) // 2 <= 4096
@@ -337,24 +417,105 @@ class MarketService:
                     pass
             if monotonic() < self.retry_news_at:
                 raise market_news.BriefingUnavailable()
-            api_key = os.getenv("OPENAI_API_KEY", "").strip()
-            if not api_key:
-                raise market_news.BriefingUnavailable()
-            if not await market_store.claim_news_request(
-                self.pool, self.bot_id, now, limit=NEWS_DAILY_LIMIT
-            ):
-                raise market_news.BriefingUnavailable()
             try:
-                briefing = await market_news.generate_briefing(api_key, now)
+                if self.news_source == "rss":
+                    briefing = await free_news.generate_briefing(now)
+                else:
+                    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+                    if not self.openai_enabled or not api_key:
+                        raise market_news.BriefingUnavailable()
+                    if not await market_store.claim_news_request(
+                        self.pool, self.bot_id, now, limit=NEWS_DAILY_LIMIT
+                    ):
+                        raise market_news.BriefingUnavailable()
+                    briefing = await market_news.generate_briefing(api_key, now)
                 await market_store.save_cache(
                     self.pool, self.bot_id, "news",
-                    {"fetched_at": briefing.fetched_at.isoformat(),
+                    {"source": self.news_source, "fetched_at": briefing.fetched_at.isoformat(),
                      "html_chunks": list(briefing.html_chunks)}, utc_now(),
                 )
                 return briefing
             except market_news.BriefingUnavailable:
                 self.retry_news_at = monotonic() + 300
                 raise
+
+    async def review_trades(self):
+        """Advance durable paper setups from actual post-send quote samples."""
+        if not self.journal_enabled:
+            return
+        async with self.review_lock:
+            now = utc_now()
+            key = "broker_feed" if self.source == "mt5" else "reference_feed"
+            snapshot = await market_store.get_cache(self.pool, self.bot_id, key)
+            observations = []
+            identity = "reference:XAUUSD"
+            if snapshot is not None:
+                try:
+                    if self.source == "reference":
+                        payload = snapshot["payload"]
+                        reference_market.aggregate_samples(payload["samples"], now)
+                        observations = payload["samples"]
+                    else:
+                        payload = validate_feed(snapshot["payload"], now)
+                        identity = "mt5:" + payload["symbol"]
+                        quote = payload["quote"]
+                        observations = [{"time": quote["time"], "price": quote["bid"]}]
+                except (KeyError, ValueError, TypeError, OverflowError):
+                    observations = []
+            for row in await journal_store.list_open(self.pool, self.bot_id):
+                try:
+                    trade = row["payload"]
+                    points = observations if trade["source_identity"] == identity else []
+                    advanced = paper_journal.advance_trade(trade, points, now)
+                    if advanced != trade:
+                        await journal_store.update_trade(
+                            self.pool, self.bot_id, row["chat_id"], row["signal_id"],
+                            advanced, now, expected_updated_at=row["updated_at"],
+                        )
+                except (KeyError, ValueError, TypeError, OverflowError):
+                    logger.warning("Paper review skipped invalid observations or journal row.")
+
+    async def send_reviews(self, bot):
+        if not self.journal_enabled:
+            return True
+        for row in await journal_store.list_reviews(self.pool, self.bot_id):
+            try:
+                text = paper_journal.format_review(row["payload"])
+                until = await self.risk_pause(row["chat_id"])
+                if until is not None:
+                    text += f"\n\nتم إيقاف الإشارات الجديدة مؤقتاً بعد 3 وقفات مرصودة ببيانات مكتملة؛ إعادة التقييم بعد {_stamp(until)}."
+                if not await journal_store.review_active(
+                    self.pool, self.bot_id, row["chat_id"], row["signal_id"]
+                ):
+                    continue
+                await bot.send_message(row["chat_id"], text, parse_mode=None)
+                await journal_store.mark_review_sent(
+                    self.pool, self.bot_id, row["chat_id"], row["signal_id"], utc_now()
+                )
+            except Forbidden:
+                await market_store.disable_subscription(self.pool, self.bot_id, row["chat_id"])
+            except RetryAfter as exc:
+                await self.telegram_backoff(exc)
+                return False
+            except Exception as exc:
+                logger.warning("Paper review delivery failed (%s).", type(exc).__name__)
+        return True
+
+    async def risk_pause(self, chat_id):
+        if not self.journal_enabled:
+            return None
+        identity = "mt5:" + os.getenv("MARKET_GOLD_SYMBOL", "XAUUSD").strip() if self.source == "mt5" else "reference:XAUUSD"
+        history = await journal_store.recent_trades(self.pool, self.bot_id, chat_id, limit=20)
+        return paper_policy.pause_until(history, identity, paper_signals.STRATEGY_ID, utc_now())
+
+    async def telegram_backoff(self, error):
+        delay = error.retry_after
+        seconds = delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
+        delay_until = utc_now() + timedelta(seconds=max(1, min(seconds, 86400)))
+        await market_store.save_cache(
+            self.pool, self.bot_id, "telegram_backoff",
+            {"until": delay_until.isoformat()}, utc_now(),
+        )
 
     async def send_report(self, bot, chat_id, lease_id=None):
         async def may_send():
@@ -365,6 +526,38 @@ class MarketService:
         if not await may_send():
             return
         await bot.send_message(chat_id, text, parse_mode=None)
+        if not await may_send():
+            return
+        result, signal_text, signal_id = await self.signals()
+        if not await may_send():
+            return
+        until = await self.risk_pause(chat_id)
+        if until is not None:
+            signal_id = None
+            signal_text = f"الإشارات التجريبية موقوفة بعد 3 وقفات متتالية مرصودة ببيانات مكتملة. إعادة التقييم بعد {_stamp(until)}. /reviews لعرض النتائج والملاحظات."
+        delivery_key = f"paper_delivery:{chat_id}"
+        delivered = await market_store.get_cache(self.pool, self.bot_id, delivery_key)
+        if not await may_send():
+            return
+        repeated = signal_id is not None and delivered is not None and delivered["payload"].get("id") == signal_id
+        if repeated:
+            signal_text = "الإشارات التجريبية: سبق إرسال إعداد هذه الشمعة؛ لا توجد إشارة جديدة."
+        trade = None
+        if signal_id is not None and not repeated and self.journal_enabled:
+            identity = "mt5:" + os.getenv("MARKET_GOLD_SYMBOL", "XAUUSD").strip() if self.source == "mt5" else "reference:XAUUSD"
+            trade = paper_journal.create_trade(signal_id, result, identity, utc_now(), self.trade_minutes)
+            signal_text += "\n\nمدة الاختبار: 15 دقيقة من إرسال الإشارة؛ تُرسل مراجعة عند رصد الوقف أو الهدف أو انتهاء المدة."
+        await bot.send_message(chat_id, signal_text, parse_mode=None)
+        if trade is not None:
+            # The evaluation window begins only after Telegram accepted the
+            # signal. Slow sending must not include earlier price samples.
+            trade = paper_journal.create_trade(signal_id, result, identity, utc_now(), self.trade_minutes)
+            await journal_store.open_trade(self.pool, self.bot_id, chat_id, trade, utc_now())
+        if signal_id is not None and not repeated:
+            await market_store.save_cache(
+                self.pool, self.bot_id, delivery_key,
+                {"id": signal_id, "result": result, "sent_at": utc_now().isoformat()}, utc_now(),
+            )
         if not await may_send():
             return
         try:
@@ -404,6 +597,7 @@ async def _worker(application, service):
                 service.pool, service.bot_id
             ):
                 await service.refresh_reference()
+            await service.review_trades()
             backoff = await market_store.get_cache(service.pool, service.bot_id, "telegram_backoff")
             if backoff is not None:
                 try:
@@ -411,6 +605,8 @@ async def _worker(application, service):
                         continue
                 except (KeyError, ValueError, TypeError):
                     pass
+            if not await service.send_reviews(application.bot):
+                continue
             due = await market_store.claim_due(service.pool, service.bot_id, utc_now(), limit=5)
             for subscription in due:
                 chat_id, lease_id = subscription["chat_id"], subscription["lease_id"]
@@ -429,13 +625,7 @@ async def _worker(application, service):
                         service.pool, service.bot_id, chat_id
                     )
                 except RetryAfter as exc:
-                    delay = exc.retry_after
-                    seconds = delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
-                    delay_until = utc_now() + timedelta(seconds=max(1, min(seconds, 86400)))
-                    await market_store.save_cache(
-                        service.pool, service.bot_id, "telegram_backoff",
-                        {"until": delay_until.isoformat()}, utc_now(),
-                    )
+                    await service.telegram_backoff(exc)
                     await market_store.release_delivery(
                         service.pool, service.bot_id, chat_id, lease_id, utc_now()
                     )
@@ -455,7 +645,9 @@ async def setup(application):
         return
     try:
         await market_store.initialize_schema(pool)
+        await journal_store.initialize_schema(pool)
         service = MarketService(pool, application.bot.id)
+        service.journal_enabled = True
         application.bot_data[SERVICE_KEY] = service
         # Do not use Application.create_task for an endless worker: stop() waits
         # for those tasks. This task is explicitly canceled before client shutdown.
@@ -540,6 +732,53 @@ async def news_command(update, context):
         service.active_users.discard(actor)
 
 
+async def signals_command(update, context):
+    message = update.effective_message
+    if message is None:
+        return
+    service = _service(update, context)
+    if service is None:
+        await message.reply_text("الإشارات التجريبية متاحة في المحادثة الخاصة بعد اتصال مصدر البيانات.")
+        return
+    actor = update.effective_chat.id
+    now = monotonic()
+    service.market_command_times = {a: t for a, t in service.market_command_times.items() if now - t < 5}
+    if actor in service.active_users or actor in service.market_command_times or len(service.active_users) >= 2:
+        await message.reply_text("انتظر قليلاً قبل طلب الإشارات التجريبية مجدداً.")
+        return
+    service.active_users.add(actor)
+    service.market_command_times[actor] = now
+    try:
+        _, text, _ = await service.signals()
+        await message.reply_text(text, parse_mode=None)
+    finally:
+        service.active_users.discard(actor)
+
+
+async def reviews_command(update, context):
+    message = update.effective_message
+    if message is None:
+        return
+    service = _service(update, context)
+    if service is None or not service.journal_enabled:
+        await message.reply_text("سجل الصفقات متاح في المحادثة الخاصة بعد تفعيل المتابعة.")
+        return
+    actor = update.effective_chat.id
+    if actor in service.active_users or len(service.active_users) >= 2:
+        await message.reply_text("انتظر قليلاً قبل طلب السجل.")
+        return
+    service.active_users.add(actor)
+    try:
+        await service.review_trades()
+        trades = await journal_store.recent_trades(service.pool, service.bot_id, actor, limit=3)
+        if not trades:
+            await message.reply_text("لا توجد صفقات ورقية مسجلة بعد. /watch لتفعيل الإشارات ومراجعتها.", parse_mode=None)
+        for trade in trades:
+            await message.reply_text(paper_journal.format_review(trade), parse_mode=None)
+    finally:
+        service.active_users.discard(actor)
+
+
 async def watch_command(update, context):
     message = update.effective_message
     if message is None:
@@ -553,9 +792,11 @@ async def watch_command(update, context):
     )
     await message.reply_text(
         "تم تفعيل تقرير XAUUSD والأخبار كل 15 دقيقة. أول تقرير خلال 15 دقيقة.\n"
-        "يعرض السعر المرجعي للذهب وسجل M15 الذي يُجمع تلقائياً، وأخباراً مع روابط وتواريخ.\n"
-        "استخدم /market أو /news الآن، و/unwatch لإيقاف التقارير.\n"
-        "البحث مشترك ومحدود بـ96 محاولة يومياً، ويستهلك رصيد OpenAI."
+        "يشمل الأسعار وإشارات تجريبية بقواعد EMA9/21 وATR14، وأخباراً مع مصادر.\n"
+        "الإشارة تظهر عند تحقق الشرط فقط، بعد 22 شمعة M15 مكتملة ومتتابعة بتغطية كافية.\n"
+        "مدة الصفقة الورقية 15 دقيقة، مع مراجعة النتيجة وملاحظات محفوظة.\n"
+        "استخدم /signals أو /market أو /reviews أو /news الآن، و/unwatch لإيقاف التقارير.\n"
+        "الأسعار والإشارات والأخبار العامة تعمل بلا OpenAI؛ عناوين الأخبار بلغتها الأصلية."
     )
 
 
@@ -576,6 +817,8 @@ async def unwatch_command(update, context):
 def register_handlers(application):
     application.add_handler(CommandHandler("market", market_command, block=False))
     application.add_handler(CommandHandler("news", news_command, block=False))
+    application.add_handler(CommandHandler("signals", signals_command, block=False))
+    application.add_handler(CommandHandler("reviews", reviews_command, block=False))
     application.add_handler(CommandHandler("watch", watch_command))
     application.add_handler(CommandHandler("unwatch", unwatch_command))
 
