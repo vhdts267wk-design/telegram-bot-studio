@@ -14,6 +14,7 @@ Docker, and Railway.
 - `/start`, `/help`, `/about`, and `/ping` commands
 - `/gold`, `/market`, `/signals`, `/reviews` and `/news` work without OpenAI or screenshots
 - `/market` and `/news` work without screenshots; `/watch` sends a report every 15 minutes
+- Optional, explicitly enabled **Demo MT5 orders at 0.01 lot**, approved with Accept/Reject in a paired private chat
 - Echo replies for normal text messages
 - Fallback handler for unknown commands
 - Error logging
@@ -26,12 +27,14 @@ Docker, and Railway.
 
 ## Data Store
 
-PostgreSQL is optional when the bot runs without the admin panel. When
+PostgreSQL is optional for a plain bot without the admin panel or bridge HTTP. When
 `DATABASE_URL` is set, the bot connects on startup and creates its tables
 automatically. When `PANEL_PASSWORD` enables the panel, a working
 `DATABASE_URL` is required and startup fails with a clear error if it is missing
-or unreachable. This prevents the panel from silently running without its
-command store.
+or unreachable. A configured `MARKET_BRIDGE_KEY` of at least 32 characters also
+enables HTTP and requires PostgreSQL, even with the admin panel disabled.
+Automatic subscriptions, paper reviews, device pairing and approved trade
+requests use that durable store.
 
 - **PostgreSQL** — a `users` table is created automatically on first run. `/start` inserts
   a new user or refreshes `username`, `first_name`, and `last_seen` for an existing one.
@@ -69,7 +72,8 @@ Telegram bots cannot display custom buttons before a user starts or messages the
 | `/signals` | Inspect the current experimental setup; no journal entry is opened |
 | `/reviews` | Recent 15-minute paper outcomes and review notes |
 | `/watch` | Opt in to a report every 15 minutes in a private chat |
-| `/unwatch` | Stop automatic reports |
+| `/unwatch` | Stop reports and cancel unclaimed trade requests; executing/open trades are unaffected |
+| `/connect_mt5 CODE` | Pair the locally started Demo bridge in its owner's private chat |
 
 The built-in commands above always take precedence. Any other `/command` is
 resolved dynamically from commands you create in Telegram Bot Studio.
@@ -107,7 +111,9 @@ never force a BUY/SELL every 15 minutes, fill missing bars or use a forming
 candle. Reference samples are not broker OHLC; spreads, fees, slippage and fills
 are unmodelled. The rules have correctness tests with synthetic data, **not
 historical profitability validation**, and are not ready for live trading.
-The bot executes no orders and reads no balances or positions.
+The default paper workflow places no orders. The separately enabled Demo
+workflow below can place real broker orders on a Demo account; its local helper
+checks account identity and, on netting accounts, existing positions and orders.
 
 The setup identity includes source, exact symbol, strategy version, triggering
 bar and direction. Its initially computed levels are saved. Worker delivery
@@ -162,13 +168,52 @@ duplicate; delivery is not an exactly-once guarantee. Paper-review delivery
 also assumes one polling replica. A failure after a signal is accepted but
 before journal persistence can leave that signal without a review record.
 
-An optional [read-only Windows MT5 bridge](bridge/README.md) can use a connected
-broker terminal later. Keep the Windows-only dependency out of Railway's server
-requirements. Explicitly set `MARKET_SOURCE=mt5`, `MARKET_GOLD_SYMBOL` to the exact
-broker gold symbol, and configure a private `MARKET_BRIDGE_KEY` of at least
-32 characters on server and bridge. The protected POST endpoint `/api/market/feed`
-is disabled without that key; it is served only with the panel enabled. No account
-balances, positions, login details or trading operations are needed.
+The [Windows MT5 bridges](bridge/README.md) use your already running, connected
+broker terminal. The read-only helper uploads market data; the separate Demo
+helper can execute explicitly approved orders. Install their Windows SDK in
+`bridge/.venv`, separate from Railway's server requirements. Set
+`MARKET_SOURCE=mt5`, `MARKET_GOLD_SYMBOL` to the exact broker gold symbol, and the
+same private `MARKET_BRIDGE_KEY` of at least 32 characters on server and bridge.
+The protected `/api/market/feed` endpoint runs with that key even when the admin
+panel is disabled. PostgreSQL is required for this HTTP mode.
+
+### Optional Demo orders after Accept
+
+Order execution defaults to **off** (`MT5_TRADING_ENABLED=false`). This release
+supports only a **Demo account and exactly 0.01 lot**. Enabling it on Railway
+also requires the user-started local Demo helper; the server never connects to
+MT5 or sends an order itself.
+
+Follow the setup in [bridge/README.md](bridge/README.md), then start
+`bridge/start_mt5_bridge.ps1` with the exact running terminal, broker symbol and
+your service's HTTPS feed URL. The launcher asks for the private bridge key as
+hidden input and requires the local phrase `ENABLE DEMO ORDERS`. In the private
+bot chat, use `/connect_mt5 CODE` with the code shown by the helper; it expires
+after ten minutes and can bind one owner once. Pairing enables alerts; `/watch`
+can enable them again after `/unwatch`.
+
+Offers require fresh device-bound quotes and a valid completed M15 signal.
+Broker grid restrictions normalize the displayed SL/TP before the offer is
+saved. Its levels, symbol, Demo mode and 0.01-lot volume remain fixed. Accept is
+valid for **at most five minutes**, sometimes less, and queues one approved
+request; Reject sends no order. The bridge checks a current quote, the bound
+Demo account, volume, protection levels and broker restrictions before sending.
+The spread-plus-price-drift guard is checked before submission; it cannot
+guarantee the eventual fill or that a broker honors its deviation parameter.
+
+One accepted offer permits one order-send attempt. Restarting, timeouts or an
+unknown outcome never trigger another attempt. A `filled` notification requires
+MT5's full-execution return code, matching full volume and a valid order ticket;
+Accept alone is not execution confirmation. Check MT5 when the result is
+unknown. `/unwatch` cancels pending unclaimed requests, while an executing
+request or open position remains unaffected; its final acknowledgment can still
+arrive. The separate 15-minute paper journal does not close an MT5 position.
+
+Keep Windows and the selected MT5 terminal awake and connected, and keep the
+foreground helper open. Account passwords and account identifiers are not
+uploaded. The helper stores a salted account-binding hash locally and refuses
+a changed account or terminal configuration; retain its local ledger to prevent
+offer replay.
 
 ## Telegram Bot Studio
 
@@ -186,15 +231,17 @@ no extra service required. Use it to manage dynamic commands at runtime:
 
 **Enabling it:** the panel is served only when `PANEL_PASSWORD` is set, and it
 requires `DATABASE_URL` (Postgres is the command store). Without `PANEL_PASSWORD`
-the bot runs as a plain poller. Once enabled, open your Railway service URL (or
+the admin pages are disabled; a configured private bridge can still serve HTTP.
+With neither the panel nor bridge HTTP enabled, the bot is a plain poller.
+Once the panel is enabled, open your Railway service URL (or
 `http://localhost:8080` locally) and sign in with `PANEL_USERNAME` / `PANEL_PASSWORD`.
 
-For a service with the panel enabled, configure Railway's health check as
+For a service with the panel or private bridge HTTP enabled, configure Railway's health check as
 `/healthz`. It reports ready only while the bot is running, polling is active,
 PostgreSQL responds, and Telegram accepts the bot token. Telegram checks time
 out after three seconds and are cached for ten seconds. A rejected token needs
 to be replaced privately in the active bot service, followed by a redeploy.
-Leave this health check unset for a plain poller,
+Leave this health check unset for a plain poller with neither HTTP feature enabled,
 which does not serve HTTP. Run only one polling deployment for each bot token;
 disconnect automatic deployments on any retired duplicate service.
 
@@ -247,16 +294,17 @@ and all state-changing forms are CSRF-protected. Always use a strong
 | `NEWS_SOURCE` | No | `rss` | Public official headlines; `openai` requires explicit paid opt-in |
 | `OPENAI_API_KEY` | Legacy paid features only | - | Not needed for prices, paper signals, reviews or RSS |
 | `OPENAI_MODEL`     | No | `gpt-4.1-mini` | Image-capable Responses API model available to your OpenAI project |
-| `DATABASE_URL`     | For panel | -  | PostgreSQL connection string; required when `PANEL_PASSWORD` is set |
+| `DATABASE_URL`     | For panel or bridge HTTP | - | PostgreSQL store; also needed for automatic reports and review history |
 | `PANEL_PASSWORD`   | No  | -       | Enables Telegram Bot Studio when set; password to sign in     |
 | `PANEL_USERNAME`   | No  | `admin` | Username for Telegram Bot Studio                              |
 | `PANEL_SECRET_KEY` | No  | derived | Secret for signing panel session cookies (derived from password if empty) |
 | `PANEL_SECURE_COOKIE` | No | Railway: `true` | Require HTTPS for panel session cookies |
-| `PORT`             | No  | `8080`  | Port the panel binds to (Railway injects this automatically)  |
+| `PORT`             | No  | `8080`  | HTTP port for panel/bridge endpoints (Railway injects this automatically) |
 | `LOG_LEVEL`        | No  | `INFO`  | Logging level, such as `DEBUG`, `INFO`, or `ERROR`            |
 | `MARKET_SOURCE` | No | `reference` | Keyless reference prices, or explicitly `mt5` for a configured broker bridge |
-| `MARKET_BRIDGE_KEY` | For MT5 only | - | Private ingest key of at least 32 characters; never send in chat |
+| `MARKET_BRIDGE_KEY` | For MT5 only | - | Private ingest/control key of at least 32 characters; enables HTTP and requires PostgreSQL; never send in chat |
 | `MARKET_GOLD_SYMBOL` | For MT5 only | `XAUUSD` | Exact broker gold symbol, including any suffix |
+| `MT5_TRADING_ENABLED` | No | `false` | Explicitly enable private Demo 0.01-lot approval requests; the local Demo helper is also required |
 
 On Railway, add a **PostgreSQL** service and reference its connection string
 from the bot service:

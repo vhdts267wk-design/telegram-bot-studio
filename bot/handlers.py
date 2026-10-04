@@ -93,6 +93,7 @@ BOT_COMMANDS = (
     ("reviews", "Paper trade outcomes and review notes"),
     ("watch", "Enable prices, paper signals and news every 15 min"),
     ("unwatch", "Stop automatic reports"),
+    ("connect_mt5", "Pair your Demo MT5 device for trade approvals"),
 )
 
 MENU_HELP = "Help"
@@ -113,7 +114,8 @@ HELP_TEXT = """Available commands:
 /signals - Experimental BUY/SELL, reference entry, stop and target
 /reviews - Last paper outcomes and review notes
 /watch - Prices, paper signals and news every 15 min
-/unwatch - Stop automatic reports"""
+/unwatch - Stop automatic reports and pending MT5 requests
+/connect_mt5 CODE - Pair your Demo MT5 device (0.01 lot)"""
 
 GOLD_PHOTO_GUIDANCE = (
     "Send a clear XAUUSD screenshot using Telegram's Photo option, with the "
@@ -183,7 +185,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "screenshots. Use /market for prices, /news for cited news, /signals for "
         "experimental paper BUY/SELL setups, and /watch for a report every 15 minutes. "
         "/unwatch stops it. Signals require sufficient completed M15 history and "
-        "a confirmed rule; the bot does not place trades.\n\n"
+        "a confirmed rule. If you pair a Demo MT5 device with /connect_mt5, each "
+        "Accept can request one 0.01-lot trade on that device; wait for MT5 confirmation.\n\n"
         "You can also send a clear XAUUSD chart photo with its timeframe and "
         "price scale visible for an educational explanation.\n\n"
         "Choose a menu button below or type /help to see the available commands.",
@@ -223,8 +226,9 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "I report XAUUSD reference prices, observed M15 movements, and cited "
         "political/economic news. /signals adds experimental paper BUY/SELL setups "
         "from transparent rules, with reference entry, stop and target. /watch sends "
-        "reports every 15 minutes without screenshots. No trades are executed, and "
-        "the strategy has not been validated for live trading."
+        "reports every 15 minutes without screenshots. An explicitly paired Demo MT5 "
+        "device can execute 0.01 lot only after your Accept. The strategy has not "
+        "been validated for live trading."
     )
 
 

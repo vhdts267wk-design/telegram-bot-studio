@@ -196,6 +196,10 @@ def create_app(application, settings) -> FastAPI:
             return JSONResponse({"status": "unavailable"}, status_code=503)
         return {"status": "ok"}
 
+    # Bridge-only deployments must not expose a blank-password admin login.
+    if not settings.panel_password:
+        return app
+
     @app.get("/login", response_class=HTMLResponse)
     async def login_form(request: Request):
         if request.session.get("authenticated"):
