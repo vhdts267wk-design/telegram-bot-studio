@@ -6,7 +6,8 @@ import re
 
 
 _SECRET_NAMES = (
-    "BOT_TOKEN", "OPENAI_API_KEY", "DATABASE_URL", "PANEL_PASSWORD", "PANEL_SECRET_KEY"
+    "BOT_TOKEN", "OPENAI_API_KEY", "DATABASE_URL", "PANEL_PASSWORD", "PANEL_SECRET_KEY",
+    "MARKET_BRIDGE_KEY",
 )
 _TOKEN_RE = re.compile(r"(?:bot)?\d{6,12}:[A-Za-z0-9_-]{30,}")
 _API_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}")

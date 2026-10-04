@@ -8,7 +8,7 @@ from telegram import Update
 from telegram.error import InvalidToken
 from telegram.ext import Application, ApplicationBuilder
 
-from bot import commands, db
+from bot import commands, db, market_monitor
 from bot.config import Settings
 from bot.logging_utils import configure_logging
 from bot.handlers import (
@@ -53,6 +53,7 @@ def build_application(settings: Settings) -> Application:
         )
         # Load panel-managed commands before publishing the Telegram menu.
         await commands.reload(application.bot_data[DB_KEY])
+        await market_monitor.setup(application)
         try:
             await set_bot_commands(application)
         except Exception as exc:
@@ -62,6 +63,7 @@ def build_application(settings: Settings) -> Application:
             )
 
     async def on_shutdown(application: Application) -> None:
+        await market_monitor.close(application)
         pool = application.bot_data.get(DB_KEY)
         if pool is not None:
             await db.close_pool(pool)
@@ -70,6 +72,7 @@ def build_application(settings: Settings) -> Application:
         ApplicationBuilder()
         .token(settings.bot_token)
         .post_init(on_startup)
+        .post_stop(market_monitor.stop)
         .post_shutdown(on_shutdown)
         .build()
     )
@@ -94,6 +97,7 @@ async def _shutdown_application(
                 first_error = exc
             logger.warning("Bot cleanup failed during %s (%s).", step, type(exc).__name__)
 
+    await attempt("market monitor stop", lambda: market_monitor.stop(application))
     if application.updater is not None and application.updater.running:
         await attempt("polling stop", application.updater.stop)
     if application.running:

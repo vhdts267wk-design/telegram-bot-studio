@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 REPLY_TYPES = ("text", "photo", "document")
 
 # Built-in names are shared with the panel's command and button validation.
-BUILTIN_COMMANDS = ("start", "help", "about", "ping", "gold")
+BUILTIN_COMMANDS = ("start", "help", "about", "ping", "gold", "market", "news", "watch", "unwatch")
 RESERVED_NAMES = frozenset(BUILTIN_COMMANDS)
 
 # name -> command dict (enabled commands only).
@@ -35,7 +35,9 @@ async def reload(pool) -> None:
         _MENU_BUTTONS = []
         return
     command_rows = await db.list_commands(pool, enabled_only=True)
-    _REGISTRY = {cmd["name"]: cmd for cmd in command_rows}
+    _REGISTRY = {
+        cmd["name"]: cmd for cmd in command_rows if cmd["name"] not in RESERVED_NAMES
+    }
     _MENU_BUTTONS = await db.list_menu_buttons(pool, enabled_only=True)
     logger.info(
         "Loaded %d dynamic command(s) and %d menu button(s).",
