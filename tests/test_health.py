@@ -21,7 +21,7 @@ def make_application():
 
 def make_settings():
     return SimpleNamespace(
-        panel_secret_key="test-only-session-secret", panel_secure_cookie=False
+        panel_secret_key="test-only-session-secret", panel_secure_cookie=False, panel_password=""
     )
 
 
