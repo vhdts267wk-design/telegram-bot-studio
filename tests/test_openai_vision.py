@@ -70,7 +70,7 @@ class OpenAIVisionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.dict(
-            handlers.os.environ, {"OPENAI_API_KEY": "local-test-key"}, clear=True
+            handlers.os.environ, {"OPENAI_API_KEY": "local-test-key", "OPENAI_ENABLED": "true"}, clear=True
         ), patch.object(handlers, "AsyncOpenAI", side_effect=create_client):
             await handlers.gold_photo(update, SimpleNamespace(bot_data={}))
 

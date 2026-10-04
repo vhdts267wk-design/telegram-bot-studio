@@ -49,6 +49,7 @@ def briefing(stamp=NOW):
 def cached_news(stamp=NOW, chunks=None):
     return {
         "payload": {
+            "source": "openai",
             "fetched_at": stamp.isoformat(),
             "html_chunks": list(briefing(stamp).html_chunks) if chunks is None else chunks,
         },
@@ -181,7 +182,7 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
         self.clock_patch = patch.object(monitor, "utc_now", return_value=NOW)
         self.env_patch = patch.dict(
             monitor.os.environ,
-            {"OPENAI_API_KEY": "synthetic-test-key", "MARKET_SOURCE": "mt5"},
+            {"OPENAI_API_KEY": "synthetic-test-key", "MARKET_SOURCE": "mt5", "NEWS_SOURCE": "openai", "OPENAI_ENABLED": "true"},
             clear=True,
         )
         self.clock_patch.start()
@@ -379,15 +380,18 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
             return briefing()
 
         self.service.market = AsyncMock(return_value="بيانات الأسعار التجريبية")
+        self.service.signals = AsyncMock(return_value=({"state": "warmup"}, "جارٍ جمع بيانات الإشارة", None))
         self.service.news = get_news
         bot = SimpleNamespace(send_message=AsyncMock())
-        with patch.object(monitor.market_store, "delivery_active", new_callable=AsyncMock, side_effect=lambda *args: enabled["value"]):
+        with patch.object(monitor.market_store, "delivery_active", new_callable=AsyncMock, side_effect=lambda *args: enabled["value"]), patch.object(monitor.market_store, "get_cache", new_callable=AsyncMock, return_value=None):
             task = asyncio.create_task(self.service.send_report(bot, 4401, "synthetic-lease"))
             await asyncio.wait_for(entered.wait(), 1)
             enabled["value"] = False
             proceed.set()
             await task
-        bot.send_message.assert_awaited_once_with(4401, "بيانات الأسعار التجريبية", parse_mode=None)
+        self.assertEqual(bot.send_message.await_count, 2)
+        bot.send_message.assert_any_await(4401, "بيانات الأسعار التجريبية", parse_mode=None)
+        bot.send_message.assert_any_await(4401, "جارٍ جمع بيانات الإشارة", parse_mode=None)
 
     async def test_stop_cancels_owned_worker_without_waiting_forever(self):
         task = asyncio.create_task(asyncio.Event().wait())

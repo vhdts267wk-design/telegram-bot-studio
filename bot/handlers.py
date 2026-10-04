@@ -89,7 +89,9 @@ BOT_COMMANDS = (
     ("gold", "XAUUSD chart education"),
     ("market", "XAUUSD market report without screenshots"),
     ("news", "Cited political and economic news"),
-    ("watch", "Enable market and news reports every 15 min"),
+    ("signals", "Experimental paper BUY/SELL setups"),
+    ("reviews", "Paper trade outcomes and review notes"),
+    ("watch", "Enable prices, paper signals and news every 15 min"),
     ("unwatch", "Stop automatic reports"),
 )
 
@@ -98,6 +100,7 @@ MENU_ABOUT = "About"
 MENU_PING = "Ping"
 MENU_MARKET = "Market"
 MENU_NEWS = "News"
+MENU_SIGNALS = "Signals"
 
 HELP_TEXT = """Available commands:
 /start - Start the bot
@@ -107,7 +110,9 @@ HELP_TEXT = """Available commands:
 /gold - Explain an XAUUSD chart for education
 /market - XAUUSD market data without screenshots
 /news - Political and economic news with sources
-/watch - Enable market and news reports every 15 min
+/signals - Experimental BUY/SELL, reference entry, stop and target
+/reviews - Last paper outcomes and review notes
+/watch - Prices, paper signals and news every 15 min
 /unwatch - Stop automatic reports"""
 
 GOLD_PHOTO_GUIDANCE = (
@@ -120,7 +125,7 @@ DYNAMIC_CALLBACK_PREFIX = "command:"
 
 
 def _main_menu_keyboard() -> ReplyKeyboardMarkup:
-    rows: list[list[str]] = [[MENU_MARKET, MENU_NEWS], [MENU_HELP, MENU_ABOUT], [MENU_PING]]
+    rows: list[list[str]] = [[MENU_MARKET, MENU_NEWS], [MENU_SIGNALS], [MENU_HELP, MENU_ABOUT], [MENU_PING]]
     custom_rows: dict[int, list[str]] = {}
     for button in commands.reply_menu_buttons():
         custom_rows.setdefault(button["row_index"], []).append(button["label"])
@@ -175,8 +180,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(
         f"{greeting}, {name}!\n\n"
         "XAUUSD market reports and political/economic news are available without "
-        "screenshots. Use /market for prices, /news for cited news, and /watch "
-        "for a report every 15 minutes. /unwatch stops it.\n\n"
+        "screenshots. Use /market for prices, /news for cited news, /signals for "
+        "experimental paper BUY/SELL setups, and /watch for a report every 15 minutes. "
+        "/unwatch stops it. Signals require sufficient completed M15 history and "
+        "a confirmed rule; the bot does not place trades.\n\n"
         "You can also send a clear XAUUSD chart photo with its timeframe and "
         "price scale visible for an educational explanation.\n\n"
         "Choose a menu button below or type /help to see the available commands.",
@@ -197,7 +204,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         HELP_TEXT
         + _dynamic_commands_text()
         + "\n\n"
-        + "No screenshot is needed for /market or /news. /watch enables reports every 15 min.\n\n"
+        + "No screenshot is needed for /market, /news or /signals. /watch enables reports "
+        "every 15 min. Paper signals use EMA9/21 and ATR14 after at least 22 sufficiently "
+        "covered, consecutive M15 bars; they are unvalidated for live trading.\n\n"
         + GOLD_PHOTO_GUIDANCE
         + "\n\nSend a normal text message and the bot will echo it back.",
         reply_markup=_dynamic_commands_keyboard(),
@@ -212,9 +221,10 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await message.reply_text(
         "I report XAUUSD reference prices, observed M15 movements, and cited "
-        "political/economic news for education. /watch enables reports every 15 minutes "
-        "without screenshots. Optional chart photos show historical information. "
-        "This is not financial advice or a buy/sell signal."
+        "political/economic news. /signals adds experimental paper BUY/SELL setups "
+        "from transparent rules, with reference entry, stop and target. /watch sends "
+        "reports every 15 minutes without screenshots. No trades are executed, and "
+        "the strategy has not been validated for live trading."
     )
 
 
@@ -234,7 +244,7 @@ async def gold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if getattr(context, "bot_data", {}).get(market_monitor.SERVICE_KEY) is not None:
         await market_monitor.market_command(update, context)
-        await message.reply_text("/news للأخبار، و/watch لتقرير تلقائي كل 15 دقيقة من دون صور.")
+        await message.reply_text("/signals للإشارات التجريبية، و/news للأخبار، و/watch لتقرير كل 15 دقيقة من دون صور.")
     else:
         await message.reply_text("🥇 XAUUSD Chart Education\n" + GOLD_PHOTO_GUIDANCE)
 
@@ -256,6 +266,14 @@ async def gold_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """Download a Telegram photo and explain its chart using async vision."""
     message = update.effective_message
     if message is None or not message.photo:
+        return
+
+    if os.environ.get("OPENAI_ENABLED", "false").strip().lower() != "true":
+        await message.reply_text(
+            "هالنسخة تعمل بلا OpenAI. استخدم /market للأسعار، /signals للإشارات التجريبية، "
+            "/reviews لمراجعة النتائج، و/watch للمتابعة كل 15 دقيقة؛ ما تحتاج صورة.",
+            parse_mode=None,
+        )
         return
 
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -301,6 +319,8 @@ async def gold_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def _analyze_gold_photo(message, api_key: str) -> None:
+    if os.environ.get("OPENAI_ENABLED", "false").strip().lower() != "true":
+        return
     # Telegram photo sizes are JPEGs; the last entry is the largest.
     try:
         telegram_file = await message.photo[-1].get_file()
@@ -408,6 +428,8 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await market_monitor.market_command(update, context)
     elif text == MENU_NEWS:
         await market_monitor.news_command(update, context)
+    elif text == MENU_SIGNALS:
+        await market_monitor.signals_command(update, context)
 
 
 async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -422,6 +444,7 @@ async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "start": start, "help": help_command, "about": about, "ping": ping,
             "gold": gold_command, "market": market_monitor.market_command,
             "news": market_monitor.news_command, "watch": market_monitor.watch_command,
+            "signals": market_monitor.signals_command,
             "unwatch": market_monitor.unwatch_command,
         }
         if target in builtins:
@@ -532,7 +555,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(MessageHandler(filters.COMMAND, dynamic_command_dispatcher))
     application.add_handler(
         MessageHandler(
-            filters.Regex(f"^({MENU_HELP}|{MENU_ABOUT}|{MENU_PING}|{MENU_MARKET}|{MENU_NEWS})$"),
+            filters.Regex(f"^({MENU_HELP}|{MENU_ABOUT}|{MENU_PING}|{MENU_MARKET}|{MENU_NEWS}|{MENU_SIGNALS})$"),
             menu_button, block=False,
         )
     )
