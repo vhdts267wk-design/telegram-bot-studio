@@ -50,3 +50,8 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local MT5 execution credentials and state
+*.dpapi
+mt5-private/
+
