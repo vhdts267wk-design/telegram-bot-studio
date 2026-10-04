@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from bot import commands, db
+from bot import commands, db, market_monitor
 from bot.handlers import DB_KEY, set_bot_commands
 from bot.panel.auth import (
     AuthRedirect,
@@ -135,6 +135,7 @@ def create_app(application, settings) -> FastAPI:
     app = FastAPI(title="Telegram Bot Studio", docs_url=None, redoc_url=None)
     app.state.application = application
     app.state.settings = settings
+    market_monitor.install_feed_route(app, application, settings)
 
     # Updater.running can remain true after polling aborts on an invalid token.
     # A short, serialized auth probe bounds both stale readiness and public traffic.

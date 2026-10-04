@@ -19,6 +19,7 @@ class Settings:
     panel_password: str = ""
     panel_secret_key: str = ""
     panel_secure_cookie: bool = False
+    market_bridge_key: str = ""
 
     @property
     def panel_enabled(self) -> bool:
@@ -78,4 +79,5 @@ class Settings:
             panel_password=panel_password,
             panel_secret_key=panel_secret_key,
             panel_secure_cookie=panel_secure_cookie,
+            market_bridge_key=os.getenv("MARKET_BRIDGE_KEY", "").strip(),
         )

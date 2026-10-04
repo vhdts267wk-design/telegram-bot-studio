@@ -1,0 +1,3 @@
+# Install only on the Windows computer/VPS running the selected MT5 terminal.
+# Keep this separate from the Railway server's requirements.txt.
+MetaTrader5==5.0.6231; sys_platform == "win32"

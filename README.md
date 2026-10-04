@@ -13,6 +13,7 @@ Docker, and Railway.
 - Persistent chat menu buttons after `/start`
 - `/start`, `/help`, `/about`, and `/ping` commands
 - `/gold` and screenshot explanations for XAUUSD chart education (OpenAI required)
+- `/market` and `/news` work without screenshots; `/watch` sends a report every 15 minutes
 - Echo replies for normal text messages
 - Fallback handler for unknown commands
 - Error logging
@@ -48,6 +49,8 @@ The bot shows a persistent reply keyboard after `/start` with these buttons:
 | `Help`  | Show available commands          |
 | `About` | Show short bot information       |
 | `Ping`  | Check whether the bot is running |
+| `Market` | XAUUSD prices and observed M15 data |
+| `News` | Cited political and economic news |
 
 Telegram bots cannot display custom buttons before a user starts or messages the bot. The keyboard appears after the bot replies, then stays available in supported Telegram clients.
 
@@ -59,7 +62,11 @@ Telegram bots cannot display custom buttons before a user starts or messages the
 | `/help`  | Show available commands          |
 | `/about` | Show short bot information       |
 | `/ping`  | Check whether the bot is running |
-| `/gold`  | Explain a visible XAUUSD chart for education |
+| `/gold`  | Market report when connected; optional chart-photo guidance otherwise |
+| `/market` | XAUUSD data without screenshots |
+| `/news` | Cited political and macroeconomic developments |
+| `/watch` | Opt in to a report every 15 minutes in a private chat |
+| `/unwatch` | Stop automatic reports |
 
 The built-in commands above always take precedence. Any other `/command` is
 resolved dynamically from commands you create in Telegram Bot Studio.
@@ -75,6 +82,53 @@ The bot uses the async Responses API with `gpt-4.1-mini` by default, a documente
 It explains visible trends, support/resistance, and conditional scenarios for
 education, without trade instructions or live-price claims. Unreadable labels
 must be acknowledged. Never paste credentials into Telegram or commit `.env`.
+
+## Market and news monitoring without screenshots
+
+Send `/market` or `/news` for a report. `/watch` enables automatic reports every
+15 minutes, with the first report after 15 minutes; `/unwatch` stops them.
+Subscriptions, delivery leases, collected prices and search usage survive restarts
+in PostgreSQL. Reports are private-chat opt-ins. A report already being delivered
+can finish its in-flight Telegram request when unsubscribing.
+
+By default `MARKET_SOURCE=reference` uses keyless USD gold reference prices from
+[GoldAPI](https://gold-api.com/llms.txt). This independent reference feed is not a
+broker execution price. The bot records at most one observed quote per minute
+while subscribed, or when `/market` is requested. It preserves the provider's
+UTC timestamp and reports old or unavailable prices explicitly.
+
+M15 bars are built from these observed samples, not downloaded historical broker
+OHLC. Collection needs time to warm up. A completed 15-minute interval needs at
+least ten samples, coverage near both edges and no gap over three minutes before
+its observed range is described. Missing prices are never filled. Hourly/four-hour
+comparisons require contiguous sufficiently covered intervals. GoldAPI's
+[terms](https://gold-api.com/terms) provide reference data as-is; availability or a
+fresh provider timestamp does not establish that a market is open.
+
+News uses live [OpenAI web search](https://developers.openai.com/api/docs/guides/tools-web-search)
+with `gpt-4.1-mini`, up to three political or macroeconomic developments relevant
+to gold, and clickable source citations. Publication dates come from source
+content; retrieval time is displayed separately. Unverified recency is acknowledged,
+and no news or prices are invented when retrieval fails. Search results are
+shared for 15 minutes and capped at **96 attempts per bot per UTC day**, including
+failed attempts, with no hidden retries. This consumes the existing OpenAI API
+balance; at current [pricing](https://developers.openai.com/api/docs/pricing), a
+full day of one search per 15 minutes costs approximately **$1.40** including the
+brief output, with actual tokens affecting the amount. The cap survives redeploys.
+
+Price/news failures do not block Telegram polling, `/ping`, or Railway readiness.
+Telegram rate limits delay deliveries rather than retrying continuously.
+Delivery leases reduce duplicate reports during deployment overlap, but a crash
+between Telegram accepting a message and database acknowledgement can cause a
+duplicate; delivery is not an exactly-once guarantee.
+
+An optional [read-only Windows MT5 bridge](bridge/README.md) can use a connected
+broker terminal later. Keep the Windows-only dependency out of Railway's server
+requirements. Explicitly set `MARKET_SOURCE=mt5`, `MARKET_GOLD_SYMBOL` to the exact
+broker gold symbol, and configure a private `MARKET_BRIDGE_KEY` of at least
+32 characters on server and bridge. The protected POST endpoint `/api/market/feed`
+is disabled without that key; it is served only with the panel enabled. No account
+balances, positions, login details or trading operations are needed.
 
 ## Telegram Bot Studio
 
@@ -149,7 +203,7 @@ and all state-changing forms are CSRF-protected. Always use a strong
 | Name           | Required | Default | Description                                        |
 | -------------- | -------- | ------- | -------------------------------------------------- |
 | `BOT_TOKEN`        | Yes | -       | Bot token from `@BotFather`                                   |
-| `OPENAI_API_KEY`   | For charts | - | OpenAI API key; missing key disables chart explanations only |
+| `OPENAI_API_KEY`   | For charts/news | - | OpenAI API key; missing key disables chart explanations and news searches |
 | `OPENAI_MODEL`     | No | `gpt-4.1-mini` | Image-capable Responses API model available to your OpenAI project |
 | `DATABASE_URL`     | For panel | -  | PostgreSQL connection string; required when `PANEL_PASSWORD` is set |
 | `PANEL_PASSWORD`   | No  | -       | Enables Telegram Bot Studio when set; password to sign in     |
@@ -158,6 +212,9 @@ and all state-changing forms are CSRF-protected. Always use a strong
 | `PANEL_SECURE_COOKIE` | No | Railway: `true` | Require HTTPS for panel session cookies |
 | `PORT`             | No  | `8080`  | Port the panel binds to (Railway injects this automatically)  |
 | `LOG_LEVEL`        | No  | `INFO`  | Logging level, such as `DEBUG`, `INFO`, or `ERROR`            |
+| `MARKET_SOURCE` | No | `reference` | Keyless reference prices, or explicitly `mt5` for a configured broker bridge |
+| `MARKET_BRIDGE_KEY` | For MT5 only | - | Private ingest key of at least 32 characters; never send in chat |
+| `MARKET_GOLD_SYMBOL` | For MT5 only | `XAUUSD` | Exact broker gold symbol, including any suffix |
 
 On Railway, add a **PostgreSQL** service and reference its connection string
 from the bot service:
