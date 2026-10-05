@@ -98,7 +98,7 @@ BOT_COMMANDS = (
     ("reviews", "Paper trade outcomes and review notes"),
     ("watch", "متابعة تحليل الشارت والفرص كل 15 دقيقة"),
     ("unwatch", "Stop automatic reports"),
-    ("connect_mt5", "Pair your Demo MT5 device for trade approvals"),
+    ("connect_mt5", "اقتران جهاز MT5 Demo على اللابتوب"),
 )
 
 MENU_HELP = "Help"
@@ -114,7 +114,7 @@ HELP_TEXT = """أوامر البوت:
 /market أو /gold - تحليل شارت XAUUSD الحالي من MT5
 /signals - اقتراح BUY أو SELL عند تحقق الشروط، مع الدخول والوقف والهدف
 /watch - متابعة تحليل الشارت والفرص كل 15 دقيقة
-/unwatch - إيقاف المتابعة والطلبات التي لم يبدأ تنفيذها
+/unwatch - إيقاف المتابعة والطلبات المعلقة
 /reviews - مراجعة نتائج الاختبارات السابقة
 /connect_mt5 CODE - اقتران جهاز MT5 Demo بحجم 0.01 lot
 /news - أخبار عند طلبها فقط
@@ -169,6 +169,19 @@ def _dynamic_commands_keyboard() -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(rows)
 
 
+def _mt5_workflow_guidance(context) -> str:
+    service = getattr(context, "bot_data", {}).get(market_monitor.SERVICE_KEY)
+    if getattr(service, "manual_tickets_enabled", False) is True:
+        return (
+            "على جهاز Demo المقترن بحجم 0.01 lot، زر «جهّز على اللابتوب» يفتح نافذة MT5 "
+            "ويملأ TP وSL فقط. بتراجعها وبتضغط Buy أو Sell بنفسك داخل MT5 على اللابتوب."
+        )
+    return (
+        "على جهاز Demo المقترن، Accept يوافق على محاولة تنفيذ واحدة بحجم 0.01 lot؛ "
+        "التنفيذ يتأكد برسالة MT5."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -190,8 +203,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "وبعرض الاتجاه والدعم والمقاومة وسبب اقتراح الصفقة أو الانتظار.\n\n"
         "اضغط «تحليل الشارت» للتحليل الحالي، أو «اقتراح صفقة» للدخول والوقف والهدف عند تحقق الإشارة. "
         "«متابعة الشارت» بتفعّل التقارير كل 15 دقيقة، من دون روابط أخبار.\n\n"
-        "على جهاز Demo المقترن، Accept يوافق على محاولة تنفيذ واحدة بحجم 0.01 lot؛ "
-        "التنفيذ يتأكد برسالة MT5. ما في صفقة مضمونة، وما بنفرض صفقة إذا الشروط مش متحققة.",
+        + _mt5_workflow_guidance(context)
+        + " ما في صفقة مضمونة، وما بنفرض صفقة إذا الشروط مش متحققة.",
         reply_markup=_main_menu_keyboard(),
     )
     dynamic_keyboard = _dynamic_commands_keyboard()
@@ -200,7 +213,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
     if message is None:
         return
@@ -212,13 +224,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         + "التحليل المباشر بيستخدم شموع MT5 المكتملة، من دون الحاجة إلى صورة. "
         "الاقتراحات الحالية تعتمد EMA9/21 وATR14 بعد 22 شمعة M15 متتابعة على الأقل، "
         "وبتظهر فقط عند تحقق الشروط.\n\n"
+        + _mt5_workflow_guidance(context) + "\n\n"
         + GOLD_PHOTO_GUIDANCE,
         reply_markup=_dynamic_commands_keyboard(),
     )
 
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
     if message is None:
         return
@@ -227,7 +239,7 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "بقرأ شموع الذهب XAUUSD على M15 وبحلّل الاتجاه والدعم والمقاومة باستخدام EMA9/21 وATR14. "
         "عند تحقق إشارة صالحة، بعرض اتجاه الصفقة والدخول المرجعي والوقف والهدف وسبب الاقتراح. "
         "المتابعة التلقائية للشارت فقط؛ الأخبار متاحة بأمر /news إذا طلبتها. "
-        "التنفيذ على Demo بحجم 0.01 lot يحتاج Accept منك وتأكيد MT5."
+        + _mt5_workflow_guidance(context)
     )
 
 

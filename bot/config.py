@@ -20,6 +20,7 @@ class Settings:
     panel_secret_key: str = ""
     panel_secure_cookie: bool = False
     market_bridge_key: str = ""
+    manual_bridge_key: str = ""
 
     @property
     def panel_enabled(self) -> bool:
@@ -29,7 +30,7 @@ class Settings:
     @property
     def http_enabled(self) -> bool:
         """A configured private bridge also needs HTTP, without an admin login."""
-        return self.panel_enabled or len(self.market_bridge_key) >= 32
+        return self.panel_enabled or len(self.market_bridge_key) >= 32 or len(self.manual_bridge_key) >= 32
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -69,9 +70,10 @@ class Settings:
             )
         )
         market_bridge_key = os.getenv("MARKET_BRIDGE_KEY", "").strip()
-        if (panel_password or len(market_bridge_key) >= 32) and not database_url:
+        manual_bridge_key = os.getenv("MT5_MANUAL_BRIDGE_KEY", "").strip()
+        if (panel_password or len(market_bridge_key) >= 32 or len(manual_bridge_key) >= 32) and not database_url:
             raise RuntimeError(
-                "DATABASE_URL is required when PANEL_PASSWORD or MARKET_BRIDGE_KEY enables HTTP. "
+                "DATABASE_URL is required when PANEL_PASSWORD, MARKET_BRIDGE_KEY or MT5_MANUAL_BRIDGE_KEY enables HTTP. "
                 "On Railway, add DATABASE_URL=${{ Postgres.DATABASE_URL }} to the "
                 "bot service variables."
             )
@@ -86,4 +88,5 @@ class Settings:
             panel_secret_key=panel_secret_key,
             panel_secure_cookie=panel_secure_cookie,
             market_bridge_key=market_bridge_key,
+            manual_bridge_key=manual_bridge_key,
         )

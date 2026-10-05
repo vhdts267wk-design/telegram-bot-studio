@@ -1,4 +1,4 @@
-"""Private market-device pairing and single-use, human-approved demo requests."""
+"""Private pairing and separately scoped execution or manual ticket requests."""
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from bot import market_store, trade_store
+from bot import manual_ticket_store, market_store, trade_store
 
 MAX_CONTROL_BYTES = 8192
 
@@ -54,11 +54,25 @@ def _policy(payload):
 
 
 def install_routes(app, application, settings):
-    async def read_request(request):
-        key = getattr(settings, "market_bridge_key", "")
+    async def read_request(request, workflow=None):
         service = application.bot_data.get("market_service")
-        if len(key) < 32 or service is None or not getattr(service, "trading_enabled", False):
-            return None, None, JSONResponse({"detail": "Demo execution is not configured"}, status_code=404)
+        automatic_flag = getattr(service, "trading_enabled", False)
+        manual_flag = getattr(service, "manual_tickets_enabled", False)
+        if type(automatic_flag) is not bool or type(manual_flag) is not bool:
+            return None, None, JSONResponse({"detail": "Requested MT5 workflow is not configured"}, status_code=404)
+        automatic = automatic_flag is True
+        # The configured manual mode must block legacy execution even if a
+        # stale service object still advertises automatic execution.
+        manual = manual_flag is True or os.getenv("MT5_MANUAL_TICKETS_ENABLED", "false").strip().lower() == "true"
+        key = os.getenv("MT5_MANUAL_BRIDGE_KEY", "") if manual else getattr(settings, "market_bridge_key", "")
+        # Ambiguous configuration fails closed, including legacy clients.
+        enabled = automatic != manual
+        if workflow == "automatic":
+            enabled = enabled and automatic
+        elif workflow == "manual_ticket":
+            enabled = enabled and manual
+        if not isinstance(key, str) or len(key) < 32 or service is None or not enabled:
+            return None, None, JSONResponse({"detail": "Requested MT5 workflow is not configured"}, status_code=404)
         if not hmac.compare_digest(
             request.headers.get("authorization", "").encode("utf-8"),
             ("Bearer " + key).encode("utf-8"),
@@ -96,7 +110,7 @@ def install_routes(app, application, settings):
         return {"ok": True, "paired": device.get("owner_user_id") is not None}
 
     async def poll(request: Request):
-        service, payload, error = await read_request(request)
+        service, payload, error = await read_request(request, "automatic")
         if error is not None:
             return error
         try:
@@ -133,7 +147,7 @@ def install_routes(app, application, settings):
                           "payload": offer["payload"], "expires_at": offer["expires_at"].isoformat()}}
 
     async def result(request: Request):
-        service, payload, error = await read_request(request)
+        service, payload, error = await read_request(request, "automatic")
         if error is not None:
             return error
         try:
@@ -167,6 +181,91 @@ def install_routes(app, application, settings):
             return JSONResponse({"detail": "Execution claim is no longer active"}, status_code=409)
         return {"ok": True}
 
+    async def fresh_manual_device(service, device_id):
+        device = await trade_store.get_device(service.pool, service.bot_id, device_id)
+        if device is None:
+            return None
+        _policy(device)
+        snapshot = await market_store.get_cache(service.pool, service.bot_id, "broker_feed")
+        if snapshot is None:
+            return None
+        # Use the time after storage reads, so their latency cannot hide a
+        # quote or device that has become stale while this request waits.
+        now = now_utc()
+        if (
+            device.get("owner_chat_id") is None
+            or device.get("owner_chat_id") != device.get("owner_user_id")
+            or not timedelta(0) <= now - device["last_seen_at"] <= timedelta(seconds=180)
+        ):
+            return None
+        from bot.market_monitor import validate_feed, _utc
+        feed = validate_feed(snapshot["payload"], now, device["symbol"])
+        if (
+            feed.get("device_id") != str(device_id) or "execution" not in feed
+            or not timedelta(0) <= now - snapshot["updated_at"] <= timedelta(seconds=180)
+            or not timedelta(seconds=-5) <= now - _utc(feed["quote"]["time"]) <= timedelta(seconds=30)
+        ):
+            return None
+        return device, now
+
+    async def manual_poll(request: Request):
+        service, payload, error = await read_request(request, "manual_ticket")
+        if error is not None:
+            return error
+        try:
+            if set(payload) != {"device_id"}:
+                raise ValueError("Invalid fields")
+            device_id, now = _uuid(payload["device_id"]), now_utc()
+            device = await trade_store.get_device(service.pool, service.bot_id, device_id)
+            if device is None:
+                return JSONResponse({"detail": "Device is not registered"}, status_code=404)
+            _policy(device)
+            await trade_store.heartbeat(service.pool, service.bot_id, device_id, now)
+            await manual_ticket_store.expire_offers(service.pool, service.bot_id, now)
+            current = await fresh_manual_device(service, device_id)
+            if current is None or await service.risk_pause(current[0]["owner_chat_id"]) is not None:
+                return {"preparation": None}
+            # Re-read after asynchronous risk/storage work. A heartbeat cannot
+            # substitute for a fresh feed or refresh the frozen offer expiry.
+            current = await fresh_manual_device(service, device_id)
+            if current is None:
+                return {"preparation": None}
+            _, now = current
+            offer = await manual_ticket_store.claim_offer(service.pool, service.bot_id, device_id, now)
+        except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
+            return JSONResponse({"detail": "Invalid device or market data"}, status_code=422)
+        if offer is None:
+            return {"preparation": None}
+        return {"preparation": {
+            "id": str(offer["id"]), "claim_id": str(offer["claim_id"]), "workflow": "manual_ticket",
+            "payload": offer["payload"], "expires_at": offer["expires_at"].isoformat(),
+        }}
+
+    async def manual_result(request: Request):
+        service, payload, error = await read_request(request, "manual_ticket")
+        if error is not None:
+            return error
+        try:
+            if set(payload) != {"device_id", "offer_id", "claim_id", "result"}:
+                raise ValueError("Invalid fields")
+            outcome = payload["result"]
+            if (
+                type(outcome) is not dict or set(outcome) != {"status"}
+                or type(outcome.get("status")) is not str or outcome["status"] not in {"prepared", "failed"}
+            ):
+                raise ValueError("Invalid preparation result")
+            completed = await manual_ticket_store.complete_offer(
+                service.pool, service.bot_id, _uuid(payload["device_id"]),
+                _uuid(payload["offer_id"]), _uuid(payload["claim_id"]), outcome, now_utc(),
+            )
+        except (ValueError, TypeError, KeyError, OverflowError):
+            return JSONResponse({"detail": "Invalid preparation result"}, status_code=422)
+        if completed is None:
+            return JSONResponse({"detail": "Preparation claim is no longer active"}, status_code=409)
+        return {"ok": True}
+
     app.add_api_route("/api/mt5/register", register, methods=["POST"])
     app.add_api_route("/api/mt5/poll", poll, methods=["POST"])
     app.add_api_route("/api/mt5/result", result, methods=["POST"])
+    app.add_api_route("/api/mt5/manual/poll", manual_poll, methods=["POST"])
+    app.add_api_route("/api/mt5/manual/result", manual_result, methods=["POST"])

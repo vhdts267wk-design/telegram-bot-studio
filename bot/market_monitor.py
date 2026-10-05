@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CommandHandler
 
-from bot import chart_analysis, free_news, journal_store, market_news, market_store, mt5_api, mt5_notifications, paper_journal, paper_policy, paper_signals, reference_market, trade_store
+from bot import chart_analysis, free_news, journal_store, manual_ticket_store, market_news, market_store, mt5_api, mt5_notifications, paper_journal, paper_policy, paper_signals, reference_market, trade_store
 
 
 logger = logging.getLogger(__name__)
@@ -296,6 +296,10 @@ class MarketService:
         self.next_reference_at = 0.0
         self.journal_enabled = False
         self.trading_enabled = False
+        self.manual_tickets_enabled = (
+            self.source == "mt5"
+            and os.getenv("MT5_MANUAL_TICKETS_ENABLED", "false").strip().lower() == "true"
+        )
         self.review_lock = asyncio.Lock()
         self.news_source = os.getenv("NEWS_SOURCE", "rss").strip().lower()
         if self.news_source not in {"rss", "openai"}:
@@ -375,6 +379,7 @@ class MarketService:
             text = chart_analysis.format_chart_proposal(
                 result, symbol=source.removeprefix("MetaTrader 5 — "),
                 execution_enabled=self.trading_enabled,
+                manual_ticket_enabled=self.manual_tickets_enabled,
             )
         else:
             text = paper_signals.format_paper_signal(result, source=source)
@@ -592,8 +597,9 @@ async def _worker(application, service):
                     pass
             if not await service.send_reviews(application.bot):
                 continue
-            if service.trading_enabled:
-                await trade_store.expire_offers(service.pool, service.bot_id, utc_now())
+            if service.trading_enabled or service.manual_tickets_enabled:
+                store = manual_ticket_store if service.manual_tickets_enabled else trade_store
+                await store.expire_offers(service.pool, service.bot_id, utc_now())
                 if not await mt5_notifications.send_results(service, application.bot):
                     continue
                 if not await mt5_notifications.send_offers(service, application.bot):
@@ -638,10 +644,12 @@ async def setup(application):
         await market_store.initialize_schema(pool)
         await journal_store.initialize_schema(pool)
         await trade_store.initialize_schema(pool)
+        await manual_ticket_store.initialize_schema(pool)
         service = MarketService(pool, application.bot.id)
         service.journal_enabled = True
         service.trading_enabled = (
             service.source == "mt5"
+            and not service.manual_tickets_enabled
             and os.getenv("MT5_TRADING_ENABLED", "false").strip().lower() == "true"
         )
         application.bot_data[SERVICE_KEY] = service
@@ -802,7 +810,11 @@ async def watch_command(update, context):
         "مدة الصفقة الورقية 15 دقيقة، مع مراجعة النتيجة وملاحظات محفوظة.\n"
         "استخدم /market للتحليل والاقتراح الآن، و/signals للاقتراح، و/reviews للنتائج، "
         "و/unwatch لإيقاف التقارير.\n"
-        "الأخبار عند طلب /news فقط. التنفيذ على MT5 يتطلب موافقتك على الطلب."
+        "الأخبار عند طلب /news فقط. "
+        + (
+            "زر «جهّز على اللابتوب» يجهّز نافذة MT5 مع TP وSL؛ التنفيذ يتم حين تضغط Buy أو Sell بنفسك على اللابتوب."
+            if service.manual_tickets_enabled else "التنفيذ على MT5 يتطلب موافقتك على الطلب."
+        )
     )
 
 
@@ -819,9 +831,13 @@ async def unwatch_command(update, context):
     )
     if service.trading_enabled:
         await trade_store.cancel_offers(service.pool, service.bot_id, update.effective_chat.id, utc_now())
+    if service.manual_tickets_enabled:
+        await manual_ticket_store.cancel_offers(service.pool, service.bot_id, update.effective_chat.id, utc_now())
     text = "تم إيقاف التقارير التلقائية. /watch لإعادة التفعيل."
     if service.trading_enabled:
         text += "\nأُلغيت طلبات MT5 المعلقة. الطلب الذي بدأ تنفيذه والصفقات المفتوحة يجب متابعتها داخل MT5؛ سيصلك إشعار نتيجة التنفيذ."
+    if service.manual_tickets_enabled:
+        text += "\nأُلغيت طلبات تجهيز MT5 المعلقة. راجع وأغلق بنفسك أي نافذة صفقة سبق تجهيزها على اللابتوب؛ /unwatch لا يغلقها."
     await message.reply_text(text)
 
 
@@ -838,14 +854,20 @@ def register_handlers(application):
 def install_feed_route(app, application, settings):
     mt5_api.install_routes(app, application, settings)
     async def ingest(request: Request):
-        key = getattr(settings, "market_bridge_key", "")
-        if len(key) < 32:
+        service = application.bot_data.get(SERVICE_KEY)
+        manual_flag = getattr(service, "manual_tickets_enabled", None)
+        if manual_flag is not None and type(manual_flag) is not bool:
+            return JSONResponse({"detail": "Market feed is not configured"}, status_code=404)
+        # The configured manual mode must never fall back to the legacy key,
+        # including requests arriving before the market service is available.
+        manual = manual_flag is True or os.getenv("MT5_MANUAL_TICKETS_ENABLED", "false").strip().lower() == "true"
+        key = os.getenv("MT5_MANUAL_BRIDGE_KEY", "") if manual else getattr(settings, "market_bridge_key", "")
+        if not isinstance(key, str) or len(key) < 32:
             return JSONResponse({"detail": "Market feed is not configured"}, status_code=404)
         expected = ("Bearer " + key).encode("utf-8")
         supplied = request.headers.get("authorization", "").encode("utf-8")
         if not hmac.compare_digest(expected, supplied):
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-        service = application.bot_data.get(SERVICE_KEY)
         if service is None:
             return JSONResponse({"detail": "Market service unavailable"}, status_code=503)
         size, parts = 0, []

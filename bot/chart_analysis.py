@@ -80,6 +80,7 @@ def format_chart_proposal(
     *,
     symbol: str = "XAUUSD",
     execution_enabled: bool = False,
+    manual_ticket_enabled: bool = False,
 ) -> str:
     """Describe the caller's trusted, freshness-gated MT5 strategy result.
 
@@ -131,6 +132,8 @@ def format_chart_proposal(
             f"ATR14: {atr:.2f}؛ الوقف 1.5×ATR والهدف 3×ATR (نحو 2:1).",
             "الدخول من إغلاق الشمعة؛ قد يختلف عن السعر الحالي بسبب الحركة والسبريد.",
             (
+                "زر «جهّز على اللابتوب» يفتح نافذة MT5 ويملأ TP وSL فقط؛ تراجعها وتضغط Buy أو Sell بنفسك على اللابتوب."
+                if manual_ticket_enabled is True else
                 "تنفيذ Demo فقط بعد عرض طلب قابل للتنفيذ وقبولك؛ الإشارة وحدها لا تؤكّد تنفيذ صفقة."
                 if execution_enabled is True
                 else "اختبار ورقي؛ لا يُرسل أمر تداول من هذه الإشارة."
