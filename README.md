@@ -460,6 +460,14 @@ execution. Old automatic Accept buttons and execution endpoints are blocked.
 Run migration `20261005_05` before use. Local setup and supported UI checks are
 described in [bridge/MANUAL-TICKETS.md](bridge/MANUAL-TICKETS.md).
 
+The display-only `bridge/MT5BotLevels.mq5` indicator shows the latest valid
+proposal's Entry Zone, reference Entry, green TP and red SL on the XAUUSD M15
+chart. Its levels match the immutable Telegram proposal. The helper reads a
+separate authenticated `/api/mt5/manual/chart` endpoint without claiming a
+ticket and publishes an expiring local snapshot. Missing, expired or unsafe
+data clears the indicator's own levels. The native Buy/Sell click stays with
+the human; attaching this indicator does not enable automatic trading.
+
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE).
