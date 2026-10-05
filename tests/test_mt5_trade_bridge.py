@@ -3,6 +3,7 @@
 import argparse
 from contextlib import redirect_stdout, redirect_stderr
 import copy
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
@@ -212,7 +213,7 @@ class TradeBridgeTests(unittest.TestCase):
 
     def test_fresh_quote_and_spread_plus_drift_guards(self):
         changes = [
-            ("time", int(NOW.timestamp()) - 31), ("time", int(NOW.timestamp()) + 1),
+            ("time", int(NOW.timestamp()) - 31), ("time", int(NOW.timestamp()) + 6),
             ("bid", 2500.2), ("ask", 2501.0), ("ask", float("nan")),
         ]
         for name, changed in changes:
@@ -226,6 +227,55 @@ class TradeBridgeTests(unittest.TestCase):
         # Each component is within 0.1R, but their sum exceeds the limit.
         self.tick.bid, self.tick.ask = 2499.8, 2500.6
         self.assertEqual(self.execute()["status"], "failed")
+        self.mt5.order_send.assert_not_called()
+
+    def test_broker_offset_normalizes_executable_quote_without_rebinding_journal(self):
+        expected = bridge.prepare_order(self.mt5, self.settings, self.ledger, self.offer, NOW)
+        device, binding = self.ledger.device_id, self.ledger.value("binding")
+        self.tick.time += 10800
+        with self.assertRaises(bridge.GuardError):
+            bridge.prepare_order(self.mt5, self.settings, self.ledger, self.offer, NOW)
+        configured = replace(self.settings, market=replace(
+            self.settings.market, broker_utc_offset_minutes=180
+        ))
+        self.assertEqual(bridge.prepare_order(self.mt5, configured, self.ledger, self.offer, NOW), expected)
+        self.assertEqual(self.ledger.device_id, device)
+        self.assertEqual(self.ledger.value("binding"), binding)
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_corrected_executable_quote_still_rejects_stale_future_and_account_change(self):
+        configured = replace(self.settings, market=replace(
+            self.settings.market, broker_utc_offset_minutes=180
+        ))
+        for age in (31, -6):
+            with self.subTest(age=age):
+                self.tick.time = int(NOW.timestamp()) + 10800 - age
+                with self.assertRaises(bridge.GuardError):
+                    bridge.prepare_order(self.mt5, configured, self.ledger, self.offer, NOW)
+        self.tick.time = int(NOW.timestamp()) + 10800 - 1
+        self.account.login += 1
+        with self.assertRaises(bridge.GuardError):
+            bridge.prepare_order(self.mt5, configured, self.ledger, self.offer, NOW)
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_executable_quote_clock_skew_and_stale_boundaries_with_and_without_offset(self):
+        for offset in (0, 180):
+            configured = replace(self.settings, market=replace(
+                self.settings.market, broker_utc_offset_minutes=offset
+            ))
+            for age, accepted in ((-5, True), (-6, False), (30, True), (31, False)):
+                with self.subTest(offset=offset, age=age):
+                    self.tick.time = int(NOW.timestamp()) + offset * 60 - age
+                    if accepted:
+                        request = bridge.prepare_order(self.mt5, configured, self.ledger, self.offer, NOW)
+                        self.assertEqual((request["volume"], request["sl"], request["tp"]),
+                                         (0.01, 2490.0, 2520.0))
+                    else:
+                        with self.assertRaises(bridge.GuardError):
+                            bridge.prepare_order(self.mt5, configured, self.ledger, self.offer, NOW)
+        self.mt5.order_check.assert_not_called()
         self.mt5.order_send.assert_not_called()
 
     def test_revalidation_after_order_check_blocks_account_change_expiry_and_price_move(self):
@@ -438,6 +488,77 @@ class TradeBridgeTests(unittest.TestCase):
         self.assertNotIn("private-provider-detail", errors.getvalue())
         self.mt5.order_send.assert_not_called()
         self.mt5.shutdown.assert_called_once()
+
+    def test_terminal_disconnect_blocks_processing_until_bound_account_recovers(self):
+        disconnected = SimpleNamespace(connected=False, path="PRIVATEPATH")
+        self.mt5.terminal_info.side_effect = [
+            self.terminal_info, self.terminal_info,  # Startup verification.
+            disconnected, disconnected,
+            self.terminal_info, self.terminal_info,  # Recovery verification.
+        ]
+        routes = []
+        sleeps = []
+        def post(settings, route, payload):
+            routes.append(route)
+            return {"paired": True} if route == "register" else {"trade": None}
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) <= 2:
+                self.assertEqual(routes, ["register"])
+            else:
+                self.assertEqual(routes, ["register", "market", "poll"])
+        output, errors = io.StringIO(), io.StringIO()
+        with (patch.object(bridge, "terminal_is_running", side_effect=[True, True, True, True, False]),
+              patch.object(market, "build_payload", return_value={"symbol": "XAUUSD.test"}) as payload,
+              patch.object(bridge.time, "monotonic", return_value=1000),
+              redirect_stdout(output), redirect_stderr(errors)):
+            self.assertEqual(bridge.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW, sleep=sleep), 0)
+        self.assertEqual(sleeps, [bridge.POLL_SECONDS] * 3)
+        self.assertEqual(errors.getvalue().count("Bridge paused (terminal_disconnected)"), 1)
+        self.assertIn("Reconnect the selected terminal", errors.getvalue())
+        self.assertNotIn("PRIVATE", errors.getvalue())
+        self.assertEqual(output.getvalue().count("MT5 connection recovered."), 1)
+        # The seeded ledger guard, startup guard and recovered guard verify the
+        # account. Neither disconnected cycle reaches an account/trade read.
+        self.assertEqual(self.mt5.account_info.call_count, 3)
+        payload.assert_called_once()
+        self.mt5.initialize.assert_called_once_with(str(self.terminal), timeout=15000)
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+        self.mt5.shutdown.assert_called_once()
+
+    def test_terminal_warning_is_bounded_and_changed_reason_is_reported_promptly(self):
+        routes = []
+        def post(settings, route, payload):
+            routes.append(route)
+            return {"paired": True}
+        original_check = bridge.check_bound_account
+        def check(mt5, settings, ledger):
+            if not routes:
+                return original_check(mt5, settings, ledger)
+            error = market.MarketDataError("PRIVATE SDK detail", reason_code=(
+                "terminal_disconnected" if len(warning_times) < 3 else "terminal_unavailable"
+            ))
+            raise error
+        warning_times = []
+        observed_times = iter([0, 10, 60, 61])
+        def observed():
+            value = next(observed_times)
+            warning_times.append(value)
+            return value
+        errors = io.StringIO()
+        with (patch.object(bridge, "terminal_is_running", side_effect=[True] * 5 + [False]),
+              patch.object(bridge, "check_bound_account", side_effect=check),
+              patch.object(bridge.time, "monotonic", side_effect=observed),
+              redirect_stdout(io.StringIO()), redirect_stderr(errors)):
+            self.assertEqual(bridge.run_bridge(self.mt5, self.settings, post=post, sleep=Mock()), 0)
+        self.assertEqual(routes, ["register"])
+        self.assertEqual(errors.getvalue().count("Bridge paused (terminal_disconnected)"), 2)
+        self.assertEqual(errors.getvalue().count("Bridge paused (terminal_unavailable)"), 1)
+        self.assertNotIn("PRIVATE", errors.getvalue())
+        self.mt5.initialize.assert_called_once()
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
 
 
 if __name__ == "__main__":

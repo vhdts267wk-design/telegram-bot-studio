@@ -210,9 +210,25 @@ class MT5NotificationTests(unittest.IsolatedAsyncioTestCase):
                 elif kind == "device":
                     self.device["last_seen_at"] = NOW - timedelta(seconds=181)
                 else:
-                    self.snapshot["payload"]["quote"]["time"] = (NOW + timedelta(seconds=1)).isoformat()
+                    self.snapshot["payload"]["quote"]["time"] = (NOW + timedelta(seconds=6)).isoformat()
                 await self.run_callback()
         self.store["decide"].assert_not_awaited()
+
+    async def test_quote_clock_skew_is_bounded_independently_of_receipt_and_heartbeat(self):
+        for seconds, allowed in ((5, True), (6, False), (-180, True), (-181, False)):
+            with self.subTest(seconds=seconds):
+                data = snapshot()
+                data["payload"]["quote"]["time"] = (NOW + timedelta(seconds=seconds)).isoformat()
+                self.assertEqual(notifications._fresh_feed(data, device(), NOW) is not None, allowed)
+        for field in ("receipt", "heartbeat"):
+            with self.subTest(field=field):
+                data, bound_device = snapshot(), device()
+                data["payload"]["quote"]["time"] = (NOW + timedelta(seconds=3)).isoformat()
+                if field == "receipt":
+                    data["updated_at"] = NOW + timedelta(seconds=1)
+                else:
+                    bound_device["last_seen_at"] = NOW + timedelta(seconds=1)
+                self.assertIsNone(notifications._fresh_feed(data, bound_device, NOW))
 
     async def test_source_symbol_device_and_changed_account_settings_block_accept(self):
         self.service.source = "reference"

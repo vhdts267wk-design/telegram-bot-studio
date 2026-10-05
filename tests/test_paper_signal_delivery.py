@@ -77,7 +77,7 @@ class PaperSourceGateTests(unittest.TestCase):
         self.assertEqual(bars[-1]["time"], (NOW - timedelta(minutes=15)).isoformat())
         self.assertEqual(engine.call_args.kwargs, {"now": NOW})
 
-    def test_stale_or_future_quote_and_receipt_gate_even_full_covered_history(self):
+    def test_stale_or_excess_future_quote_and_receipt_gate_even_full_covered_history(self):
         for source, make_snapshot, quote_path in (
             ("mt5", broker_snapshot, ("quote", "time")),
             ("reference", reference_snapshot, ("as_of",)),
@@ -85,7 +85,7 @@ class PaperSourceGateTests(unittest.TestCase):
             for field in ("quote_old", "quote_future", "receipt_old", "receipt_future"):
                 snapshot = make_snapshot()
                 if field.startswith("quote"):
-                    stamp = NOW - timedelta(minutes=4) if field == "quote_old" else NOW + timedelta(seconds=1)
+                    stamp = NOW - timedelta(minutes=4) if field == "quote_old" else NOW + timedelta(seconds=6 if source == "mt5" else 1)
                     target = snapshot["payload"]
                     for name in quote_path[:-1]:
                         target = target[name]
@@ -100,6 +100,17 @@ class PaperSourceGateTests(unittest.TestCase):
                     result, _, _ = monitor.paper_result(snapshot, NOW, source)
                     self.assertEqual(result["state"], "stale")
                     engine.assert_not_called()
+
+    def test_only_mt5_quote_allows_five_seconds_clock_skew(self):
+        for lead in (1, 3, 5):
+            snapshot = broker_snapshot()
+            snapshot["payload"]["quote"]["time"] = (NOW + timedelta(seconds=lead)).isoformat()
+            with self.subTest(lead=lead), patch.object(
+                monitor.paper_signals, "analyze_paper_signal", return_value=setup_result()
+            ) as engine:
+                result, _, _ = monitor.paper_result(snapshot, NOW, "mt5")
+                self.assertEqual(result["state"], "signal")
+                engine.assert_called_once()
 
     def test_fresh_quote_does_not_make_old_completed_bars_fresh(self):
         snapshot = broker_snapshot()
@@ -268,6 +279,23 @@ class PaperDeliveryTests(unittest.IsolatedAsyncioTestCase):
             proceed.set()
             await asyncio.wait_for(task, 1)
         bot.send_message.assert_awaited_once_with(4401, "synthetic price report", parse_mode=None)
+        service.news.assert_not_awaited()
+        self.assertNotIn("paper_delivery:4401", self.saved)
+
+    async def test_paused_report_never_shows_proposal_or_opens_another_trade(self):
+        service = self.reporting_service()
+        service.journal_enabled = True
+        service.risk_pause = AsyncMock(return_value=NOW + timedelta(minutes=15))
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with patch.object(monitor.journal_store, "open_trade", new_callable=AsyncMock) as journal, patch.object(
+            monitor.trade_store, "create_offer", new_callable=AsyncMock
+        ) as offer:
+            await service.send_report(bot, 4401)
+        texts = [call.args[1] for call in bot.send_message.await_args_list]
+        self.assertTrue(any("موقوفة" in text for text in texts))
+        self.assertFalse(any("BUY" in text for text in texts))
+        journal.assert_not_awaited()
+        offer.assert_not_awaited()
         service.news.assert_not_awaited()
         self.assertNotIn("paper_delivery:4401", self.saved)
 

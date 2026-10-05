@@ -1,5 +1,6 @@
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import io
 import json
@@ -97,6 +98,25 @@ class MT5BridgeTests(unittest.TestCase):
                     self.payload()
         self.mt5.symbol_info.assert_not_called()
 
+    def test_terminal_failures_have_distinct_allowlisted_reason_codes(self):
+        conditions = (
+            (None, "terminal_unavailable"),
+            (SimpleNamespace(connected=False), "terminal_disconnected"),
+            (SimpleNamespace(connected=True, path=None), "terminal_installation_mismatch"),
+            (SimpleNamespace(connected=True, path=str(self.terminal.parent / "PRIVATEPATH")),
+             "terminal_installation_mismatch"),
+        )
+        for info, expected in conditions:
+            with self.subTest(reason=expected):
+                self.mt5.terminal_info.return_value = info
+                with self.assertRaises(bridge.MarketDataError) as raised:
+                    self.payload()
+                self.assertEqual(raised.exception.reason_code, expected)
+                self.assertNotIn("PRIVATE", str(raised.exception))
+        error = bridge.MarketDataError("PRIVATE SDK detail", reason_code="PRIVATECODE")
+        self.assertIsNone(error.reason_code)
+        self.mt5.symbol_info.assert_not_called()
+
     def test_weekend_quote_keeps_original_time_and_gaps_are_never_filled(self):
         friday = self.now - timedelta(days=2)
         friday_seconds = int(friday.timestamp())
@@ -163,6 +183,38 @@ class MT5BridgeTests(unittest.TestCase):
         with self.assertRaises(bridge.MarketDataError):
             bridge.build_payload(self.mt5, self.settings, self.now.replace(tzinfo=None))
 
+    def test_explicit_broker_offset_normalizes_quotes_and_completed_bars(self):
+        expected = self.payload()
+        self.mt5.symbol_info_tick.return_value.time += 3 * 3600
+        self.mt5.copy_rates_from_pos.return_value = [
+            {**rate, "time": rate["time"] + 3 * 3600} for rate in self.rates
+        ]
+        # UTC remains the default. A broker-clock quote requires an explicit
+        # verified conversion, rather than a larger future-date tolerance.
+        with self.assertRaises(bridge.MarketDataError):
+            self.payload()
+        configured = replace(self.settings, broker_utc_offset_minutes=180)
+        self.assertEqual(bridge.build_payload(self.mt5, configured, self.now), expected)
+
+    def test_corrected_broker_quote_preserves_stale_and_future_rejections(self):
+        configured = replace(self.settings, broker_utc_offset_minutes=180)
+        for age in (-bridge.FUTURE_TOLERANCE_SECONDS - 1,
+                    bridge.MAX_QUOTE_AGE_SECONDS + 1):
+            with self.subTest(age=age):
+                self.mt5.symbol_info_tick.return_value.time = self.now_seconds + 10800 - age
+                with self.assertRaises(bridge.MarketDataError):
+                    bridge.build_payload(self.mt5, configured, self.now)
+        self.mt5.copy_rates_from_pos.assert_not_called()
+
+    def test_corrected_broker_candle_must_still_be_completed(self):
+        configured = replace(self.settings, broker_utc_offset_minutes=180)
+        self.mt5.symbol_info_tick.return_value.time += 10800
+        shifted = [{**rate, "time": rate["time"] + 10800} for rate in self.rates]
+        shifted[-1]["time"] = self.now_seconds + 10800
+        self.mt5.copy_rates_from_pos.return_value = shifted
+        with self.assertRaises(bridge.MarketDataError):
+            bridge.build_payload(self.mt5, configured, self.now)
+
     def test_safe_url_validation(self):
         self.assertEqual(bridge.validate_feed_url(self.url), self.url)
         for url in (
@@ -192,6 +244,25 @@ class MT5BridgeTests(unittest.TestCase):
             with self.subTest(terminal=terminal):
                 with self.assertRaises(bridge.ConfigurationError):
                     bridge.load_settings(argparse.Namespace(terminal=str(terminal), symbol="XAUUSD.test"), env)
+
+    def test_broker_offset_environment_requires_bounded_clean_quarter_hour_integer(self):
+        args = argparse.Namespace(terminal=str(self.terminal), symbol="XAUUSD.test")
+        env = {"MARKET_BRIDGE_URL": self.url, "MARKET_BRIDGE_KEY": self.key}
+        self.assertEqual(bridge.load_settings(args, env).broker_utc_offset_minutes, 0)
+        for value, expected in (("180", 180), ("+180", 180), ("-720", -720),
+                                ("840", 840), ("345", 345), ("0", 0)):
+            with self.subTest(value=value):
+                configured = bridge.load_settings(args, {**env, "MT5_BROKER_UTC_OFFSET_MINUTES": value})
+                self.assertEqual(configured.broker_utc_offset_minutes, expected)
+        for value in ("", " 180", "180 ", "180\n", "180.0", "1_80", "True",
+                      "15e1", "--180", "181", "-735", "855", None, 180):
+            with self.subTest(value=value):
+                with self.assertRaises(bridge.ConfigurationError):
+                    bridge.load_settings(args, {**env, "MT5_BROKER_UTC_OFFSET_MINUTES": value})
+        for value in (True, 180.0, "180", 181, -735, 855):
+            with self.subTest(direct_value=value):
+                with self.assertRaises(bridge.ConfigurationError):
+                    replace(self.settings, broker_utc_offset_minutes=value)
 
     def test_http_payload_header_timeout_and_no_response_body_access(self):
         payload = self.payload()
