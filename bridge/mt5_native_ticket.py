@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 import os
 from pathlib import Path
 import re
+import sys
 import time
 
 
@@ -72,33 +73,6 @@ def _decimal_text(value):
     if not parsed.is_finite():
         raise TicketError("readback_failed")
     return parsed
-
-
-def read_stop_mode_control(dialog):
-    """Read one explicitly labeled price/points combo in the selected Trade tab."""
-    def normalized(value):
-        return str(value).replace("&", "").strip().rstrip(":").casefold()
-
-    combos = [control for control in dialog.descendants(control_type="ComboBox") if control.is_visible()]
-    matches = [control for control in combos if normalized(control.element_info.name) == "stop levels"]
-    if not matches:
-        labels = [control for control in dialog.descendants(control_type="Text")
-                  if control.is_visible() and normalized(control.window_text()) == "stop levels"]
-        if len(labels) != 1:
-            raise TicketError("absolute_mode_unverified")
-        label = labels[0].rectangle()
-        center = (label.top + label.bottom) / 2
-        matches = [control for control in combos
-                   if control.rectangle().left >= label.right
-                   and control.rectangle().top <= center <= control.rectangle().bottom]
-    if len(matches) != 1:
-        raise TicketError("absolute_mode_unverified")
-    selected = normalized(matches[0].selected_text())
-    if selected in {"in prices", "prices"}:
-        return "prices"
-    if selected in {"in points", "points"}:
-        return "points"
-    raise TicketError("absolute_mode_unverified")
 
 
 class NativeTicketAdapter:
@@ -191,6 +165,12 @@ class Win32Terminal:
 
     EDIT_IDS = frozenset({10333, 10334, 10336})
     SUBMIT_IDS = frozenset({10408, 10409})
+    MODE_STAGES = frozenset({
+        "terminal_binding", "existing_ticket_gate", "main_enabled_gate", "options_menu", "options_post",
+        "options_discovery", "trade_tab_find", "trade_tab_select", "trade_tab_verify",
+        "stop_combo_find", "stop_combo_read", "options_cancel", "final_identity",
+    })
+    MODE_DETAILS = frozenset({"0", "1", "multiple", "true", "false", "prices", "points", "unknown"})
 
     def __init__(self, terminal: Path, account_login: int, data_directory: Path, *, stop_mode_reader=None, account_guard=None):
         if os.name != "nt":
@@ -231,6 +211,8 @@ class Win32Terminal:
         self.user.GetDlgCtrlID.restype = ctypes.c_int
         self.user.GetParent.argtypes = [wintypes.HWND]
         self.user.GetParent.restype = wintypes.HWND
+        self.user.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        self.user.GetWindowLongW.restype = ctypes.c_long
         self.user.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         self.user.GetClassNameW.restype = ctypes.c_int
         self.user.IsWindow.argtypes = [wintypes.HWND]
@@ -334,7 +316,26 @@ class Win32Terminal:
                 found.append(handle)
         return found
 
+    def _mode_phase(self, stage, detail=""):
+        self.mode_stage = stage if stage in self.MODE_STAGES else "terminal_binding"
+        self.mode_detail = detail if detail in self.MODE_DETAILS else ""
+
     def read_stop_mode(self):
+        """Expose only a fixed local phase on failure, never raw UI/account data."""
+        self._mode_phase("terminal_binding")
+        try:
+            return self._read_stop_mode()
+        except Exception as error:
+            kind = type(error).__name__
+            if kind not in {"TicketError", "ImportError", "ModuleNotFoundError", "COMError", "TimeoutError",
+                            "ElementNotFoundError", "ElementAmbiguousError", "NoPatternInterfaceError"}:
+                kind = "other"
+            detail = ", " + self.mode_detail if self.mode_detail else ""
+            print("Native price-mode check blocked at " + self.mode_stage + " (" + kind + detail + ").",
+                  file=sys.stderr, flush=True)
+            raise
+
+    def _read_stop_mode(self):
         """Read the actual Trade setting, without changing or saving settings.
 
         The installed Order window is modeless. Each call reads Options again,
@@ -344,21 +345,27 @@ class Win32Terminal:
         """
         self.verify_terminal()
         tickets = self.existing_tickets()
+        self._mode_phase("existing_ticket_gate", str(len(tickets)) if len(tickets) < 2 else "multiple")
         if tickets and (not self.price_mode_attested or tickets != [self.attested_ticket]):
             raise TicketError("absolute_mode_unverified")
         self.price_mode_attested = False
-        if not self.user.IsWindowEnabled(self.main):
+        enabled = bool(self.user.IsWindowEnabled(self.main))
+        self._mode_phase("main_enabled_gate", "true" if enabled else "false")
+        if not enabled:
             raise TicketError("absolute_mode_unverified")
         options = None
+        failed_stage = None
         try:
-            from pywinauto import Application
+            self._mode_phase("options_menu")
             command = self._options_menu_command()
             # Only the discovered Options menu command is posted. Options is
             # modal, so a synchronous dispatch could block before discovery and
             # cleanup. No guessed command ID or trading command is accepted.
+            self._mode_phase("options_post")
             if not self.user.PostMessageW(self.main, 0x0111, command, 0):
                 raise TicketError("absolute_mode_unverified")
             deadline = time.monotonic() + 5
+            self._mode_phase("options_discovery")
             while time.monotonic() < deadline:
                 matches = [handle for handle in self.windows() if self.window_pid(handle) == self.pid
                            and self.class_name(handle) == "#32770" and self.text(handle) == "Options"
@@ -371,34 +378,93 @@ class Win32Terminal:
                 time.sleep(0.05)
             if options is None:
                 raise TicketError("absolute_mode_unverified")
-            application = Application(backend="uia").connect(process=self.pid)
-            dialog = application.window(handle=options)
-            tabs = dialog.child_window(control_type="Tab").wrapper_object()
-            tabs.select("Trade")  # Selection pattern, not a mouse/keyboard event
-            names = tabs.texts()
-            selected = tabs.get_selected_tab()
-            if selected is None or not 0 <= selected < len(names) or names[selected] != "Trade":
-                raise TicketError("absolute_mode_unverified")
-            mode = read_stop_mode_control(dialog)
+            mode = self._read_native_trade_mode(options)
             if mode != "prices":
                 raise TicketError("absolute_mode_unverified")
         except TicketError:
+            failed_stage = (self.mode_stage, self.mode_detail)
             raise
         except Exception:
+            failed_stage = (self.mode_stage, self.mode_detail)
             raise TicketError("absolute_mode_unverified") from None
         finally:
             if options is not None and self.user.IsWindow(options) and self.window_pid(options) == self.pid:
+                self._mode_phase("options_cancel")
                 self._message(options, 0x0010)  # WM_CLOSE = Cancel; never save Options
                 deadline = time.monotonic() + 3
                 while self.user.IsWindow(options) and time.monotonic() < deadline:
                     time.sleep(0.05)
                 if self.user.IsWindow(options):
                     raise TicketError("absolute_mode_unverified")
+            if failed_stage is not None:
+                self._mode_phase(*failed_stage)
+        self._mode_phase("final_identity")
         self.verify_terminal()
         if self.existing_tickets() != tickets or not self.user.IsWindowEnabled(self.main):
             raise TicketError("absolute_mode_unverified")
         self.price_mode_attested = True
         return "prices"
+
+    def _verify_options_dialog(self, options):
+        self.verify_terminal()
+        if (not self.user.IsWindow(options) or self.window_pid(options) != self.pid
+                or self.class_name(options) != "#32770" or self.text(options) != "Options"
+                or not self.user.IsWindowVisible(options) or self.user.IsWindowEnabled(self.main)):
+            raise TicketError("absolute_mode_unverified")
+
+    def _read_native_stop_controls(self, options):
+        """Recognize the observed Trade page, then read its actual combo text."""
+        self._mode_phase("stop_combo_find")
+        children = self.windows(options)
+        combos = [child for child in children if self.user.GetDlgCtrlID(child) == 10391]
+        # Static IDs are reused on other pages (10428 is News languages on
+        # Server). Only a visible Stop-level combo can identify the Trade page.
+        combos = [combo for combo in combos if self.user.IsWindowVisible(combo)]
+        if not combos:
+            return None
+        labels = [child for child in children if self.user.GetDlgCtrlID(child) == 10428
+                  and self.user.IsWindowVisible(child)]
+        if len(labels) != 1 or len(combos) != 1:
+            raise TicketError("absolute_mode_unverified")
+        label, combo = labels[0], combos[0]
+        if (self.class_name(label) != "Static" or self.class_name(combo) != "ComboBox"
+                or self.window_pid(label) != self.pid or self.window_pid(combo) != self.pid):
+            raise TicketError("absolute_mode_unverified")
+        if self.text(label).replace("&", "").strip().rstrip(":").casefold() != "stop levels":
+            raise TicketError("absolute_mode_unverified")
+        self._mode_phase("stop_combo_read")
+        value = self.text(combo).strip().casefold()
+        mode = {"in prices": "prices", "prices": "prices", "in points": "points", "points": "points"}.get(value)
+        self._mode_phase("stop_combo_read", mode or "unknown")
+        if mode is None:
+            raise TicketError("absolute_mode_unverified")
+        return mode
+
+    def _read_native_trade_mode(self, options):
+        self._verify_options_dialog(options)
+        self._mode_phase("trade_tab_find")
+        tab = self.control(options, 12320, "SysTabControl32")
+        style = self.user.GetWindowLongW(tab, -16)  # GWL_STYLE
+        count = self._message(tab, 0x1304)  # TCM_GETITEMCOUNT
+        current = self._message(tab, 0x130B)  # TCM_GETCURSEL
+        if (not self.user.IsWindowVisible(tab) or not style or style & 0x0100  # TCS_BUTTONS
+                or not 1 <= count <= 32 or not 0 <= current < count):
+            raise TicketError("absolute_mode_unverified")
+        # A remembered Trade page needs no navigation. Otherwise the native
+        # selection notification switches each bounded page; the unique visible
+        # observed Stop levels controls identify Trade without guessing its index.
+        for index in [current] + [item for item in range(count) if item != current]:
+            self._verify_options_dialog(options)
+            if index != current:
+                self._mode_phase("trade_tab_select")
+                self._message(tab, 0x1330, index, 0)  # TCM_SETCURFOCUS, normal tab notifications
+                self._mode_phase("trade_tab_verify")
+                if self._message(tab, 0x130B) != index:
+                    raise TicketError("absolute_mode_unverified")
+            mode = self._read_native_stop_controls(options)
+            if mode is not None:
+                return mode
+        raise TicketError("absolute_mode_unverified")
 
     def _options_menu_command(self):
         menu = self.user.GetMenu(self.main)

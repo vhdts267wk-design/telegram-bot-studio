@@ -1,3 +1,2 @@
 # Local Windows helper only; never add this UI dependency to the bot server.
 -r requirements.txt
-pywinauto==0.6.9; sys_platform == "win32"
