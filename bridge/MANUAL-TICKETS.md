@@ -35,4 +35,46 @@ The fixed protection levels must still match the broker tick grid and minimum st
 
 Press Ctrl+C to stop the foreground helper. It installs no background service or scheduled task. A successfully prepared window remains for your review or cancellation; an interrupted locked preparation follows the same guarded cancellation path.
 
-Official references: [Native order window and submission](https://www.metatrader5.com/en/terminal/help/trading/performing_deals), [SL/TP prices versus points settings](https://www.metatrader5.com/en/terminal/help/startworking/settings), and [SDK function list](https://www.mql5.com/en/docs/python_metatrader5).
+## Proposal levels on the chart
+
+Compile `bridge/MT5BotLevels.mq5` in MetaEditor and copy the resulting
+`MT5BotLevels.ex5` into `MQL5/Indicators/MT5Bot` under this terminal's **File >
+Open Data Folder**. Refresh MT5's Navigator and attach **MT5BotLevels** to
+the intended XAUUSD M15 chart. It is a display-only custom indicator and needs
+no DLLs, WebRequest permissions or algorithmic-trading setting. Keep the
+paired manual helper running.
+
+Each latest valid published proposal appears automatically, before a ticket
+preparation request: shaded Entry Zone, gold reference Entry, green TP and red
+SL, with direction and prices. The reference zone is entry plus/minus 0.1 times
+the original stop distance, rounded inward to the frozen broker tick grid.
+Telegram and the chart use the same calculation and original SL/TP; spread
+is not included in that reference zone. Native preparation retains its
+existing spread-plus-drift guard and never guarantees a fill at Entry.
+
+The separate manual-key-authenticated `POST /api/mt5/manual/chart` accepts
+only the paired `device_id`. It neither claims nor changes a proposal, and
+does not refresh the device heartbeat. It selects the latest published
+owner-bound proposal before checking status, subscription, risk pause, Demo
+0.01 binding, receipt/quote freshness, broker metadata and explicit expiry.
+A newer rejected or expired proposal cannot expose an older one again.
+
+The helper refreshes the market feed every 20 seconds and reads display
+updates every 10 seconds. It atomically publishes one headerless ASCII row
+in the verified terminal common folder's
+`Files/MT5Bot/levels_<terminal-data-folder-name>.csv`. The row expires within
+25 seconds and no later than the proposal or quote deadline. It contains a
+random nonce and salted account-binding hash, never the raw account login,
+server, Telegram chat/user, device ID or API key. The indicator checks its
+current Demo account, terminal, XAUUSD M15 chart, UTC expiry, price grid and
+completed broker chart bar before drawing. The broker UTC offset affects
+chart coordinates only; expiry uses `TimeGMT()`.
+
+Missing, malformed, stale or unavailable data clears only the indicator's
+own objects and displays a waiting message. Account changes require reloading
+the indicator. User drawings, orders, positions and an already prepared
+native ticket are untouched. Stopping or crashing the helper cannot leave
+active levels displayed past the short local expiry. When no valid proposal
+exists, the indicator waits; it does not invent a trade.
+
+Official references: [Native order window and submission](https://www.metatrader5.com/en/terminal/help/trading/performing_deals), [SL/TP prices versus points settings](https://www.metatrader5.com/en/terminal/help/startworking/settings), [SDK function list](https://www.mql5.com/en/docs/python_metatrader5), [Custom indicators](https://www.metatrader5.com/en/terminal/help/charts_analysis/indicators), and [MetaEditor compilation](https://www.metatrader5.com/en/metaeditor/help/development/compile).

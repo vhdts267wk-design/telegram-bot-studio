@@ -26,10 +26,12 @@ try:
     from bridge import mt5_market_bridge as market
     from bridge import mt5_trade_bridge as trade
     from bridge import mt5_native_ticket as native
+    from bridge import mt5_chart_overlay as chart
 except ModuleNotFoundError:
     import mt5_market_bridge as market
     import mt5_trade_bridge as trade
     import mt5_native_ticket as native
+    import mt5_chart_overlay as chart
 
 
 @dataclass(frozen=True)
@@ -207,7 +209,8 @@ def prepare_ticket(mt5, settings, ledger, journal, adapter, preparation, *, cloc
 
 def api_post(settings, route, payload):
     routes = {"market": "/api/market/feed", "register": "/api/mt5/register",
-              "poll": "/api/mt5/manual/poll", "result": "/api/mt5/manual/result"}
+              "poll": "/api/mt5/manual/poll", "result": "/api/mt5/manual/result",
+              "chart": "/api/mt5/manual/chart"}
     if route not in routes:
         raise trade.GuardError("Invalid manual bridge route.")
     market.validate_feed_url(settings.market.url)
@@ -240,8 +243,17 @@ def flush_results(settings, ledger, journal, post=api_post):
         journal.acknowledge(pending["offer_id"], pending["claim_id"])
 
 
-def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.sleep, adapter_factory=None):
+def refresh_chart(settings, device_id, exporter, feed, *, post=api_post, clock=trade.now_utc):
+    """Read display levels separately from claiming a ticket preparation."""
+    reply = post(settings, "chart", {"device_id": device_id})
+    if type(reply) is not dict or set(reply) != {"proposal"}:
+        raise chart.OverlayError("Invalid chart response")
+    exporter.publish(reply["proposal"], execution=feed.get("execution"), quote=feed.get("quote"), observed_at=clock())
+
+
+def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.sleep, adapter_factory=None, exporter_factory=None):
     ledger = process_lock = None
+    exporter = None
     initialized = False
     try:
         process_lock = trade.ProcessLock(settings.state_directory)
@@ -257,6 +269,17 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
         data_path = getattr(terminal_info, "data_path", None)
         if not data_path:
             raise trade.GuardError("The terminal data directory could not be verified.")
+        try:
+            if exporter_factory is not None:
+                exporter = exporter_factory(terminal_info, settings.market, account)
+            elif adapter_factory is None or getattr(terminal_info, "commondata_path", None) is not None:
+                # A synthetic adapter without a common directory has no file
+                # export. The real helper always requires the verified path.
+                exporter = chart.ChartExporter.from_terminal_info(terminal_info, settings.market, account)
+            if exporter is not None:
+                exporter.clear(clock())
+        except (chart.OverlayError, OSError):
+            raise trade.GuardError("The MT5 common Files directory could not be verified for chart display.") from None
         factory = adapter_factory or (
             lambda: native.NativeTicketAdapter(native.Win32Terminal(
                 settings.market.terminal, account.login, Path(data_path),
@@ -279,11 +302,26 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
         next_feed = 0.0
         feed_available = False
         outage_reported = False
+        chart_outage_reported = False
+        latest_feed = None
+
+        def chart_unavailable():
+            nonlocal chart_outage_reported
+            if exporter is None:
+                return
+            try:
+                exporter.clear(clock())
+            except Exception:
+                pass  # The previous row also has a bounded display deadline.
+            if not chart_outage_reported:
+                print("MT5 chart display unavailable.", file=sys.stderr, flush=True)
+                chart_outage_reported = True
 
         def unavailable(reason):
             nonlocal feed_available, next_feed, outage_reported
             feed_available = False
             next_feed = time.monotonic() + trade.POLL_SECONDS
+            chart_unavailable()
             if not outage_reported:
                 print("MT5 feed unavailable (" + reason + ").", file=sys.stderr, flush=True)
                 outage_reported = True
@@ -297,11 +335,23 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
                     payload["device_id"] = ledger.device_id
                     payload["execution"] = trade.execution_metadata(mt5.symbol_info(settings.market.symbol))
                     post(settings, "market", payload)
-                    next_feed = time.monotonic() + trade.FEED_SECONDS
+                    latest_feed = payload
+                    cadence = min(trade.FEED_SECONDS, chart.FEED_REFRESH_SECONDS) if exporter is not None else trade.FEED_SECONDS
+                    next_feed = time.monotonic() + cadence
                     if not feed_available:
                         print("Fresh MT5 feed ready.", flush=True)
                     feed_available, outage_reported = True, False
                 if feed_available:
+                    if exporter is not None:
+                        try:
+                            refresh_chart(settings, ledger.device_id, exporter, latest_feed, post=post, clock=clock)
+                            if chart_outage_reported:
+                                print("MT5 chart display ready.", flush=True)
+                            chart_outage_reported = False
+                        except Exception:
+                            # A display failure must never claim a draft or
+                            # interfere with the existing preparation path.
+                            chart_unavailable()
                     reply = post(settings, "poll", {"device_id": ledger.device_id})
                     preparation = reply.get("preparation")
                     if preparation is not None:
@@ -327,6 +377,11 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
         print("Manual helper stopped: " + message, file=sys.stderr, flush=True)
         return 1
     finally:
+        if exporter is not None:
+            try:
+                exporter.clear(clock())
+            except Exception:
+                print("MT5 chart display unavailable.", file=sys.stderr, flush=True)
         if initialized:
             mt5.shutdown()
         if ledger is not None:
