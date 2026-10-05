@@ -39,6 +39,33 @@ class ManualTicketStoreTests(unittest.IsolatedAsyncioTestCase):
         self.pool = SimpleNamespace(fetchrow=AsyncMock(return_value=row()), fetch=AsyncMock(return_value=[]),
                                     fetchval=AsyncMock(return_value=True))
 
+    async def test_chart_read_selects_newest_publication_before_eligibility_without_writes(self):
+        self.pool.fetchrow.return_value = row(status="offered", published_at=NOW, message_id=77)
+        result = await store.get_chart_offer(self.pool, BOT, DEVICE, NOW)
+        self.assertEqual(result["id"], OFFER)
+        query, *args = self.pool.fetchrow.await_args.args
+        latest, conditions = compact(query).split("SELECT latest.*", 1)
+        self.assertIn("published_at IS NOT NULL AND message_id IS NOT NULL", latest)
+        self.assertIn("ORDER BY published_at DESC, created_at DESC, id DESC LIMIT 1", latest)
+        self.assertNotIn("status", latest)
+        self.assertIn("latest.status IN ('offered', 'requested', 'preparing', 'prepared')", conditions)
+        self.assertIn("latest.expires_at > $3", conditions)
+        self.assertIn("device.owner_chat_id = latest.chat_id AND device.owner_user_id = latest.user_id", conditions)
+        self.assertIn("latest.chat_id = latest.user_id AND subscription.active", conditions)
+        self.assertIn("latest.preparing_at >= $5 AND latest.preparing_at <= $3", conditions)
+        self.assertIn("latest.result = '{\"status\":\"prepared\"}'::jsonb", conditions)
+        self.assertEqual(args, [BOT, DEVICE, NOW, NOW - store.HEARTBEAT_TTL, NOW - store.PREPARATION_TIMEOUT])
+        for forbidden in ("INSERT ", "UPDATE ", "DELETE ", "FOR UPDATE", "SKIP LOCKED"):
+            self.assertNotIn(forbidden, query.upper())
+        self.pool.fetchval.assert_not_awaited()
+        self.pool.fetch.assert_not_awaited()
+
+    async def test_chart_read_returns_none_without_reviving_an_older_offer(self):
+        self.pool.fetchrow.return_value = None
+        self.assertIsNone(await store.get_chart_offer(self.pool, BOT, DEVICE, NOW))
+        self.pool.fetchrow.assert_awaited_once()
+        self.pool.fetchval.assert_not_awaited()
+
     async def test_schema_is_separate_and_serializes_preparation_per_device(self):
         schema = " ".join(compact(statement) for statement in store.SCHEMA_STATEMENTS)
         self.assertIn("CREATE TABLE IF NOT EXISTS mt5_manual_ticket_offers", schema)

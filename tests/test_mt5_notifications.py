@@ -708,6 +708,7 @@ class ManualMT5NotificationTests(unittest.IsolatedAsyncioTestCase):
         sent = self.bot.send_message.await_args
         for text in ("Demo", "0.01", "TP", "SL", "لا يرسل صفقة", "بنفسك"):
             self.assertIn(text, sent.args[1])
+        self.assertIn("منطقة دخول مرجعية قبل السبريد: 99.700 – 100.300", sent.args[1])
         buttons = sent.kwargs["reply_markup"].inline_keyboard[0]
         self.assertEqual(buttons[0].text, "جهّز على اللابتوب")
         for button in buttons:
