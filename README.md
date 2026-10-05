@@ -447,6 +447,19 @@ package settings before Railway can pull it without registry credentials.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
+## Manual MT5 tickets
+
+Set `MARKET_SOURCE=mt5`, `MT5_MANUAL_TICKETS_ENABLED=true`,
+`MT5_TRADING_ENABLED=false` and a distinct `MT5_MANUAL_BRIDGE_KEY` of at least
+32 characters. The paired Windows helper uploads broker candles and quotes,
+and the bot's **جهّز على اللابتوب** button requests a visible native MT5 ticket
+with Volume, Stop Loss and Take Profit filled. The human reviews the ticket
+and clicks Buy/Sell inside MT5. Preparation never sends an order or confirms
+execution. Old automatic Accept buttons and execution endpoints are blocked.
+
+Run migration `20261005_05` before use. Local setup and supported UI checks are
+described in [bridge/MANUAL-TICKETS.md](bridge/MANUAL-TICKETS.md).
+
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE).
