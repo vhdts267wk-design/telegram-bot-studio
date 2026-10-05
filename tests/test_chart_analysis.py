@@ -197,6 +197,14 @@ class ChartProposalTests(unittest.TestCase):
         self.assertIn("لا يُرسل أمر تداول", report)
         self.assertNotIn("تنفيذ Demo", report)
 
+    def test_manual_ticket_proposal_requires_native_buy_sell_and_overrides_auto_guidance(self):
+        result = self.result()
+        report = chart_analysis.format_chart_proposal(result, execution_enabled=True, manual_ticket_enabled=True)
+        for text in ("جهّز على اللابتوب", "TP وSL فقط", "Buy أو Sell بنفسك", f"الدخول المرجعي: {result['entry']:.2f}"):
+            self.assertIn(text, report)
+        self.assertNotIn("تنفيذ Demo فقط", report)
+        self.assertNotIn("طلب قابل للتنفيذ وقبولك", report)
+
     def test_waiting_states_explain_actual_reason_and_never_make_levels(self):
         cases = (
             ({"state": "warmup", "candle_count": 5}, "5/22"),

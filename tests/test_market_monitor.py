@@ -17,6 +17,7 @@ from bot import market_news
 
 NOW = datetime(2026, 10, 4, 12, 30, tzinfo=timezone.utc)
 BRIDGE_KEY = "synthetic-feed-key-" + "x" * 32
+MANUAL_BRIDGE_KEY = "synthetic-manual-feed-key-" + "y" * 32
 
 
 def broker_feed(count=24):
@@ -490,6 +491,71 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(monitor.WORKER_KEY, application.bot_data)
 
 
+class ManualTicketMonitorTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.env = patch.dict(monitor.os.environ, {
+            "MARKET_SOURCE": "mt5", "MT5_MANUAL_TICKETS_ENABLED": "true", "MT5_TRADING_ENABLED": "true",
+        }, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.clock = patch.object(monitor, "utc_now", return_value=NOW)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.service = monitor.MarketService(object(), 9901)
+
+    async def test_setup_initializes_manual_store_after_devices_and_manual_flag_disables_automatic_trading(self):
+        order = []
+
+        def initialise(name):
+            async def initialize(pool):
+                order.append(name)
+            return initialize
+
+        application = SimpleNamespace(bot_data={"db": object()}, bot=SimpleNamespace(id=9901), running=False)
+        with patch.object(monitor.market_store, "initialize_schema", side_effect=initialise("market")), patch.object(
+            monitor.journal_store, "initialize_schema", side_effect=initialise("journal")
+        ), patch.object(monitor.trade_store, "initialize_schema", side_effect=initialise("trade")), patch.object(
+            monitor.manual_ticket_store, "initialize_schema", side_effect=initialise("manual")
+        ):
+            await monitor.setup(application)
+            await monitor.stop(application)
+        service = application.bot_data[monitor.SERVICE_KEY]
+        self.assertTrue(service.manual_tickets_enabled)
+        self.assertFalse(service.trading_enabled)
+        self.assertEqual(order, ["market", "journal", "trade", "manual"])
+
+    async def test_worker_dispatches_manual_preparation_offers_and_results_with_auto_disabled(self):
+        application = SimpleNamespace(running=True, bot=object())
+        with patch.object(monitor.asyncio, "sleep", new_callable=AsyncMock, side_effect=[None, asyncio.CancelledError]), patch.object(
+            monitor.market_store, "get_cache", new_callable=AsyncMock, return_value=None
+        ), patch.object(monitor.market_store, "claim_due", new_callable=AsyncMock, return_value=[]), patch.object(
+            monitor.manual_ticket_store, "expire_offers", new_callable=AsyncMock
+        ) as manual_expire, patch.object(monitor.trade_store, "expire_offers", new_callable=AsyncMock) as auto_expire, patch.object(
+            monitor.mt5_notifications, "send_results", new_callable=AsyncMock, return_value=True
+        ) as results, patch.object(monitor.mt5_notifications, "send_offers", new_callable=AsyncMock, return_value=True) as offers:
+            with self.assertRaises(asyncio.CancelledError):
+                await monitor._worker(application, self.service)
+        self.assertFalse(self.service.trading_enabled)
+        manual_expire.assert_awaited_once()
+        auto_expire.assert_not_awaited()
+        results.assert_awaited_once_with(self.service, application.bot)
+        offers.assert_awaited_once_with(self.service, application.bot)
+
+    async def test_unwatch_cancels_manual_pending_and_explains_existing_native_window(self):
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(type="private", id=4401))
+        context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
+        with patch.object(monitor.market_store, "disable_subscription", new_callable=AsyncMock), patch.object(
+            monitor.manual_ticket_store, "cancel_offers", new_callable=AsyncMock
+        ) as manual_cancel, patch.object(monitor.trade_store, "cancel_offers", new_callable=AsyncMock) as auto_cancel:
+            await monitor.unwatch_command(update, context)
+        manual_cancel.assert_awaited_once_with(self.service.pool, 9901, 4401, NOW)
+        auto_cancel.assert_not_awaited()
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("تجهيز MT5 المعلقة", text)
+        self.assertIn("لا يغلقها", text)
+
+
 class ReferenceCoordinatorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.clock = {"now": NOW, "monotonic": 100.0}
@@ -596,6 +662,7 @@ class ReferenceReportTests(unittest.TestCase):
 class FeedRouteTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.service = monitor.MarketService(object(), 9901)
+        self.service.manual_tickets_enabled = False
         self.application = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
         self.settings = SimpleNamespace(market_bridge_key=BRIDGE_KEY)
         self.app = FastAPI()
@@ -636,6 +703,55 @@ class FeedRouteTests(unittest.IsolatedAsyncioTestCase):
             response = await self.post(body=oversized_stream())
             self.assertEqual(response.status_code, 413)
             save.assert_not_awaited()
+
+    async def test_manual_feed_accepts_only_dedicated_key_and_never_legacy_key(self):
+        self.service.manual_tickets_enabled = True
+        with patch.dict(monitor.os.environ, {"MT5_MANUAL_BRIDGE_KEY": MANUAL_BRIDGE_KEY}), patch.object(
+            monitor.market_store, "save_feed_cache", new_callable=AsyncMock, return_value=True
+        ) as save:
+            self.assertEqual((await self.post(auth=BRIDGE_KEY)).status_code, 401)
+            save.assert_not_awaited()
+            self.assertEqual((await self.post(auth=MANUAL_BRIDGE_KEY)).status_code, 200)
+            save.assert_awaited_once()
+
+    async def test_missing_or_short_manual_key_fails_closed_even_with_valid_legacy_key(self):
+        self.service.manual_tickets_enabled = True
+        for manual_key in ("", "short"):
+            with self.subTest(manual_key=manual_key), patch.dict(
+                monitor.os.environ, {"MT5_MANUAL_BRIDGE_KEY": manual_key}
+            ), patch.object(monitor.market_store, "save_feed_cache", new_callable=AsyncMock) as save:
+                self.assertEqual((await self.post(auth=BRIDGE_KEY)).status_code, 404)
+                self.assertEqual((await self.post(auth=MANUAL_BRIDGE_KEY)).status_code, 404)
+                save.assert_not_awaited()
+
+    async def test_automatic_feed_does_not_accept_manual_key(self):
+        with patch.dict(monitor.os.environ, {"MT5_MANUAL_BRIDGE_KEY": MANUAL_BRIDGE_KEY}), patch.object(
+            monitor.market_store, "save_feed_cache", new_callable=AsyncMock, return_value=True
+        ) as save:
+            self.assertEqual((await self.post(auth=MANUAL_BRIDGE_KEY)).status_code, 401)
+            save.assert_not_awaited()
+            self.assertEqual((await self.post(auth=BRIDGE_KEY)).status_code, 200)
+            save.assert_awaited_once()
+
+    async def test_configured_manual_mode_isolates_key_before_service_ready_and_during_switch(self):
+        with patch.dict(monitor.os.environ, {
+            "MT5_MANUAL_TICKETS_ENABLED": "true", "MT5_MANUAL_BRIDGE_KEY": MANUAL_BRIDGE_KEY,
+        }), patch.object(monitor.market_store, "save_feed_cache", new_callable=AsyncMock, return_value=True) as save:
+            # Configuration already says manual even before service restart.
+            self.assertEqual((await self.post(auth=BRIDGE_KEY)).status_code, 401)
+            self.assertEqual((await self.post(auth=MANUAL_BRIDGE_KEY)).status_code, 200)
+            save.reset_mock()
+            self.application.bot_data.clear()
+            self.assertEqual((await self.post(auth=BRIDGE_KEY)).status_code, 401)
+            self.assertEqual((await self.post(auth=MANUAL_BRIDGE_KEY)).status_code, 503)
+            save.assert_not_awaited()
+
+    async def test_invalid_runtime_mode_flag_fails_closed_before_any_feed_write(self):
+        for flag in ("true", 1):
+            self.service.manual_tickets_enabled = flag
+            with self.subTest(flag=flag), patch.object(monitor.market_store, "save_feed_cache", new_callable=AsyncMock) as save:
+                self.assertEqual((await self.post(auth=BRIDGE_KEY)).status_code, 404)
+                save.assert_not_awaited()
 
     async def test_invalid_payloads_are_rejected_without_echoing_the_body(self):
         bad_feed = broker_feed()
