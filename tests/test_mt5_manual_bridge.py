@@ -403,44 +403,6 @@ class NativeTicketTests(unittest.TestCase):
             with self.subTest(symbol=symbol), self.assertRaises(native.TicketError):
                 native.Draft(symbol, direction, volume, stop, target, 2, NOW + timedelta(minutes=5))
 
-    def test_authoritative_stop_setting_is_read_without_changing_any_combo_value(self):
-        combo = Mock()
-        combo.element_info.name = "Stop levels:"
-        combo.is_visible.return_value = True
-        dialog = Mock()
-        dialog.descendants.side_effect = lambda **query: [combo] if query["control_type"] == "ComboBox" else []
-        for text, expected in (("in prices", "prices"), ("in points", "points")):
-            with self.subTest(text=text):
-                combo.selected_text.return_value = text
-                self.assertEqual(native.read_stop_mode_control(dialog), expected)
-        combo.selected_text.return_value = "unsupported units"
-        with self.assertRaisesRegex(native.TicketError, "absolute_mode_unverified"):
-            native.read_stop_mode_control(dialog)
-        combo.select.assert_not_called()
-        combo.set_text.assert_not_called()
-
-    def test_unlabeled_stop_combo_requires_unique_same_row_label_relationship(self):
-        combo = Mock()
-        combo.element_info.name = ""
-        combo.is_visible.return_value = True
-        combo.rectangle.return_value = SimpleNamespace(left=150, right=300, top=100, bottom=125)
-        combo.selected_text.return_value = "in prices"
-        label = Mock()
-        label.window_text.return_value = "Stop levels:"
-        label.is_visible.return_value = True
-        label.rectangle.return_value = SimpleNamespace(left=50, right=140, top=103, bottom=122)
-        dialog = Mock()
-        combos = [combo]
-        dialog.descendants.side_effect = lambda **query: combos if query["control_type"] == "ComboBox" else [label]
-        self.assertEqual(native.read_stop_mode_control(dialog), "prices")
-        ambiguous = Mock()
-        ambiguous.element_info.name = ""
-        ambiguous.is_visible.return_value = True
-        ambiguous.rectangle.return_value = SimpleNamespace(left=310, right=400, top=100, bottom=125)
-        combos.append(ambiguous)
-        with self.assertRaisesRegex(native.TicketError, "absolute_mode_unverified"):
-            native.read_stop_mode_control(dialog)
-
     def test_a_ticket_appearing_during_chart_selection_is_not_reused_or_overwritten(self):
         def activate(symbol, timeframe):
             self.backend.ticket = 88
@@ -547,12 +509,21 @@ class ObservedNativeWindowTests(unittest.TestCase):
 
     def mode_backend(self, ticket=55):
         backend = self.window_backend()
-        state = {"options": False, "ticket": ticket}
-        backend.windows = lambda parent=None: [100] + ([state["ticket"]] if state["ticket"] else []) + ([77] if state["options"] else [])
+        state = {"options": False, "ticket": ticket, "selected": 1, "trade_index": 1,
+                 "count": 4, "style": 0x50000000, "mode": "In Prices", "label": "Stop levels:",
+                 "children": [12320, 10428, 10391]}
+        backend.windows = lambda parent=None: state["children"] if parent == 77 else (
+            [100] + ([state["ticket"]] if state["ticket"] else []) + ([77] if state["options"] else []))
         backend.existing_tickets = lambda: [state["ticket"]] if state["ticket"] else []
-        backend.class_name = lambda handle: "#32770" if handle == 77 else "other"
-        backend.text = lambda handle: "Options" if handle == 77 else "Order: XAUUSD - Gold vs US Dollar"
-        backend.user.IsWindowVisible.return_value = True
+        classes = {77: "#32770", 12320: "SysTabControl32", 10428: "Static", 10391: "ComboBox"}
+        backend.class_name = lambda handle: classes.get(handle, "other")
+        backend.text = lambda handle: ("Options" if handle == 77 else state["mode"] if handle == 10391
+                                       else state["label"] if handle == 10428 else "Order: XAUUSD - Gold vs US Dollar")
+        backend.user.GetDlgCtrlID.side_effect = lambda handle: handle
+        backend.user.GetWindowLongW.side_effect = lambda handle, index: state["style"]
+        backend.user.IsWindowVisible.side_effect = lambda handle: (
+            state["options"] and state["selected"] == state["trade_index"] if handle in (10428, 10391)
+            else state["options"] if handle in (77, 12320) else True)
         backend.user.IsWindow = lambda handle: state["options"] if handle == 77 else True
         backend.user.IsWindowEnabled = lambda handle: not state["options"]
         backend._options_menu_command = Mock(return_value=33405)
@@ -560,8 +531,14 @@ class ObservedNativeWindowTests(unittest.TestCase):
         def message(handle, code, first=0, second=0):
             if (handle, code) == (77, 0x0010):
                 state["options"] = False
+            elif (handle, code) == (12320, 0x1304):
+                return state["count"]
+            elif (handle, code) == (12320, 0x130B):
+                return state["selected"]
+            elif (handle, code) == (12320, 0x1330):
+                state["selected"] = first
             else:
-                raise AssertionError("Only opening/cancelling Options is supported in this fixture")
+                raise AssertionError("Only native tab navigation and cancelling Options are supported")
             return 1
 
         backend._message = Mock(side_effect=message)
@@ -570,46 +547,33 @@ class ObservedNativeWindowTests(unittest.TestCase):
             state["options"] = True
             return True
         backend.user.PostMessageW.side_effect = post
-        tab = Mock()
-        tab.texts.return_value = ["General", "Trade"]
-        tab.get_selected_tab.return_value = 1
-        dialog = Mock()
-        dialog.child_window.return_value.wrapper_object.return_value = tab
-        application = Mock()
-        application.connect.return_value = application
-        application.window.return_value = dialog
-        application_factory = Mock(return_value=application)
-        return backend, state, tab, application_factory
+        return backend, state
 
     def test_modeless_owned_ticket_requires_a_fresh_actual_options_read_and_cancel(self):
-        backend, state, tab, application_factory = self.mode_backend()
-        with patch.dict("sys.modules", {"pywinauto": SimpleNamespace(Application=application_factory)}), patch.object(
-            native, "read_stop_mode_control", return_value="prices"
-        ) as reader:
+        backend, state = self.mode_backend()
+        # A framework that cannot import must not affect the native reader.
+        with patch.dict("sys.modules", {"pywinauto": None}):
             self.assertEqual(backend.read_stop_mode(), "prices")
-        reader.assert_called_once()
-        tab.select.assert_called_once_with("Trade")
         self.assertFalse(state["options"])
         self.assertTrue(backend.price_mode_attested)
         backend._message.assert_any_call(77, 0x0010)
-        application_factory.assert_called_once_with(backend="uia")
+        self.assertFalse(any(call.args[1] == 0x1330 for call in backend._message.call_args_list))
 
     def test_foreign_or_unattested_ticket_blocks_options_before_any_action(self):
         for foreign, prior_attestation in ((56, True), (55, False)):
             with self.subTest(foreign=foreign, prior_attestation=prior_attestation):
-                backend, state, tab, application_factory = self.mode_backend(foreign)
+                backend, state = self.mode_backend(foreign)
                 backend.price_mode_attested = prior_attestation
-                with self.assertRaisesRegex(native.TicketError, "absolute_mode_unverified"):
+                with redirect_stderr(io.StringIO()), self.assertRaisesRegex(native.TicketError, "absolute_mode_unverified"):
                     backend.read_stop_mode()
                 backend._message.assert_not_called()
                 backend.user.PostMessageW.assert_not_called()
                 self.assertFalse(state["options"])
 
     def test_points_changed_with_modeless_ticket_blocks_and_cancels_options(self):
-        backend, state, tab, application_factory = self.mode_backend()
-        with patch.dict("sys.modules", {"pywinauto": SimpleNamespace(Application=application_factory)}), patch.object(
-            native, "read_stop_mode_control", return_value="points"
-        ):
+        backend, state = self.mode_backend()
+        state["mode"] = "In Points"
+        with redirect_stderr(io.StringIO()):
             with self.assertRaisesRegex(native.TicketError, "absolute_mode_unverified"):
                 backend.read_stop_mode()
         self.assertFalse(state["options"])
@@ -617,12 +581,9 @@ class ObservedNativeWindowTests(unittest.TestCase):
         backend._message.assert_any_call(77, 0x0010)
 
     def test_initial_price_attestation_reads_options_without_opening_any_ticket(self):
-        backend, state, tab, application_factory = self.mode_backend(None)
+        backend, state = self.mode_backend(None)
         backend.price_mode_attested = False
-        with patch.dict("sys.modules", {"pywinauto": SimpleNamespace(Application=application_factory)}), patch.object(
-            native, "read_stop_mode_control", return_value="prices"
-        ):
-            self.assertEqual(backend.read_stop_mode(), "prices")
+        self.assertEqual(backend.read_stop_mode(), "prices")
         self.assertIsNone(state["ticket"])
         self.assertFalse(state["options"])
 
@@ -689,6 +650,74 @@ class ObservedNativeWindowTests(unittest.TestCase):
                 backend._message.assert_not_called()
                 self.assertFalse(state["closed"])
                 self.assertFalse(state["enabled"])
+
+    def test_mode_failure_diagnostic_preserves_read_stage_after_cancel_and_redacts_ui_text(self):
+        for selected, expected in (("In Points", "points"), ("private unexpected UI value", "unknown")):
+            with self.subTest(selected=selected):
+                backend, state = self.mode_backend()
+                state["mode"] = selected
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    with self.assertRaisesRegex(native.TicketError, "absolute_mode_unverified"):
+                        backend.read_stop_mode()
+                self.assertIn("stop_combo_read (TicketError, " + expected + ")", errors.getvalue())
+                self.assertNotIn(selected, errors.getvalue())
+                self.assertFalse(state["options"])
+                self.assertFalse(backend.price_mode_attested)
+
+    def test_native_tab_navigation_skips_reused_server_label_and_finds_real_trade_controls(self):
+        backend, state = self.mode_backend()
+        state["selected"], state["trade_index"] = 0, 2
+        original_windows, original_text = backend.windows, backend.text
+        original_visibility = backend.user.IsWindowVisible.side_effect
+        backend.windows = lambda parent=None: ([12320, 10428] if parent == 77 and state["selected"] != 2
+                                               else original_windows(parent))
+        backend.text = lambda handle: ("News languages:" if handle == 10428 and state["selected"] != 2
+                                       else original_text(handle))
+        backend.user.IsWindowVisible.side_effect = lambda handle: (state["options"] if handle == 10428
+                                                                  else original_visibility(handle))
+        self.assertEqual(backend.read_stop_mode(), "prices")
+        backend._message.assert_any_call(12320, 0x1330, 1, 0)
+        backend._message.assert_any_call(12320, 0x1330, 2, 0)
+        self.assertFalse(state["options"])
+        self.assertEqual(state["mode"], "In Prices")
+        self.assertTrue(all(call.args[1] in (0x1304, 0x130B, 0x1330, 0x0010)
+                            for call in backend._message.call_args_list))
+
+    def test_native_stop_source_requires_unique_visible_combo_and_exact_label(self):
+        for change in ("missing_label", "wrong_label", "duplicate_combo"):
+            with self.subTest(change=change):
+                backend, state = self.mode_backend()
+                if change == "missing_label":
+                    state["children"].remove(10428)
+                elif change == "wrong_label":
+                    state["label"] = "News languages:"
+                else:
+                    state["children"].append(10391)
+                with redirect_stderr(io.StringIO()), self.assertRaisesRegex(native.TicketError, "absolute_mode_unverified"):
+                    backend.read_stop_mode()
+                self.assertFalse(state["options"])
+                self.assertFalse(backend.price_mode_attested)
+
+    def test_native_tab_layout_and_bounds_fail_closed_before_navigation(self):
+        for setting, value in (("count", 33), ("count", 0), ("selected", -1), ("style", 0x50000100)):
+            with self.subTest(setting=setting, value=value):
+                backend, state = self.mode_backend()
+                state[setting] = value
+                with redirect_stderr(io.StringIO()), self.assertRaisesRegex(native.TicketError, "absolute_mode_unverified"):
+                    backend.read_stop_mode()
+                self.assertFalse(any(call.args[1] == 0x1330 for call in backend._message.call_args_list))
+                self.assertFalse(state["options"])
+
+    def test_native_tab_selection_requires_confirmed_page_change(self):
+        backend, state = self.mode_backend()
+        state["selected"] = 0
+        original = backend._message.side_effect
+        backend._message.side_effect = lambda handle, code, *args: (0 if code == 0x1330 else original(handle, code, *args))
+        with redirect_stderr(io.StringIO()), self.assertRaisesRegex(native.TicketError, "absolute_mode_unverified"):
+            backend.read_stop_mode()
+        self.assertEqual(backend.mode_stage, "trade_tab_verify")
+        self.assertFalse(state["options"])
 
 
 if __name__ == "__main__":
