@@ -277,25 +277,45 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
         if registered.get("paired") is not True:
             print("In your private bot chat, send: /connect_mt5 " + code, flush=True)
         next_feed = 0.0
+        feed_available = False
+        outage_reported = False
+
+        def unavailable(reason):
+            nonlocal feed_available, next_feed, outage_reported
+            feed_available = False
+            next_feed = time.monotonic() + trade.POLL_SECONDS
+            if not outage_reported:
+                print("MT5 feed unavailable (" + reason + ").", file=sys.stderr, flush=True)
+                outage_reported = True
+
         while trade.terminal_is_running(settings.market.terminal):
-            check_manual_account(mt5, settings, ledger)
             try:
+                check_manual_account(mt5, settings, ledger)
                 flush_results(settings, ledger, journal, post)
                 if time.monotonic() >= next_feed:
-                    next_feed = time.monotonic() + trade.FEED_SECONDS
                     payload = market.build_payload(mt5, settings.market, clock())
                     payload["device_id"] = ledger.device_id
                     payload["execution"] = trade.execution_metadata(mt5.symbol_info(settings.market.symbol))
                     post(settings, "market", payload)
-                reply = post(settings, "poll", {"device_id": ledger.device_id})
-                preparation = reply.get("preparation")
-                if preparation is not None:
-                    prepare_ticket(mt5, settings, ledger, journal, adapter, preparation, clock=clock)
-                    flush_results(settings, ledger, journal, post)
-            except trade.GuardError:
+                    next_feed = time.monotonic() + trade.FEED_SECONDS
+                    if not feed_available:
+                        print("Fresh MT5 feed ready.", flush=True)
+                    feed_available, outage_reported = True, False
+                if feed_available:
+                    reply = post(settings, "poll", {"device_id": ledger.device_id})
+                    preparation = reply.get("preparation")
+                    if preparation is not None:
+                        prepare_ticket(mt5, settings, ledger, journal, adapter, preparation, clock=clock)
+                        flush_results(settings, ledger, journal, post)
+            except market.MarketDataError as error:
+                if error.reason_code == "terminal_installation_mismatch":
+                    raise
+                reason = error.reason_code or "market_data_unavailable"
+                unavailable(reason)
+            except (trade.GuardError, native.TicketError):
                 raise
-            except Exception as error:
-                print("Manual bridge update unavailable (" + type(error).__name__ + ").", file=sys.stderr, flush=True)
+            except Exception:
+                unavailable("service_unavailable")
             sleep(trade.POLL_SECONDS)
         print("MT5 closed; manual helper stopped.", flush=True)
         return 0
