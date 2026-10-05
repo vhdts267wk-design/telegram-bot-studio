@@ -140,6 +140,40 @@ async def get_offer(pool, bot_id, offer_id):
     ))
 
 
+async def get_chart_offer(pool, bot_id, device_id, now):
+    """Read the newest published proposal without claiming or expiring rows.
+
+    Choose the latest publication before eligibility checks. A newer rejected
+    or expired proposal must not make an older recommendation visible again.
+    """
+    now = _utc(now)
+    row = await pool.fetchrow(
+        """
+        WITH latest AS (
+            SELECT * FROM mt5_manual_ticket_offers
+            WHERE bot_id = $1 AND device_id = $2 AND published_at IS NOT NULL AND message_id IS NOT NULL
+            ORDER BY published_at DESC, created_at DESC, id DESC LIMIT 1
+        )
+        SELECT latest.*, device.symbol, device.account_mode, device.volume FROM latest
+        JOIN mt5_devices AS device ON device.bot_id = latest.bot_id AND device.device_id = latest.device_id
+        JOIN market_subscriptions AS subscription
+            ON subscription.bot_id = latest.bot_id AND subscription.chat_id = latest.chat_id
+        WHERE latest.status IN ('offered', 'requested', 'preparing', 'prepared')
+            AND latest.created_at <= $3 AND latest.published_at <= $3 AND latest.updated_at <= $3
+            AND latest.expires_at > $3 AND latest.expires_at <= latest.created_at + INTERVAL '5 minutes'
+            AND device.owner_chat_id = latest.chat_id AND device.owner_user_id = latest.user_id
+            AND latest.chat_id = latest.user_id AND subscription.active
+            AND device.last_seen_at >= $4 AND device.last_seen_at <= $3
+            AND (latest.status = 'offered' OR latest.decided_at <= $3)
+            AND (latest.status != 'preparing' OR (latest.preparing_at >= $5 AND latest.preparing_at <= $3))
+            AND (latest.status != 'prepared' OR (latest.result = '{"status":"prepared"}'::jsonb
+                AND latest.completed_at <= $3))
+        """,
+        _identifier(bot_id, positive=True), _uuid(device_id), now, now - HEARTBEAT_TTL, now - PREPARATION_TIMEOUT,
+    )
+    return _offer(row)
+
+
 async def decide(pool, bot_id, offer_id, chat_id, user_id, message_id, decision, now):
     if type(decision) is not str or decision not in {"requested", "rejected"}:
         raise ValueError("The preparation decision must be requested or rejected.")

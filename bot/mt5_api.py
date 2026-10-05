@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from bot import manual_ticket_store, market_store, trade_store
+from bot import manual_ticket_store, market_store, proposal_overlay, trade_store
 
 MAX_CONTROL_BYTES = 8192
 
@@ -181,7 +181,7 @@ def install_routes(app, application, settings):
             return JSONResponse({"detail": "Execution claim is no longer active"}, status_code=409)
         return {"ok": True}
 
-    async def fresh_manual_device(service, device_id):
+    async def fresh_manual_device(service, device_id, *, include_feed=False):
         device = await trade_store.get_device(service.pool, service.bot_id, device_id)
         if device is None:
             return None
@@ -206,7 +206,38 @@ def install_routes(app, application, settings):
             or not timedelta(seconds=-5) <= now - _utc(feed["quote"]["time"]) <= timedelta(seconds=30)
         ):
             return None
-        return device, now
+        return (device, now, feed) if include_feed else (device, now)
+
+    async def manual_chart(request: Request):
+        service, payload, error = await read_request(request, "manual_ticket")
+        if error is not None:
+            return error
+        try:
+            if set(payload) != {"device_id"}:
+                raise ValueError("Invalid fields")
+            device_id = _uuid(payload["device_id"])
+            current = await fresh_manual_device(service, device_id, include_feed=True)
+            if current is None:
+                return {"proposal": None}
+            device, _, _ = current
+            owner = (device["owner_chat_id"], device["owner_user_id"])
+            if await service.risk_pause(owner[0]) is not None:
+                return {"proposal": None}
+            offer = await manual_ticket_store.get_chart_offer(service.pool, service.bot_id, device_id, now_utc())
+            if offer is None or not await trade_store.subscription_active(service.pool, service.bot_id, owner[0]):
+                return {"proposal": None}
+            # Re-read the bound device and broker quote after every awaited
+            # eligibility check. This endpoint never refreshes a heartbeat,
+            # modifies an offer or acquires a preparation claim.
+            current = await fresh_manual_device(service, device_id, include_feed=True)
+            if current is None:
+                return {"proposal": None}
+            device, now, feed = current
+            if (device["owner_chat_id"], device["owner_user_id"]) != owner:
+                return {"proposal": None}
+            return {"proposal": proposal_overlay.build_chart_overlay(offer, device, feed, now)}
+        except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
+            return JSONResponse({"detail": "Invalid device or market data"}, status_code=422)
 
     async def manual_poll(request: Request):
         service, payload, error = await read_request(request, "manual_ticket")
@@ -269,3 +300,4 @@ def install_routes(app, application, settings):
     app.add_api_route("/api/mt5/result", result, methods=["POST"])
     app.add_api_route("/api/mt5/manual/poll", manual_poll, methods=["POST"])
     app.add_api_route("/api/mt5/manual/result", manual_result, methods=["POST"])
+    app.add_api_route("/api/mt5/manual/chart", manual_chart, methods=["POST"])

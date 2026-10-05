@@ -22,7 +22,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CallbackQueryHandler, CommandHandler
 
-from bot import manual_ticket_store, market_monitor, market_store, trade_store
+from bot import manual_ticket_store, market_monitor, market_store, proposal_overlay, trade_store
 
 
 logger = logging.getLogger(__name__)
@@ -421,10 +421,12 @@ def _offer_text(payload, expires_at) -> str:
 
 def _manual_offer_text(payload, expires_at) -> str:
     digits = _digits(payload)
+    zone = proposal_overlay.reference_zone(payload)
     return (
         f"اقتراح تجهيز صفقة على اللابتوب — {payload['symbol']}\n"
         f"{payload['direction']} | Demo | الحجم: {payload['volume']:g} lot\n"
         f"دخول مرجعي: {payload['entry']:.{digits}f}\nSL وقف: {payload['stop']:.{digits}f}\nTP هدف: {payload['target']:.{digits}f}\n"
+        f"منطقة دخول مرجعية قبل السبريد: {zone['entry_zone_low']:.{digits}f} – {zone['entry_zone_high']:.{digits}f}\n"
         f"صلاحية طلب التجهيز حتى: {_utc(expires_at):%Y-%m-%d %H:%M:%S} UTC\n"
         "«جهّز على اللابتوب» يفتح نافذة MT5 ويملأ TP وSL فقط؛ لا يرسل صفقة. "
         "تراجع الرمز والحجم والأسعار وتضغط Buy أو Sell بنفسك داخل MT5.\n"
