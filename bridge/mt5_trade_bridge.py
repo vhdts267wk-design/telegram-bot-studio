@@ -21,7 +21,9 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import stat
 import sys
+import tempfile
 import time
 from urllib import request
 from urllib.error import HTTPError
@@ -37,6 +39,10 @@ except ModuleNotFoundError:
 MAX_JSON_BYTES = 64 * 1024
 POLL_SECONDS = 10
 FEED_SECONDS = 60
+TERMINAL_WARNING_SECONDS = 60
+# A verified live connection was about three seconds ahead after its fixed
+# broker offset was removed. Bound that clock skew; keep stale age at 30 seconds.
+EXECUTABLE_QUOTE_FUTURE_TOLERANCE_SECONDS = 5
 MAX_DRIFT_R = Decimal("0.1")
 DEMO_VOLUME = Decimal("0.01")
 STRATEGY_ID = "ema9-21-atr14-v1"
@@ -65,6 +71,135 @@ class Settings:
     account_mode: str
     volume: Decimal
     enable_orders: bool
+    startup_report: Path | None = None
+
+
+STARTUP_STAGES = {
+    "configuration": "reading the local configuration",
+    "terminal_process_check": "checking the existing terminal process",
+    "sdk_load": "loading the terminal client",
+    "lock_directory": "checking the helper state directory for the process lock",
+    "lock_file_open": "opening the local process lock file",
+    "lock_file_prepare": "preparing the local process lock file",
+    "lock_acquire": "acquiring the exclusive local helper lock",
+    "ledger_directory": "checking the helper state directory for the journal",
+    "ledger_open": "opening the local journal database",
+    "ledger_schema": "initializing the local journal tables",
+    "ledger_identity": "initializing the local journal identity",
+    "terminal_initialize": "connecting to the existing terminal",
+    "account_check": "checking the confirmed local account",
+    "ledger_binding": "checking the saved local account binding",
+    "broker_settings": "checking the broker symbol and volume",
+    "registration": "registering the local helper with the service",
+    "ready": "waiting for approved requests",
+    "first_feed": "sending the first market update",
+    "bridge_loop": "running the helper",
+}
+DIAGNOSTIC_ERRORS = frozenset({
+    "PermissionError", "FileNotFoundError", "NotADirectoryError", "OSError",
+    "OperationalError", "DatabaseError", "GuardError", "HTTPError", "URLError",
+    "TimeoutError", "RuntimeError", "ValueError", "TypeError", "AttributeError",
+    "KeyboardInterrupt", "MarketDataError",
+})
+
+
+def diagnostic_error(error):
+    name = type(error).__name__
+    return name if name in DIAGNOSTIC_ERRORS else "Exception"
+
+
+def expected_startup_report():
+    # This optional local diagnostic belongs beside the human launcher, outside
+    # the repository and private state directory. No user-supplied write target.
+    task = Path(__file__).absolute().parent.parent.parent.parent
+    return task / "outputs" / "MT5-Startup-Status.json"
+
+
+def validated_startup_report(value, state_directory=None):
+    if value is None:
+        return None
+    expected = expected_startup_report()
+    if os.path.normcase(str(Path(value).absolute())) != os.path.normcase(str(expected)):
+        raise GuardError("The optional startup report destination does not match the existing output file.")
+    if not report_destination_is_safe(expected):
+        raise GuardError("The optional startup report output destination could not be safely verified.")
+    parent = expected.parent.resolve(strict=True)
+    if state_directory is not None:
+        state = Path(state_directory).expanduser().resolve()
+        if parent == state or state in parent.parents:
+            raise GuardError("The optional startup report cannot be written inside helper state.")
+    return expected
+
+
+def report_destination_is_safe(path):
+    try:
+        for parent in path.parents:
+            info = os.lstat(parent)
+            if getattr(info, "st_file_attributes", 0) & 0x400 or not stat.S_ISDIR(info.st_mode):
+                return False
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return True
+        return (not getattr(info, "st_file_attributes", 0) & 0x400
+                and stat.S_ISREG(info.st_mode) and info.st_nlink == 1)
+    except OSError:
+        return False
+
+
+class StartupDiagnostics:
+    """Fixed fields only: never paths, keys, pairing codes or account details."""
+
+    def __init__(self, path=None):
+        self.path = validated_startup_report(path)
+        self.stage = "configuration"
+        self.original_error = None
+        self.record = {
+            "report_version": 1, "kind": "mt5_bridge_startup",
+            "attempt_id": uuid4().hex, "started_utc": iso_date(now_utc()),
+            "updated_utc": None, "status": "starting", "stage": self.stage,
+            "error_class": None, "registration_succeeded": None,
+            "bridge_ready": False, "already_paired": None,
+            "first_feed_accepted": None,
+        }
+
+    def set_stage(self, stage):
+        self.stage = stage if stage in STARTUP_STAGES else "configuration"
+
+    def save(self, status, error=None):
+        if self.path is None:
+            return False
+        self.record.update(
+            status=status if status in ("starting", "ready", "stopped", "interrupted") else "stopped",
+            stage=self.stage, updated_utc=iso_date(now_utc()),
+            error_class=self.original_error or (diagnostic_error(error) if error is not None else None),
+        )
+        try:
+            # The existing outputs directory must already exist. No mkdir,
+            # ledger access, source data or exception strings are used here.
+            if not report_destination_is_safe(self.path):
+                return False
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.path.parent,
+                                                 prefix="mt5-startup-", suffix=".tmp", delete=False) as file:
+                    temporary = Path(file.name)
+                    json.dump(self.record, file, indent=2)
+                    file.write("\n")
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary, self.path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            return True
+        except Exception:
+            return False
+
+
+def startup_stage(diagnostics, stage):
+    if diagnostics is not None:
+        diagnostics.set_stage(stage)
 
 
 def positive_decimal(value) -> Decimal:
@@ -121,7 +256,10 @@ def load_settings(args, environ=None) -> Settings:
     configured = market.load_settings(args, environ)
     if len(configured.key) < 32:
         raise GuardError("The private bridge key must contain at least 32 characters.")
-    return Settings(configured, Path(args.state_directory).expanduser().resolve(), "demo", DEMO_VOLUME, True)
+    report = getattr(args, "startup_report", None)
+    state = Path(args.state_directory).expanduser().resolve()
+    return Settings(configured, state, "demo", DEMO_VOLUME, True,
+                    validated_startup_report(report, state))
 
 
 def terminal_is_running(terminal: Path) -> bool:
@@ -178,9 +316,13 @@ def terminal_is_running(terminal: Path) -> bool:
 class Ledger:
     """Durably reserve each offer before any broker call can send an order."""
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, diagnostics=None):
+        self.diagnostics = diagnostics
+        startup_stage(diagnostics, "ledger_directory")
         directory.mkdir(parents=True, exist_ok=True)
+        startup_stage(diagnostics, "ledger_open")
         self.db = sqlite3.connect(directory / "trade-ledger.sqlite3", timeout=10)
+        startup_stage(diagnostics, "ledger_schema")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -188,6 +330,7 @@ class Ledger:
             id TEXT PRIMARY KEY, claim_id TEXT NOT NULL, payload_hash TEXT NOT NULL,
             result TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0)""")
         self.db.commit()
+        startup_stage(diagnostics, "ledger_identity")
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO metadata VALUES ('device_id', ?)", (str(uuid4()),))
             self.db.execute("INSERT OR IGNORE INTO metadata VALUES ('binding_salt', ?)", (secrets.token_hex(32),))
@@ -204,6 +347,7 @@ class Ledger:
         return self.value("device_id")
 
     def bind(self, binding: str):
+        startup_stage(self.diagnostics, "ledger_binding")
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO metadata VALUES ('binding', ?)", (binding,))
             if self.value("binding") != binding:
@@ -244,21 +388,27 @@ class Ledger:
 class ProcessLock:
     """Keep one local bridge alive; OS releases the lock if the process dies."""
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, diagnostics=None):
+        startup_stage(diagnostics, "lock_directory")
         directory.mkdir(parents=True, exist_ok=True)
+        startup_stage(diagnostics, "lock_file_open")
         self.handle = open(directory / "bridge.lock", "a+b")
         try:
+            startup_stage(diagnostics, "lock_file_prepare")
             if self.handle.seek(0, os.SEEK_END) == 0:
                 self.handle.write(b"0")
                 self.handle.flush()
             self.handle.seek(0)
+            startup_stage(diagnostics, "lock_acquire")
             if os.name == "nt":
                 import msvcrt
                 msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:  # Permits synthetic CI tests; main still requires Windows.
                 import fcntl
                 fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as error:
+            if diagnostics is not None:
+                diagnostics.original_error = diagnostic_error(error)
             self.handle.close()
             raise GuardError("Another bridge is already running for this local configuration.") from None
 
@@ -359,9 +509,9 @@ def prepare_order(mt5, settings: Settings, ledger: Ledger, offer: dict, now: dat
     tick = mt5.symbol_info_tick(settings.market.symbol)
     if tick is None:
         raise GuardError("A fresh executable broker quote is required.")
-    stamp = market.integer_value(getattr(tick, "time", None))
+    stamp = market.broker_timestamp_utc(getattr(tick, "time", None), settings.market)
     bid, ask = positive_decimal(getattr(tick, "bid", None)), positive_decimal(getattr(tick, "ask", None))
-    if ask < bid or not 0 <= now.timestamp() - stamp <= 30:
+    if ask < bid or not -EXECUTABLE_QUOTE_FUTURE_TOLERANCE_SECONDS <= now.timestamp() - stamp <= 30:
         raise GuardError("The executable broker quote is stale, future-dated, or crossed.")
     price = ask if direction == "BUY" else bid
     risk = abs(entry - stop)
@@ -513,20 +663,26 @@ def execution_metadata(symbol) -> dict:
     return {"tick_size": tick_size, "point": point, "digits": digits, "stops_level": stops_level}
 
 
-def run_bridge(mt5, settings: Settings, *, post=api_post, clock=now_utc, sleep=time.sleep):
+def run_bridge(mt5, settings: Settings, *, post=api_post, clock=now_utc, sleep=time.sleep, diagnostics=None):
     ledger, process_lock = None, None
     initialized = False
+    diagnostics = diagnostics or StartupDiagnostics(settings.startup_report)
     try:
-        process_lock = ProcessLock(settings.state_directory)
-        ledger = Ledger(settings.state_directory)
+        validated_startup_report(diagnostics.path, settings.state_directory)
+        process_lock = ProcessLock(settings.state_directory, diagnostics=diagnostics)
+        ledger = Ledger(settings.state_directory, diagnostics=diagnostics)
+        diagnostics.set_stage("terminal_process_check")
         if not terminal_is_running(settings.market.terminal):
             raise GuardError("Open and connect the selected MT5 demo terminal before starting the bridge.")
+        diagnostics.set_stage("terminal_initialize")
         if not mt5.initialize(str(settings.market.terminal), timeout=15000):
             raise GuardError("The existing MT5 terminal could not be connected.")
         initialized = True
+        diagnostics.set_stage("account_check")
         check_bound_account(mt5, settings, ledger)
         # Verify broker volume and metadata before exposing pairing. A synthetic
         # order is never sent here; volume/metadata are checked without order_check.
+        diagnostics.set_stage("broker_settings")
         symbol = mt5.symbol_info(settings.market.symbol)
         if symbol is None or getattr(symbol, "currency_base", None) != "XAU" or getattr(symbol, "currency_profit", None) != "USD":
             raise GuardError("Choose the broker's exact XAU/USD symbol.")
@@ -534,28 +690,51 @@ def run_bridge(mt5, settings: Settings, *, post=api_post, clock=now_utc, sleep=t
         if not minimum <= settings.volume <= maximum or settings.volume % step:
             raise GuardError("This broker does not accept exactly 0.01 lots.")
         code, registration = pairing_registration(settings, ledger)
+        diagnostics.set_stage("registration")
+        diagnostics.record["registration_succeeded"] = False
         registered = post(settings, "register", registration)
+        diagnostics.record["registration_succeeded"] = True
+        paired = registered.get("paired")
+        diagnostics.record["already_paired"] = paired if type(paired) is bool else None
+        diagnostics.record["bridge_ready"] = True
+        diagnostics.set_stage("ready")
+        diagnostics.save("ready")
         print("DEMO bridge ready. Each Telegram Accept can submit one 0.01-lot market order.", flush=True)
         if registered.get("paired") is True:
             print("This local demo bridge is already paired with your private bot chat.", flush=True)
         else:
             print("In your private bot chat, send: /connect_mt5 " + code, flush=True)
         next_feed = 0.0
+        terminal_failure = None
+        last_terminal_warning = 0.0
         while terminal_is_running(settings.market.terminal):
             try:
                 check_bound_account(mt5, settings, ledger)
+                if terminal_failure is not None:
+                    print("MT5 connection recovered. The selected demo account is verified; bridge processing resumed.", flush=True)
+                    terminal_failure = None
                 flush_results(settings, ledger, post)
                 if time.monotonic() >= next_feed:
                     next_feed = time.monotonic() + FEED_SECONDS
                     try:
+                        first_feed = diagnostics.record["first_feed_accepted"] is not True
+                        if first_feed:
+                            diagnostics.set_stage("first_feed")
                         payload = market.build_payload(mt5, settings.market, clock())
                         payload["device_id"] = ledger.device_id
                         payload["execution"] = execution_metadata(mt5.symbol_info(settings.market.symbol))
                         post(settings, "market", payload)
+                        if first_feed:
+                            diagnostics.record["first_feed_accepted"] = True
+                            diagnostics.save("ready")
                     except Exception as error:
+                        if diagnostics.record["first_feed_accepted"] is None:
+                            diagnostics.record["first_feed_accepted"] = False
+                            diagnostics.save("ready", error)
                         # An unchanged/stale market upload must not disable the
                         # outcome outbox or polling for accepted decisions.
                         print("Market update unavailable (" + type(error).__name__ + ").", file=sys.stderr, flush=True)
+                diagnostics.set_stage("bridge_loop")
                 reply = post(settings, "poll", {"device_id": ledger.device_id})
                 offer = reply.get("trade")
                 if offer is not None:
@@ -563,17 +742,36 @@ def run_bridge(mt5, settings: Settings, *, post=api_post, clock=now_utc, sleep=t
                     flush_results(settings, ledger, post)
             except GuardError:
                 raise  # Changes to the bound terminal/account require a fresh user start.
+            except market.MarketDataError as error:
+                reason = getattr(error, "reason_code", None)
+                message = market.TERMINAL_FAILURE_MESSAGES.get(reason)
+                if message is None:
+                    print("Bridge update unavailable (MarketDataError).", file=sys.stderr, flush=True)
+                else:
+                    observed = time.monotonic()
+                    if reason != terminal_failure or observed - last_terminal_warning >= TERMINAL_WARNING_SECONDS:
+                        print("Bridge paused (" + reason + "): " + message
+                              + " Orders remain blocked until the selected terminal and demo account are verified.",
+                              file=sys.stderr, flush=True)
+                        last_terminal_warning = observed
+                    terminal_failure = reason
             except Exception as error:
                 print("Bridge update unavailable (" + type(error).__name__ + ").", file=sys.stderr, flush=True)
             sleep(POLL_SECONDS)
         print("MT5 terminal closed; bridge stopped.", flush=True)
+        diagnostics.save("stopped")
         return 0
     except KeyboardInterrupt:
         print("Bridge stopped. Uncertain trades must be checked in MT5; they are never retried.", flush=True)
+        diagnostics.save("interrupted", KeyboardInterrupt())
         return 0
     except Exception as error:
         message = str(error) if isinstance(error, GuardError) else type(error).__name__
-        print("Bridge stopped: " + message, file=sys.stderr, flush=True)
+        print("Bridge stopped: " + message + " (startup stage: " + STARTUP_STAGES[diagnostics.stage] + ").", file=sys.stderr, flush=True)
+        if diagnostics.save("stopped", error):
+            print("A sanitized startup report was saved beside the launcher.", file=sys.stderr, flush=True)
+        elif diagnostics.path is not None:
+            print("The sanitized startup report could not be saved.", file=sys.stderr, flush=True)
         return 1
     finally:
         if initialized:
@@ -595,19 +793,26 @@ def main(argv=None):
     parser.add_argument("--volume", required=True)
     parser.add_argument("--state-directory", required=True)
     parser.add_argument("--enable-orders", action="store_true")
+    parser.add_argument("--startup-report", help="Optional sanitized startup JSON in an existing output directory")
     args = parser.parse_args(argv)
+    diagnostics = StartupDiagnostics()
     try:
+        diagnostics.path = validated_startup_report(args.startup_report, args.state_directory)
+        diagnostics.save("starting")
         if os.name != "nt":
             raise GuardError("The local trade bridge requires Windows.")
         settings = load_settings(args)
+        diagnostics.set_stage("terminal_process_check")
         if not terminal_is_running(settings.market.terminal):
             raise GuardError("Start the selected MT5 demo terminal yourself first.")
+        diagnostics.set_stage("sdk_load")
         mt5 = importlib.import_module("MetaTrader5")
     except Exception as error:
         message = str(error) if isinstance(error, GuardError) else type(error).__name__
         print("Bridge unavailable: " + message, file=sys.stderr)
+        diagnostics.save("stopped", error)
         return 1
-    return run_bridge(mt5, settings)
+    return run_bridge(mt5, settings, diagnostics=diagnostics)
 
 
 if __name__ == "__main__":

@@ -400,7 +400,7 @@ class MonitorJournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("موقوفة" in call.args[1] and "3" in call.args[1] and "13:12 UTC" in call.args[1]
                             for call in paused_bot.send_message.await_args_list))
         self.recent.assert_awaited_with(self.pool, BOT_ID, CHAT_ID, limit=20)
-        self.service.news.assert_awaited_once()
+        self.service.news.assert_not_awaited()
         other_chat = CHAT_ID + 1
         active_bot = SimpleNamespace(send_message=AsyncMock())
         await self.service.send_report(active_bot, other_chat)

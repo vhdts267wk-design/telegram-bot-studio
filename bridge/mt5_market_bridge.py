@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any
@@ -23,6 +24,11 @@ POLL_SECONDS = 60
 REQUEST_TIMEOUT = 15
 MAX_QUOTE_AGE_SECONDS = 10 * 24 * 60 * 60
 FUTURE_TOLERANCE_SECONDS = 30
+TERMINAL_FAILURE_MESSAGES = {
+    "terminal_unavailable": "The MT5 client connection is unavailable. Check that the selected terminal is open and connected.",
+    "terminal_disconnected": "MT5 is disconnected. Reconnect the selected terminal to its broker.",
+    "terminal_installation_mismatch": "The connected MT5 installation does not match the selected terminal. Stop the bridge and start it with the intended terminal.",
+}
 
 
 class ConfigurationError(ValueError):
@@ -31,6 +37,12 @@ class ConfigurationError(ValueError):
 
 class MarketDataError(ValueError):
     """The terminal or its market data cannot be used safely."""
+
+    def __init__(self, message: str, *, reason_code: str | None = None):
+        super().__init__(message)
+        # Only these authored codes can produce a human-readable diagnostic.
+        # Arbitrary SDK error text and terminal/account paths stay private.
+        self.reason_code = reason_code if reason_code in TERMINAL_FAILURE_MESSAGES else None
 
 
 class TransportError(RuntimeError):
@@ -43,6 +55,10 @@ class Settings:
     symbol: str
     url: str
     key: str = field(repr=False)
+    broker_utc_offset_minutes: int = 0
+
+    def __post_init__(self) -> None:
+        validate_broker_utc_offset_minutes(self.broker_utc_offset_minutes)
 
 
 class PrivateArgumentParser(argparse.ArgumentParser):
@@ -81,6 +97,25 @@ def validate_feed_url(value: str) -> str:
     return value
 
 
+def validate_broker_utc_offset_minutes(value: Any) -> int:
+    if type(value) is not int or not -720 <= value <= 840 or value % 15:
+        raise ConfigurationError(
+            "Set the verified broker UTC offset to an integer number of minutes "
+            "from -720 to 840, in steps of 15."
+        )
+    return value
+
+
+def parse_broker_utc_offset_minutes(value: Any) -> int:
+    if type(value) is not str or not re.fullmatch(r"[+-]?[0-9]+", value):
+        raise ConfigurationError("Set a clean integer MT5_BROKER_UTC_OFFSET_MINUTES value.")
+    try:
+        offset = int(value)
+    except ValueError as exc:
+        raise ConfigurationError("Invalid broker UTC offset.") from exc
+    return validate_broker_utc_offset_minutes(offset)
+
+
 def load_settings(args: argparse.Namespace, environ: Any = None) -> Settings:
     environ = os.environ if environ is None else environ
     url = validate_feed_url(environ.get("MARKET_BRIDGE_URL", ""))
@@ -93,16 +128,21 @@ def load_settings(args: argparse.Namespace, environ: Any = None) -> Settings:
     symbol = args.symbol
     if not symbol or len(symbol) > 64 or symbol != symbol.strip() or any(ord(c) < 32 for c in symbol):
         raise ConfigurationError("Choose the exact broker gold symbol.")
-    return Settings(terminal=terminal, symbol=symbol, url=url, key=key)
+    offset = parse_broker_utc_offset_minutes(environ.get("MT5_BROKER_UTC_OFFSET_MINUTES", "0"))
+    return Settings(terminal=terminal, symbol=symbol, url=url, key=key,
+                    broker_utc_offset_minutes=offset)
 
 
 def check_terminal(mt5: Any, terminal: Path) -> None:
     info = mt5.terminal_info()
-    if info is None or not info.connected:
-        raise MarketDataError("Start and connect the selected MT5 terminal first.")
+    if info is None:
+        raise MarketDataError("Start and connect the selected MT5 terminal first.", reason_code="terminal_unavailable")
+    if not info.connected:
+        raise MarketDataError("Start and connect the selected MT5 terminal first.", reason_code="terminal_disconnected")
     actual_path = getattr(info, "path", None)
     if not actual_path or str(Path(actual_path).resolve()).casefold() != str(terminal.parent).casefold():
-        raise MarketDataError("The connected terminal does not match the selected installation.")
+        raise MarketDataError("The connected terminal does not match the selected installation.",
+                              reason_code="terminal_installation_mismatch")
 
 
 def positive_price(value: Any) -> float:
@@ -136,6 +176,16 @@ def utc_timestamp(value: int) -> str:
         raise MarketDataError("Invalid market timestamp.") from exc
 
 
+def broker_timestamp_utc(value: Any, settings: Settings) -> int:
+    # Some connected brokers supply server-clock epoch fields. Apply only the
+    # explicitly verified, fixed offset; never infer it from a quote's age.
+    stamp = integer_value(value)
+    normalized = stamp - settings.broker_utc_offset_minutes * 60
+    if stamp <= 0 or normalized <= 0:
+        raise MarketDataError("Invalid market timestamp.")
+    return normalized
+
+
 def build_payload(mt5: Any, settings: Settings, now: datetime | None = None) -> dict:
     now = datetime.now(timezone.utc) if now is None else now
     if now.tzinfo is None or now.utcoffset() is None:
@@ -153,7 +203,7 @@ def build_payload(mt5: Any, settings: Settings, now: datetime | None = None) -> 
     if tick is None:
         raise MarketDataError("A fresh broker quote is required.")
     bid, ask = positive_price(tick.bid), positive_price(tick.ask)
-    quote_time = integer_value(tick.time)
+    quote_time = broker_timestamp_utc(tick.time, settings)
     if (
         ask < bid
         or quote_time <= 0
@@ -169,7 +219,7 @@ def build_payload(mt5: Any, settings: Settings, now: datetime | None = None) -> 
     seen_times = set()
     for rate in rates:
         try:
-            bar_time = integer_value(rate["time"])
+            bar_time = broker_timestamp_utc(rate["time"], settings)
             prices = {name: positive_price(rate[name]) for name in ("open", "high", "low", "close")}
             volume = integer_value(rate["tick_volume"])
         except (KeyError, IndexError, TypeError) as exc:

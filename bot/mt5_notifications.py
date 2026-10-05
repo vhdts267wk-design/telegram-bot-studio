@@ -27,6 +27,7 @@ from bot import market_monitor, market_store, trade_store
 logger = logging.getLogger(__name__)
 CALLBACK_PATTERN = re.compile(r"^mt5:([ar]):([0-9a-f]{32})$")
 FRESH_SECONDS = 180
+QUOTE_FUTURE_TOLERANCE_SECONDS = 5
 OFFER_MINUTES = 5
 MAX_DRIFT_R = 0.1
 
@@ -171,10 +172,13 @@ def _fresh_feed(snapshot, device, now) -> dict | None:
         clean = {key: value for key, value in payload.items() if key != "device_id"}
         validated = market_monitor.validate_feed(clean, now, symbol)
         _execution_metadata(validated)
-        for stamp in (snapshot["updated_at"], validated["quote"]["time"], device["last_seen_at"]):
+        for stamp in (snapshot["updated_at"], device["last_seen_at"]):
             age = (now - _utc(stamp)).total_seconds()
             if not 0 <= age <= FRESH_SECONDS:
                 return None
+        quote_age = (now - _utc(validated["quote"]["time"])).total_seconds()
+        if not -QUOTE_FUTURE_TOLERANCE_SECONDS <= quote_age <= FRESH_SECONDS:
+            return None
         return validated
     except (KeyError, TypeError, ValueError, OverflowError, AttributeError, DecimalException):
         return None

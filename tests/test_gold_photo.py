@@ -76,6 +76,17 @@ class GoldPhotoTests(unittest.IsolatedAsyncioTestCase):
         self.large_photo.get_file.assert_not_awaited()
         self.client_factory.assert_not_called()
 
+    async def test_connected_mt5_photo_request_uses_current_chart_without_paid_vision(self):
+        handlers.os.environ["OPENAI_ENABLED"] = "false"
+        self.context.bot_data[handlers.market_monitor.SERVICE_KEY] = object()
+        with patch.object(handlers.market_monitor, "market_command", new_callable=AsyncMock) as analysis:
+            await handlers.gold_photo(self.update, self.context)
+            analysis.assert_awaited_once_with(self.update, self.context)
+        self.assertIn("بيانات MT5", self.replies()[0])
+        self.assertIn("بدل تفاصيل الصورة", self.replies()[0])
+        self.large_photo.get_file.assert_not_awaited()
+        self.client_factory.assert_not_called()
+
     async def test_missing_or_whitespace_api_key_stops_before_downloading(self):
         for api_key in (None, "   "):
             with self.subTest(api_key=api_key):

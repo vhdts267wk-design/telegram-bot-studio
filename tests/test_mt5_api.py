@@ -87,10 +87,30 @@ class DemoAPITests(unittest.IsolatedAsyncioTestCase):
             claim.assert_awaited_once()
             claim.reset_mock()
             for field, value in (("time", (NOW-timedelta(seconds=31)).isoformat()),
-                                 ("time", (NOW+timedelta(seconds=1)).isoformat())):
+                                 ("time", (NOW+timedelta(seconds=6)).isoformat())):
                 snapshot["payload"]["quote"][field] = value
                 self.assertEqual((await self.post("poll", {"device_id": str(DEVICE)})).json(), {"trade": None})
             snapshot["payload"] = feed(); snapshot["payload"]["device_id"] = str(OFFER)
+            self.assertEqual((await self.post("poll", {"device_id": str(DEVICE)})).json(), {"trade": None})
+            claim.assert_not_awaited()
+
+    async def test_poll_quote_clock_skew_is_bounded_and_receipt_remains_strict(self):
+        snapshot = {"payload": feed(), "updated_at": NOW}
+        with patch.object(mt5_api.trade_store, "get_device", new_callable=AsyncMock, return_value=self.device), \
+             patch.object(mt5_api.trade_store, "heartbeat", new_callable=AsyncMock), \
+             patch.object(mt5_api.trade_store, "expire_offers", new_callable=AsyncMock), \
+             patch.object(mt5_api.market_store, "get_cache", new_callable=AsyncMock, return_value=snapshot), \
+             patch.object(mt5_api.trade_store, "claim_offer", new_callable=AsyncMock, return_value=None) as claim:
+            for seconds, allowed in ((5, True), (6, False), (-30, True), (-31, False)):
+                with self.subTest(seconds=seconds):
+                    claim.reset_mock()
+                    snapshot["payload"]["quote"]["time"] = (NOW+timedelta(seconds=seconds)).isoformat()
+                    response = await self.post("poll", {"device_id": str(DEVICE)})
+                    self.assertEqual(response.json(), {"trade": None})
+                    self.assertEqual(claim.await_count, int(allowed))
+            claim.reset_mock()
+            snapshot["payload"] = feed()
+            snapshot["updated_at"] = NOW+timedelta(seconds=1)
             self.assertEqual((await self.post("poll", {"device_id": str(DEVICE)})).json(), {"trade": None})
             claim.assert_not_awaited()
 

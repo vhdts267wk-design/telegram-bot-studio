@@ -151,23 +151,38 @@ class BrokerFeedTests(unittest.TestCase):
             with self.subTest(snapshot=snapshot):
                 text = monitor.market_text(snapshot, NOW)
                 self.assertIn("قديمة", text)
-                self.assertIn("ليست سعراً مباشراً", text)
-                self.assertNotIn("EMA20", text)
-                self.assertNotIn("تغير الإغلاق", text)
-                self.assertNotIn("نطاق آخر", text)
+                self.assertIn("ننتظر", text)
+                self.assertNotIn("EMA9", text)
+                self.assertNotIn("دعم محتمل", text)
+                self.assertNotIn("اقتراح شراء", text)
 
     def test_gap_ends_derived_window_instead_of_filling_missing_history(self):
         feed = broker_feed()
         feed["candles"].pop(-5)
         text = monitor.market_text({"payload": feed, "updated_at": NOW}, NOW)
-        self.assertIn("السجل المتصل قصير", text)
-        self.assertNotIn("EMA20", text)
-        self.assertNotIn("تغير الإغلاق", text)
-        self.assertNotIn("نطاق آخر", text)
+        self.assertIn("متاح 4/22", text)
+        self.assertIn("السجل غير كاف", text)
+        self.assertNotIn("الاتجاه حسب EMA9/21", text)
+        self.assertNotIn("دعم محتمل", text)
         text = monitor.market_text({"payload": broker_feed(), "updated_at": NOW}, NOW)
-        self.assertIn("EMA20", text)
-        self.assertIn("تغير الإغلاق", text)
-        self.assertIn("نطاق آخر", text)
+        self.assertIn("الاتجاه حسب EMA9/21", text)
+        self.assertIn("الحركة الأخيرة", text)
+        self.assertIn("دعم محتمل", text)
+        self.assertIn("مقاومة محتملة", text)
+        self.assertIn("ننتظر", text)
+        self.assertNotIn("/news", text)
+
+    def test_quote_skew_is_bounded_and_never_applies_to_bridge_receipt(self):
+        feed = broker_feed()
+        feed["quote"]["time"] = (NOW + timedelta(seconds=5)).isoformat()
+        text = monitor.market_text({"payload": feed, "updated_at": NOW}, NOW)
+        self.assertIn("الاتجاه حسب EMA9/21", text)
+        for receipt, quote_lead in ((NOW + timedelta(seconds=1), 0), (NOW, 6)):
+            feed["quote"]["time"] = (NOW + timedelta(seconds=quote_lead)).isoformat()
+            with self.subTest(receipt=receipt, quote_lead=quote_lead):
+                text = monitor.market_text({"payload": feed, "updated_at": receipt}, NOW)
+                self.assertIn("ننتظر", text)
+                self.assertNotIn("الاتجاه حسب EMA9/21", text)
 
     def test_corrupt_persisted_huge_number_yields_unavailable_text(self):
         feed = broker_feed()
@@ -370,18 +385,30 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
             due.assert_awaited_once_with(self.service.pool, 9901, NOW, limit=5)
             active.assert_awaited_once_with(self.service.pool, 9901, 4401, "synthetic-lease", NOW)
 
-    async def test_unwatch_while_provider_runs_prevents_remaining_news_messages(self):
+    async def test_automatic_report_sends_chart_and_wait_state_without_news(self):
+        self.service.market = AsyncMock(return_value="تحليل الشارت")
+        self.service.signals = AsyncMock(return_value=({"state": "no_signal"}, "ننتظر تقاطعاً جديداً", None))
+        self.service.news = AsyncMock(side_effect=AssertionError("Automatic reports must not request news"))
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with patch.object(monitor.market_store, "get_cache", new_callable=AsyncMock, return_value=None):
+            await self.service.send_report(bot, 4401)
+        self.assertEqual(bot.send_message.await_count, 2)
+        bot.send_message.assert_any_await(4401, "تحليل الشارت", parse_mode=None)
+        bot.send_message.assert_any_await(4401, "ننتظر تقاطعاً جديداً", parse_mode=None)
+        self.service.news.assert_not_awaited()
+
+    async def test_unwatch_while_chart_runs_prevents_queued_report(self):
         entered, proceed = asyncio.Event(), asyncio.Event()
         enabled = {"value": True}
 
-        async def get_news():
+        async def get_chart():
             entered.set()
             await proceed.wait()
-            return briefing()
+            return "تحليل الشارت"
 
-        self.service.market = AsyncMock(return_value="بيانات الأسعار التجريبية")
+        self.service.market = get_chart
         self.service.signals = AsyncMock(return_value=({"state": "warmup"}, "جارٍ جمع بيانات الإشارة", None))
-        self.service.news = get_news
+        self.service.news = AsyncMock()
         bot = SimpleNamespace(send_message=AsyncMock())
         with patch.object(monitor.market_store, "delivery_active", new_callable=AsyncMock, side_effect=lambda *args: enabled["value"]), patch.object(monitor.market_store, "get_cache", new_callable=AsyncMock, return_value=None):
             task = asyncio.create_task(self.service.send_report(bot, 4401, "synthetic-lease"))
@@ -389,9 +416,71 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
             enabled["value"] = False
             proceed.set()
             await task
-        self.assertEqual(bot.send_message.await_count, 2)
-        bot.send_message.assert_any_await(4401, "بيانات الأسعار التجريبية", parse_mode=None)
-        bot.send_message.assert_any_await(4401, "جارٍ جمع بيانات الإشارة", parse_mode=None)
+        bot.send_message.assert_not_awaited()
+        self.service.signals.assert_not_awaited()
+        self.service.news.assert_not_awaited()
+
+    async def test_market_command_shows_chart_and_frozen_proposal_without_order_or_journal(self):
+        self.service.market = AsyncMock(return_value="الاتجاه: صاعد | دعم 2700 | مقاومة 2730")
+        self.service.signals = AsyncMock(return_value=({"state": "signal"}, "BUY | دخول 2720 | وقف 2717 | هدف 2726", "setup-id"))
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(type="private", id=4401))
+        context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
+        with patch.object(monitor.journal_store, "open_trade", new_callable=AsyncMock) as journal, patch.object(
+            monitor.trade_store, "create_offer", new_callable=AsyncMock
+        ) as offer:
+            await monitor.market_command(update, context)
+        message.reply_text.assert_awaited_once_with(
+            "الاتجاه: صاعد | دعم 2700 | مقاومة 2730\n\nBUY | دخول 2720 | وقف 2717 | هدف 2726", parse_mode=None,
+        )
+        journal.assert_not_awaited()
+        offer.assert_not_awaited()
+        self.assertEqual(self.service.active_users, set())
+
+    async def test_manual_chart_and_signal_commands_suppress_proposal_during_risk_pause(self):
+        self.service.market = AsyncMock(return_value="الاتجاه: صاعد")
+        self.service.signals = AsyncMock(return_value=({"state": "signal"}, "BUY | دخول 2720 | وقف 2717 | هدف 2726", "setup-id"))
+        self.service.risk_pause = AsyncMock(return_value=NOW + timedelta(minutes=15))
+        for command in (monitor.market_command, monitor.signals_command):
+            self.service.market_command_times.clear()
+            message = SimpleNamespace(reply_text=AsyncMock())
+            update = SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(type="private", id=4401))
+            context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
+            await command(update, context)
+            text = message.reply_text.await_args.args[0]
+            self.assertIn("موقوفة", text)
+            self.assertNotIn("BUY", text)
+            self.assertNotIn("دخول", text)
+
+    async def test_market_command_reads_real_broker_candles_and_shows_one_current_proposal(self):
+        feed = broker_feed(count=22)
+        for index, bar in enumerate(feed["candles"]):
+            close = 2700.0 if index < 21 else 2710.0
+            bar.update(open=close, high=close + 1, low=close - 1, close=close)
+        feed["quote"].update(bid=2710.0, ask=2710.2)
+        snapshot = {"payload": feed, "updated_at": NOW}
+        self.service.trading_enabled = True
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(type="private", id=4401))
+        context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
+
+        async def read_cache(pool, bot_id, key):
+            return snapshot if key == "broker_feed" else None
+
+        with patch.object(monitor.market_store, "get_cache", side_effect=read_cache), patch.object(
+            monitor.market_store, "save_cache", new_callable=AsyncMock
+        ) as save, patch.object(monitor.trade_store, "create_offer", new_callable=AsyncMock) as offer:
+            await monitor.market_command(update, context)
+        text = message.reply_text.await_args.args[0]
+        self.assertIn("السعر الحالي", text)
+        self.assertIn("الاتجاه حسب EMA9/21", text)
+        self.assertIn("دعم محتمل", text)
+        self.assertIn("مقاومة محتملة", text)
+        self.assertEqual(text.count("BUY"), 1)
+        self.assertIn("2710.00", text)
+        self.assertNotIn("https://", text)
+        self.assertEqual(save.await_args.args[2], "paper_setup")
+        offer.assert_not_awaited()
 
     async def test_stop_cancels_owned_worker_without_waiting_forever(self):
         task = asyncio.create_task(asyncio.Event().wait())

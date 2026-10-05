@@ -1,4 +1,4 @@
-"""Market reports and explicitly subscribed 15-minute Telegram delivery."""
+"""Chart reports and explicitly subscribed 15-minute Telegram delivery."""
 
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CommandHandler
 
-from bot import free_news, journal_store, market_news, market_store, mt5_api, mt5_notifications, paper_journal, paper_policy, paper_signals, reference_market, trade_store
+from bot import chart_analysis, free_news, journal_store, market_news, market_store, mt5_api, mt5_notifications, paper_journal, paper_policy, paper_signals, reference_market, trade_store
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ REPORT_INTERVAL = timedelta(minutes=15)
 NEWS_DAILY_LIMIT = 96
 MAX_FEED_BYTES = 65536
 QUOTE_FRESH_SECONDS = 180
+QUOTE_CLOCK_SKEW_SECONDS = 5
 NOTICE = "للتثقيف فقط. ليس نصيحة مالية أو توصية شراء أو بيع."
 
 
@@ -140,73 +141,26 @@ def _stamp(value):
     return value.strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _pause_text(until):
+    return (
+        "الإشارات التجريبية موقوفة بعد 3 وقفات متتالية مرصودة ببيانات مكتملة. "
+        f"إعادة التقييم بعد {_stamp(until)}. /reviews لعرض النتائج والملاحظات."
+    )
+
+
 def market_text(snapshot, now):
-    """Deterministic observations from broker data, with original timestamps."""
+    """Explain the real broker chart; order delivery stays on its existing path."""
     if snapshot is None:
-        return (
-            "متابعة XAUUSD — M15\n\n"
-            "مصدر أسعار الوسيط غير متصل بعد. ربط MetaTrader 5 أو مصدر أسعار مباشر "
-            "مطلوب للمتابعة من دون صور. الأخبار متاحة عبر /news."
-        )
+        return chart_analysis.format_chart_analysis(None, None, now, include_proposal=False)
     try:
         payload = validate_feed(snapshot["payload"], now)
+        received_at = snapshot["updated_at"]
     except (KeyError, TypeError, ValueError):
         return "بيانات الأسعار المتاحة غير صالحة حالياً. يلزم تحديث مصدر الوسيط."
-    quote = payload["quote"]
-    quote_time = _utc(quote["time"])
-    received_at = snapshot["updated_at"]
-    bars = payload["candles"]
-    last = bars[-1]
-    last_start = _utc(last["time"])
-    fresh_quote = (now - quote_time).total_seconds() <= QUOTE_FRESH_SECONDS
-    fresh_bridge = now - received_at <= timedelta(minutes=3)
-    fresh_bar = now - (last_start + timedelta(minutes=15)) <= timedelta(minutes=20)
-    lines = [
-        f"متابعة {payload['symbol']} — M15",
-        "المصدر: MetaTrader 5، بيانات وسيطك؛ الأسعار بالدولار.",
-        f"آخر سعر لدى المصدر: Bid {quote['bid']:.2f} | Ask {quote['ask']:.2f}",
-        f"وقت السعر: {_stamp(quote_time)}",
-        f"آخر اتصال بالمصدر: {_stamp(received_at)}",
-    ]
-    if not (fresh_quote and fresh_bridge and fresh_bar):
-        lines.extend([
-            "",
-            "البيانات قديمة حالياً؛ ليست سعراً مباشراً. لا يوجد تحليل جديد لحركة السوق.",
-            NOTICE,
-        ])
-        return "\n".join(lines)
-    lines.extend([
-        "",
-        f"آخر شمعة مكتملة بدأت {_stamp(last_start)}:",
-        f"افتتاح {last['open']:.2f} | أعلى {last['high']:.2f} | "
-        f"أدنى {last['low']:.2f} | إغلاق {last['close']:.2f}",
-    ])
-    # A gap (weekend, unavailable terminal or missing history) ends the window.
-    consecutive = [last]
-    for bar in reversed(bars[:-1]):
-        if _utc(consecutive[0]["time"]) - _utc(bar["time"]) != timedelta(minutes=15):
-            break
-        consecutive.insert(0, bar)
-    if len(consecutive) >= 5:
-        old = consecutive[-5]["close"]
-        change = (last["close"] / old - 1) * 100
-        lines.append(f"تغير الإغلاق خلال ساعة: {change:+.2f}%")
-    if len(consecutive) >= 16:
-        recent = consecutive[-16:]
-        lines.append(
-            f"نطاق آخر 4 ساعات: {min(b['low'] for b in recent):.2f} — "
-            f"{max(b['high'] for b in recent):.2f}"
-        )
-    if len(consecutive) >= 20:
-        ema = sum(b["close"] for b in consecutive[:20]) / 20
-        for bar in consecutive[20:]:
-            ema += (bar["close"] - ema) * (2 / 21)
-        relation = "فوق" if last["close"] > ema else "تحت" if last["close"] < ema else "عند"
-        lines.append(f"EMA20 للشموع المكتملة: {ema:.2f}؛ آخر إغلاق {relation} المتوسط.")
-    else:
-        lines.append("السجل المتصل قصير؛ تفاصيل الاتجاه الأوسع غير متاحة بعد.")
-    lines.extend(["", NOTICE])
-    return "\n".join(lines)
+    result, _, _ = paper_result(snapshot, now, "mt5")
+    return chart_analysis.format_chart_analysis(
+        payload, result, now, received_at=received_at, include_proposal=False,
+    )
 
 
 def reference_text(snapshot, now):
@@ -306,8 +260,11 @@ def paper_result(snapshot, now, source):
                 if bars and _utc(bars[0]["time"]) - _utc(bar["time"]) != timedelta(minutes=15):
                     break
                 bars.insert(0, {key: bar[key] for key in ("time", "open", "high", "low", "close")})
+        # Broker tick time can lead the API clock by a few seconds. Only the
+        # quote gets this bound; cache/device clocks and completed bars do not.
+        quote_min_age = timedelta(seconds=-QUOTE_CLOCK_SKEW_SECONDS) if source == "mt5" else timedelta(0)
         if not (
-            timedelta(0) <= now - stamp <= timedelta(seconds=QUOTE_FRESH_SECONDS)
+            quote_min_age <= now - stamp <= timedelta(seconds=QUOTE_FRESH_SECONDS)
             and timedelta(0) <= now - received <= timedelta(minutes=3)
         ):
             return {"state": "stale", "candle_count": len(bars)}, label, identity
@@ -414,7 +371,14 @@ class MarketService:
                     self.pool, self.bot_id, "paper_setup",
                     {"id": signal_id, "result": result}, utc_now(),
                 )
-        return result, paper_signals.format_paper_signal(result, source=source), signal_id
+        if self.source == "mt5":
+            text = chart_analysis.format_chart_proposal(
+                result, symbol=source.removeprefix("MetaTrader 5 — "),
+                execution_enabled=self.trading_enabled,
+            )
+        else:
+            text = paper_signals.format_paper_signal(result, source=source)
+        return result, text, signal_id
 
     async def news(self):
         async with self.news_lock:
@@ -567,7 +531,7 @@ class MarketService:
         until = await self.risk_pause(chat_id)
         if until is not None:
             signal_id = None
-            signal_text = f"الإشارات التجريبية موقوفة بعد 3 وقفات متتالية مرصودة ببيانات مكتملة. إعادة التقييم بعد {_stamp(until)}. /reviews لعرض النتائج والملاحظات."
+            signal_text = _pause_text(until)
         delivery_key = f"paper_delivery:{chat_id}"
         delivered = await market_store.get_cache(self.pool, self.bot_id, delivery_key)
         if not await may_send():
@@ -591,18 +555,6 @@ class MarketService:
                 self.pool, self.bot_id, delivery_key,
                 {"id": signal_id, "result": result, "sent_at": utc_now().isoformat()}, utc_now(),
             )
-        if not await may_send():
-            return
-        try:
-            briefing = await self.news()
-        except market_news.BriefingUnavailable:
-            if await may_send():
-                await bot.send_message(
-                    chat_id, "تعذر تحديث الأخبار حالياً. لم أستنتج أخباراً جديدة أو تأثيراً على السعر.",
-                    parse_mode=None,
-                )
-            return
-        await send_news(bot, chat_id, briefing, may_send=may_send)
 
 
 async def send_news(bot, chat_id, briefing, may_send=None):
@@ -742,7 +694,12 @@ async def market_command(update, context):
     service.active_users.add(actor)
     service.market_command_times[actor] = now
     try:
-        await update.effective_message.reply_text(await service.market(), parse_mode=None)
+        chart_text = await service.market()
+        _, signal_text, _ = await service.signals()
+        until = await service.risk_pause(actor)
+        if until is not None:
+            signal_text = _pause_text(until)
+        await update.effective_message.reply_text(chart_text + "\n\n" + signal_text, parse_mode=None)
     finally:
         service.active_users.discard(actor)
 
@@ -794,6 +751,9 @@ async def signals_command(update, context):
     service.market_command_times[actor] = now
     try:
         _, text, _ = await service.signals()
+        until = await service.risk_pause(actor)
+        if until is not None:
+            text = _pause_text(until)
         await message.reply_text(text, parse_mode=None)
     finally:
         service.active_users.discard(actor)
@@ -835,12 +795,14 @@ async def watch_command(update, context):
         service.pool, service.bot_id, update.effective_chat.id, utc_now()
     )
     await message.reply_text(
-        "تم تفعيل تقرير XAUUSD والأخبار كل 15 دقيقة. أول تقرير خلال 15 دقيقة.\n"
-        "يشمل الأسعار وإشارات تجريبية بقواعد EMA9/21 وATR14، وأخباراً مع مصادر.\n"
-        "الإشارة تظهر عند تحقق الشرط فقط، بعد 22 شمعة M15 مكتملة ومتتابعة بتغطية كافية.\n"
+        "تم تفعيل تحليل شارت XAUUSD كل 15 دقيقة. أول تقرير خلال 15 دقيقة.\n"
+        "يشمل اتجاه الشارت، الدعوم والمقاومات المرصودة، وEMA9/21 وATR14.\n"
+        "اقتراح BUY أو SELL مع دخول ووقف وهدف يظهر عند تحقق الشروط فقط، "
+        "بعد 22 شمعة M15 مكتملة ومتتابعة؛ وإلا يوضح سبب الانتظار.\n"
         "مدة الصفقة الورقية 15 دقيقة، مع مراجعة النتيجة وملاحظات محفوظة.\n"
-        "استخدم /signals أو /market أو /reviews أو /news الآن، و/unwatch لإيقاف التقارير.\n"
-        "الأسعار والإشارات والأخبار العامة تعمل بلا OpenAI؛ عناوين الأخبار بلغتها الأصلية."
+        "استخدم /market للتحليل والاقتراح الآن، و/signals للاقتراح، و/reviews للنتائج، "
+        "و/unwatch لإيقاف التقارير.\n"
+        "الأخبار عند طلب /news فقط. التنفيذ على MT5 يتطلب موافقتك على الطلب."
     )
 
 
