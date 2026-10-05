@@ -254,6 +254,116 @@ class ManualBridgeTests(unittest.TestCase):
         self.mt5.order_send.assert_not_called()
         self.mt5.order_check.assert_not_called()
 
+    def loop_probe(self):
+        self.fixture.terminal_info.data_path = str(self.fixture.base)
+        adapter = Mock()
+        adapter.prepare.return_value = {"status": "prepared"}
+        timer = {"seconds": 0.0}
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            timer["seconds"] += seconds
+
+        return adapter, timer, sleep, sleeps
+
+    def test_runtime_disconnect_recovers_once_and_never_polls_or_prepares_while_disconnected(self):
+        adapter, timer, sleep, sleeps = self.loop_probe()
+        calls, cycle = [], {"number": 0}
+
+        def running(terminal):
+            cycle["number"] += 1
+            self.fixture.terminal_info.connected = cycle["number"] not in (2, 3)
+            return cycle["number"] <= 4
+
+        def post(settings, route, payload):
+            calls.append((cycle["number"], route))
+            return ({"paired": True} if route == "register" else {"preparation": self.preparation} if route == "poll" else {})
+
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(trade, "terminal_is_running", side_effect=running), patch.object(manual.time, "monotonic", side_effect=lambda: timer["seconds"]), patch.object(
+            manual.market, "build_payload", return_value={"symbol": self.settings.market.symbol}
+        ), redirect_stdout(output), redirect_stderr(errors):
+            result = manual.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
+                                       sleep=sleep, adapter_factory=lambda: adapter)
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [(1, "register"), (4, "market"), (4, "poll"), (4, "result")])
+        self.assertEqual(errors.getvalue().count("MT5 feed unavailable (terminal_disconnected)."), 1)
+        self.assertEqual(output.getvalue().count("Fresh MT5 feed ready."), 1)
+        self.assertEqual(sleeps, [10, 10, 10])
+        adapter.prepare.assert_called_once()
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_failed_feed_build_or_upload_retries_then_prepares_only_after_successful_fresh_upload(self):
+        for failure in ("data", "http"):
+            with self.subTest(failure=failure):
+                # Use a distinct identity per trial so durable earlier attempts
+                # cannot conceal an incorrectly repeated UI action.
+                preparation = deepcopy(self.preparation)
+                preparation["id"] = "00000000-0000-4000-8000-00000000000" + ("3" if failure == "data" else "4")
+                adapter, timer, sleep, sleeps = self.loop_probe()
+                calls, attempts = [], {"feed": 0}
+
+                def build(mt5, settings, now):
+                    if failure == "data":
+                        attempts["feed"] += 1
+                        if attempts["feed"] <= 2:
+                            raise manual.market.MarketDataError("private SDK data detail")
+                    return {"symbol": self.settings.market.symbol}
+
+                def post(settings, route, payload):
+                    calls.append((timer["seconds"], route))
+                    if route == "market" and failure == "http":
+                        attempts["feed"] += 1
+                        if attempts["feed"] <= 2:
+                            raise manual.HTTPError("https://private.invalid", 503, "private service detail", {}, None)
+                    return ({"paired": True} if route == "register" else {"preparation": preparation} if route == "poll" else {})
+
+                output, errors = io.StringIO(), io.StringIO()
+                with patch.object(trade, "terminal_is_running", side_effect=[True, True, True, True, False]), patch.object(
+                    manual.time, "monotonic", side_effect=lambda: timer["seconds"]
+                ), patch.object(manual.market, "build_payload", side_effect=build), redirect_stdout(output), redirect_stderr(errors):
+                    result = manual.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
+                                               sleep=sleep, adapter_factory=lambda: adapter)
+                self.assertEqual(result, 0)
+                self.assertEqual([stamp for stamp, route in calls if route == "poll"], [20])
+                self.assertEqual([stamp for stamp, route in calls if route == "result"], [20])
+                self.assertEqual(attempts["feed"], 3)
+                self.assertEqual(errors.getvalue().count("MT5 feed unavailable ("), 1)
+                self.assertNotIn("private", errors.getvalue())
+                self.assertEqual(output.getvalue().count("Fresh MT5 feed ready."), 1)
+                adapter.prepare.assert_called_once()
+                self.assertEqual(self.journal.pending(), [])
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_runtime_terminal_mismatch_and_account_switch_remain_fatal_without_polling(self):
+        for changed in ("terminal", "account"):
+            with self.subTest(changed=changed):
+                adapter, timer, sleep, sleeps = self.loop_probe()
+                original_path, original_login = self.fixture.terminal_info.path, self.fixture.account.login
+                count = {"calls": 0}
+
+                def running(terminal):
+                    count["calls"] += 1
+                    if count["calls"] == 2:
+                        if changed == "terminal":
+                            self.fixture.terminal_info.path = str(self.fixture.base / "different")
+                        else:
+                            self.fixture.account.login = 1
+                    return True
+
+                post = Mock(return_value={"paired": True})
+                with patch.object(trade, "terminal_is_running", side_effect=running), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    result = manual.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
+                                               sleep=sleep, adapter_factory=lambda: adapter)
+                self.fixture.terminal_info.path, self.fixture.account.login = original_path, original_login
+                self.assertEqual(result, 1)
+                self.assertEqual([call.args[1] for call in post.call_args_list], ["register"])
+                self.assertEqual(sleeps, [])
+                adapter.prepare.assert_not_called()
+
 
 class FakeNativeBackend:
     def __init__(self):
