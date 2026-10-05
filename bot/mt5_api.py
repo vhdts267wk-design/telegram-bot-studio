@@ -119,7 +119,7 @@ def install_routes(app, application, settings):
             if (
                 feed.get("device_id") != str(device_id) or "execution" not in feed
                 or not timedelta(0) <= now - snapshot["updated_at"] <= timedelta(seconds=180)
-                or not timedelta(0) <= now - _utc(feed["quote"]["time"]) <= timedelta(seconds=30)
+                or not timedelta(seconds=-5) <= now - _utc(feed["quote"]["time"]) <= timedelta(seconds=30)
             ):
                 return {"trade": None}
             if device.get("owner_chat_id") is None or await service.risk_pause(device["owner_chat_id"]) is not None:
