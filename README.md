@@ -13,8 +13,8 @@ Docker, and Railway.
 - Persistent chat menu buttons after `/start`
 - `/start`, `/help`, `/about`, and `/ping` commands
 - `/gold`, `/market`, `/signals`, `/reviews` and `/news` work without OpenAI or screenshots
-- `/market` and `/news` work without screenshots; `/watch` sends a report every 15 minutes
-- Optional, explicitly enabled **Demo MT5 orders at 0.01 lot**, approved with Accept/Reject in a paired private chat
+- `/market` reads completed MT5 M15/M5/M1 candles; `/news` remains a separate request
+- Empirically gated **Demo MT5 proposals at 0.01 lot**, with a native ticket draft and the final Buy/Sell click made by the human
 - Echo replies for normal text messages
 - Fallback handler for unknown commands
 - Error logging
@@ -52,9 +52,9 @@ The bot shows a persistent reply keyboard after `/start` with these buttons:
 | `Help`  | Show available commands          |
 | `About` | Show short bot information       |
 | `Ping`  | Check whether the bot is running |
-| `Market` | XAUUSD prices and observed M15 data |
+| `Market` | XAUUSD M15 direction, M5 confirmation and M1 timing |
 | `News` | Cited political and economic news |
-| `Signals` | Experimental paper BUY/SELL setups |
+| `Signals` | A qualified manual Demo proposal or an explicit waiting reason |
 
 Telegram bots cannot display custom buttons before a user starts or messages the bot. The keyboard appears after the bot replies, then stays available in supported Telegram clients.
 
@@ -69,10 +69,10 @@ Telegram bots cannot display custom buttons before a user starts or messages the
 | `/gold`  | Market report when connected; optional chart-photo guidance otherwise |
 | `/market` | XAUUSD data without screenshots |
 | `/news` | Cited political and macroeconomic developments |
-| `/signals` | Inspect the current experimental setup; no journal entry is opened |
-| `/reviews` | Recent 15-minute paper outcomes and review notes |
-| `/watch` | Opt in to a report every 15 minutes in a private chat |
-| `/unwatch` | Stop reports and cancel unclaimed trade requests; executing/open trades are unaffected |
+| `/signals` | Inspect a qualified M15/M5/M1 proposal or its blocking reason; no order is sent |
+| `/reviews` | Legacy reference-paper observation records; these are not the MTF qualification study |
+| `/watch` | Opt in to private monitoring; MT5 status updates are sent when the state or reason changes |
+| `/unwatch` | Stop reports and cancel pending preparation requests; close any prepared window yourself |
 | `/connect_mt5 CODE` | Pair the locally started Demo bridge in its owner's private chat |
 
 The built-in commands above always take precedence. Any other `/command` is
@@ -89,38 +89,77 @@ The legacy chart-photo feature is disabled unless an owner explicitly sets
 
 ## Market and news monitoring without screenshots
 
-Send `/market` or `/news` for a report. `/watch` enables automatic reports every
-15 minutes, with the first report after 15 minutes; `/unwatch` stops them.
+Send `/market` or `/news` for a report. With MT5, `/watch` checks for qualified
+opportunities every five seconds; status delivery is checked each minute and
+unchanged states/reasons are suppressed. The separate reference workflow keeps
+its 15-minute report interval. `/unwatch` stops monitoring.
 Subscriptions, delivery leases, collected prices and search usage survive restarts
 in PostgreSQL. Reports are private-chat opt-ins. A report already being delivered
 can finish its in-flight Telegram request when unsubscribing.
 
-Reports also include **experimental paper signals**, requested with `/signals`.
-The fixed rule is EMA9/EMA21 on consecutive completed M15 candles: BUY only when
-the fast EMA crosses from at/below to above the slow EMA, SELL on the inverse,
-otherwise no new setup. EMAs use SMA seeds; ATR14 uses true ranges and Wilder
-smoothing. The reference entry is the triggering candle's close, the stop is
-1.5 ATR away, and the target is 3 ATR away (a nominal 2:1 ratio). Levels rounded
-to $0.01 must remain positive and correctly ordered; zero/tiny ATR suppresses
-the setup.
+The current MT5 strategy is `mtf-ema-pullback-60m-v1`: **M15 direction → M5
+pullback/recovery confirmation → M1 close beyond the previous candle's range**.
+It uses EMA9/EMA21 and ATR14 from actual completed broker candles. Each stream
+contains at most 64 actual bars and needs a contiguous suffix of at least 22;
+any gap resets indicator warmup. Missing bars are never filled, and no forming
+candle or later M15/M5 close can confirm an earlier M1 decision.
 
-At least **22 sufficiently covered, consecutive completed M15 candles** are
-required, roughly 5.5 hours of collection plus an initial partial period or any
-gaps. A fresh quote and a recent completed candle are also required. Reports
-never force a BUY/SELL every 15 minutes, fill missing bars or use a forming
-candle. Reference samples are not broker OHLC; spreads, fees, slippage and fills
-are unmodelled. The rules have correctness tests with synthetic data, **not
-historical profitability validation**, and are not ready for live trading.
-The default paper workflow places no orders. The separately enabled Demo
-workflow below can place real broker orders on a Demo account; its local helper
-checks account identity and, on netting accounts, existing positions and orders.
+Entry uses the current executable Ask for BUY or Bid for SELL, rounded adversely
+to the broker tick grid. The stop uses a recent five-bar M5 swing plus a 0.2 ATR
+buffer; TP1 is 2R and the supplementary TP2 is 3R. The static reference entry
+zone is entry ±0.1R, rounded inward. Published entry, SL and TP remain fixed;
+the live spread-plus-price-drift guard still applies and a displayed entry is
+not a guaranteed fill.
 
-The setup identity includes source, exact symbol, strategy version, triggering
-bar and direction. Its initially computed levels are saved. Worker delivery
-remembers the last setup per chat across restarts; `/signals` deliberately lets
-the user inspect the current result again. The same at-least-once delivery
-limitation described below applies if a crash occurs after Telegram accepts a
-message and before its acknowledgement. No paper fills or profits are claimed.
+**No BUY/SELL alert, chart proposal or native preparation is available until
+the empirical gate passes.** A server-local artifact, pinned separately by its
+SHA256, must match the exact strategy/policy/implementation, broker and verified
+cost model. It must contain at least **200 independent, nonoverlapping
+out-of-sample trades** per required cost scenario and a **lower endpoint of the
+two-sided 95% Wilson confidence interval of at least 70%**, after costs. An
+observed 70% win rate alone is insufficient. A separately evidenced independence
+assessment must establish that the effective independent sample size equals the
+raw OOS trade count; missing or reduced effective sample size blocks
+qualification. Nonoverlap alone does not establish independence. A historical
+confidence bound is neither a probability for the next trade nor a guarantee.
+Feed-provided reports, AI confidence and provisional research cannot qualify.
+
+Success means TP1 is reached before SL with positive modeled net cash within
+**60 minutes from actual entry in the tick replay**, rather than from the signal
+candle or message. A timeout is a nonwin. Entry must be the next executable
+tick after the decision within ten seconds; the horizon is
+purged across dataset splits. TP2 does not count as the success target. Candle
+OHLC can give provisional first-barrier bounds, but cannot resolve intrabar
+ordering or prove fills and therefore cannot produce a qualified artifact.
+
+The default has **unverified costs and no pinned evidence artifact**, so MT5
+proposals remain blocked. Unknown costs are not treated as zero. The live
+filters require a quote at most ten seconds old and cache/snapshot/risk data at
+most 30 seconds old. Every actionable alert, chart proposal and native ticket
+preparation must remain within **ten seconds of the triggering M1 candle's
+close**. Technical observations may use that closed bar for up to 75 seconds,
+but that observation window never extends trade validity. Quote clock skew is
+bounded to five seconds; forming bars have no grace.
+They also require Demo 0.01 lot, no open positions or pending orders, estimated
+loss including costs ≤1% equity, free margin ≥2 times required margin, effective
+reward/risk ≥1.5, and spread ≤min(0.1R, 0.15 M1 ATR). The weekday UTC 06–19
+window must accommodate the 60-minute horizon plus ten seconds of entry delay.
+Broker holidays/session closures still require the broker's actual availability
+checks. Tick activity must be at least half the preceding 20-bar median; it is
+a price-update proxy, not verified traded volume or market depth.
+
+Historical qualification requires same-broker UTC Bid/Ask tick history,
+completed M1/M5/M15 history, file fingerprints, verified timestamp/DST provenance,
+chronological development/validation/untouched OOS splits, and commission,
+slippage, financing and 0.01-lot contract/cash-conversion assumptions covering
+the tested period. Record historical tick size, point, digits and stop/margin
+rules. Verified historical execution specifications must cover the full tested
+period and match the live symbol specifications exactly; verified costs and
+timestamp/timezone/DST provenance must cover that same period. A current symbol
+setting or today's UTC offset cannot establish old specifications. Zero candle
+spreads, zero real volume, missing ticks or declared
+simulated costs must not be presented as verified execution evidence. Keep raw
+history and private broker metadata local; publish only a reviewed summary.
 
 By default `MARKET_SOURCE=reference` uses keyless USD gold reference prices from
 [GoldAPI](https://gold-api.com/llms.txt). This independent reference feed is not a
@@ -145,7 +184,7 @@ macroeconomics. This is limited coverage, not a comprehensive news service.
 An empty or unavailable bulletin is reported explicitly; older headlines are
 never presented as new. Results are cached for 15 minutes by provider.
 
-Successfully delivered automatic signals open immutable paper journals in
+The separate legacy reference workflow can open immutable paper journals in
 PostgreSQL. The observation window starts after Telegram accepts the signal and
 lasts **15 minutes**. The worker checks collected reference samples every minute;
 it reports the first observed SL/TP crossing or reviews expiry. A missing gap
@@ -168,52 +207,25 @@ duplicate; delivery is not an exactly-once guarantee. Paper-review delivery
 also assumes one polling replica. A failure after a signal is accepted but
 before journal persistence can leave that signal without a review record.
 
-The [Windows MT5 bridges](bridge/README.md) use your already running, connected
-broker terminal. The read-only helper uploads market data; the separate Demo
-helper can execute explicitly approved orders. Install their Windows SDK in
-`bridge/.venv`, separate from Railway's server requirements. Set
-`MARKET_SOURCE=mt5`, `MARKET_GOLD_SYMBOL` to the exact broker gold symbol, and the
-same private `MARKET_BRIDGE_KEY` of at least 32 characters on server and bridge.
-The protected `/api/market/feed` endpoint runs with that key even when the admin
-panel is disabled. PostgreSQL is required for this HTTP mode.
+The current [Windows manual helper](bridge/MANUAL-TICKETS.md) uses an already
+running connected MT5 terminal, reads the actual account and broker settings,
+and uploads the three closed candle streams. Install its Windows dependencies
+separately from server requirements. Use `MARKET_SOURCE=mt5`,
+`MT5_MANUAL_TICKETS_ENABLED=true`, `MT5_TRADING_ENABLED=false` and a distinct
+private `MT5_MANUAL_BRIDGE_KEY` of at least 32 characters. PostgreSQL is required
+for pairing and private bridge HTTP. The manual key never falls back to the
+legacy bridge key. Old automatic Accept execution is not part of this workflow.
 
-### Optional Demo orders after Accept
-
-Order execution defaults to **off** (`MT5_TRADING_ENABLED=false`). This release
-supports only a **Demo account and exactly 0.01 lot**. Enabling it on Railway
-also requires the user-started local Demo helper; the server never connects to
-MT5 or sends an order itself.
-
-Follow the setup in [bridge/README.md](bridge/README.md), then start
-`bridge/start_mt5_bridge.ps1` with the exact running terminal, broker symbol and
-your service's HTTPS feed URL. The launcher asks for the private bridge key as
-hidden input and requires the local phrase `ENABLE DEMO ORDERS`. In the private
-bot chat, use `/connect_mt5 CODE` with the code shown by the helper; it expires
-after ten minutes and can bind one owner once. Pairing enables alerts; `/watch`
-can enable them again after `/unwatch`.
-
-Offers require fresh device-bound quotes and a valid completed M15 signal.
-Broker grid restrictions normalize the displayed SL/TP before the offer is
-saved. Its levels, symbol, Demo mode and 0.01-lot volume remain fixed. Accept is
-valid for **at most five minutes**, sometimes less, and queues one approved
-request; Reject sends no order. The bridge checks a current quote, the bound
-Demo account, volume, protection levels and broker restrictions before sending.
-The spread-plus-price-drift guard is checked before submission; it cannot
-guarantee the eventual fill or that a broker honors its deviation parameter.
-
-One accepted offer permits one order-send attempt. Restarting, timeouts or an
-unknown outcome never trigger another attempt. A `filled` notification requires
-MT5's full-execution return code, matching full volume and a valid order ticket;
-Accept alone is not execution confirmation. Check MT5 when the result is
-unknown. `/unwatch` cancels pending unclaimed requests, while an executing
-request or open position remains unaffected; its final acknowledgment can still
-arrive. The separate 15-minute paper journal does not close an MT5 position.
-
-Keep Windows and the selected MT5 terminal awake and connected, and keep the
-foreground helper open. Account passwords and account identifiers are not
-uploaded. The helper stores a salted account-binding hash locally and refuses
-a changed account or terminal configuration; retain its local ledger to prevent
-offer replay.
+Pair the user-started helper in its owner's private chat with `/connect_mt5 CODE`.
+Only a still-qualified, fresh device-bound proposal can expose **جهّز على
+اللابتوب**. That action fills a visible native MT5 ticket at Demo 0.01 lot with
+the frozen SL/TP; it sends no order. Review the direction, quote, volume and
+protection, then make the final native Buy/Sell click yourself while the signal
+remains valid. Preparation is refused after ten seconds from M1 close. If that
+deadline passes before your final click, cancel the draft and wait for a fresh
+qualified signal. Expiry or `/unwatch` does not close a successfully prepared
+window or an open position. Keep Windows and the selected terminal
+awake, retain the local attempt ledger, and do not share pairing codes or keys.
 
 ## Telegram Bot Studio
 
@@ -304,7 +316,15 @@ and all state-changing forms are CSRF-protected. Always use a strong
 | `MARKET_SOURCE` | No | `reference` | Keyless reference prices, or explicitly `mt5` for a configured broker bridge |
 | `MARKET_BRIDGE_KEY` | For MT5 only | - | Private ingest/control key of at least 32 characters; enables HTTP and requires PostgreSQL; never send in chat |
 | `MARKET_GOLD_SYMBOL` | For MT5 only | `XAUUSD` | Exact broker gold symbol, including any suffix |
-| `MT5_TRADING_ENABLED` | No | `false` | Explicitly enable private Demo 0.01-lot approval requests; the local Demo helper is also required |
+| `MT5_TRADING_ENABLED` | No | `false` | Retired automatic order path; keep false for the MTF/manual workflow |
+| `MT5_MANUAL_TICKETS_ENABLED` | No | `false` | Allow gated Demo 0.01 native preparation; human final click |
+| `MT5_MANUAL_BRIDGE_KEY` | Manual MT5 only | empty | Distinct private manual bridge key; never put it in chat or a public artifact |
+| `MT5_EVIDENCE_PATH` | Qualified MT5 proposals only | empty | Server-local reviewed empirical artifact; never accepted from feed/API |
+| `MT5_EVIDENCE_SHA256` | Qualified MT5 proposals only | empty | Operator-controlled SHA256 pin for that exact artifact |
+| `MT5_COST_MODEL_VERIFIED` | Windows helper | `false` | True only after the operator verifies the explicit cost model |
+| `MT5_COMMISSION_ROUND_TURN_PER_LOT` | Windows helper | unknown | Round-trip commission in account currency per lot; no missing-to-zero default |
+| `MT5_SLIPPAGE_PRICE` | Windows helper | unknown | Conservative per-side price allowance, matched to the reviewed study |
+| `MT5_BROKER_UTC_OFFSET_MINUTES` | Windows helper | verify before use | Explicit current terminal time normalization; historical offsets need separate period verification |
 
 On Railway, add a **PostgreSQL** service and reference its connection string
 from the bot service:
@@ -461,8 +481,9 @@ Run migration `20261005_05` before use. Local setup and supported UI checks are
 described in [bridge/MANUAL-TICKETS.md](bridge/MANUAL-TICKETS.md).
 
 The display-only `bridge/MT5BotLevels.mq5` indicator shows the latest valid
-proposal's Entry Zone, reference Entry, green TP and red SL on the XAUUSD M15
-chart. Its levels match the immutable Telegram proposal. The helper reads a
+proposal's Entry Zone, reference Entry, green TP1 and red SL on the XAUUSD **M1**
+chart. Use indicator version **2**; old M15/CSV-v1 snapshots are rejected. Its
+levels match the immutable qualified Telegram proposal. The helper reads a
 separate authenticated `/api/mt5/manual/chart` endpoint without claiming a
 ticket and publishes an expiring local snapshot. Missing, expired or unsafe
 data clears the indicator's own levels. The native Buy/Sell click stays with
