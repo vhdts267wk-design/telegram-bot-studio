@@ -92,13 +92,13 @@ BOT_COMMANDS = (
     ("about", "Show bot information"),
     ("ping", "Check bot status"),
     ("gold", "تحليل شارت الذهب من MT5"),
-    ("market", "تحليل الشارت والاتجاه والدعم والمقاومة"),
+    ("market", "تحليل M15 للاتجاه وM5 للتأكيد وM1 للتوقيت عند اتصال MT5"),
     ("news", "Cited political and economic news"),
-    ("signals", "اقتراح BUY أو SELL مع الدخول والوقف والهدف"),
-    ("reviews", "Paper trade outcomes and review notes"),
-    ("watch", "متابعة تحليل الشارت والفرص كل 15 دقيقة"),
-    ("unwatch", "Stop automatic reports"),
-    ("connect_mt5", "Pair your Demo MT5 device for trade approvals"),
+    ("signals", "اقتراح مؤهل بأدلة خارج العينة، أو سبب الانتظار"),
+    ("reviews", "مراجعات ورقية سابقة؛ ليست تأهيل الاستراتيجية الحالية"),
+    ("watch", "متابعة الفرص والحالة دون تكرار الحالة نفسها"),
+    ("unwatch", "إيقاف المتابعة وطلبات التجهيز المعلقة"),
+    ("connect_mt5", "اقتران جهاز MT5 Demo على اللابتوب"),
 )
 
 MENU_HELP = "Help"
@@ -111,11 +111,11 @@ MENU_WATCH = "متابعة الشارت"
 
 HELP_TEXT = """أوامر البوت:
 /start - عرض القائمة
-/market أو /gold - تحليل شارت XAUUSD الحالي من MT5
-/signals - اقتراح BUY أو SELL عند تحقق الشروط، مع الدخول والوقف والهدف
-/watch - متابعة تحليل الشارت والفرص كل 15 دقيقة
-/unwatch - إيقاف المتابعة والطلبات التي لم يبدأ تنفيذها
-/reviews - مراجعة نتائج الاختبارات السابقة
+/market أو /gold - تحليل XAUUSD على M15 وM5 وM1 عند اتصال MT5
+/signals - الاقتراح المؤهل بأدلة خارج العينة أو سبب الانتظار
+/watch - متابعة الفرص وحالة الانتظار دون تكرار الحالة نفسها
+/unwatch - إيقاف المتابعة والطلبات المعلقة
+/reviews - مراجعات ورقية قديمة، لا تثبت تأهيل M15/M5/M1
 /connect_mt5 CODE - اقتران جهاز MT5 Demo بحجم 0.01 lot
 /news - أخبار عند طلبها فقط
 /help - المساعدة
@@ -126,6 +126,17 @@ GOLD_PHOTO_GUIDANCE = (
     "Send a clear XAUUSD screenshot using Telegram's Photo option, with the "
     "timeframe and price scale visible. Wait 30 seconds between chart requests. "
     "Educational only. Not financial advice or a buy/sell signal."
+)
+
+MTF_ANALYSIS_GUIDANCE = (
+    "بقرأ شموع XAUUSD المكتملة: M15 للاتجاه، M5 لتأكيد الارتداد، وM1 لتوقيت الدخول. "
+    "EMA9/21 وATR14 يحتاجان 22 شمعة متصلة بعد آخر فجوة في كل إطار؛ لا نستخدم الشمعة الجارية.\n"
+    "لا يظهر اقتراح شراء/بيع أو مستويات قابلة للتنفيذ قبل دليل معتمد خارج العينة بعد التكاليف: "
+    "200 صفقة مستقلة على الأقل، والحد الأدنى لفاصل Wilson ذي الطرفين بنسبة 95% لا يقل عن 70%. "
+    "غياب الأدلة أو التكاليف الموثّقة يعني الانتظار؛ لا ثقة ذكاء اصطناعي بديلة.\n"
+    "المتابعة تفحص الفرص كل 5 ثوانٍ والحالة كل دقيقة دون تكرار الحالة نفسها. "
+    "صلاحية الاقتراح والتجهيز 10 ثوانٍ من إغلاق M1؛ إذا انتهت ألغِ النافذة وانتظر إشارة جديدة. "
+    "تقييم النجاح: TP1 قبل SL خلال 60 دقيقة من الدخول الفعلي وبعد التكاليف؛ لا ضمان للصفقة المقبلة."
 )
 
 DYNAMIC_CALLBACK_PREFIX = "command:"
@@ -169,6 +180,35 @@ def _dynamic_commands_keyboard() -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(rows)
 
 
+def _uses_mt5(context) -> bool:
+    service = getattr(context, "bot_data", {}).get(market_monitor.SERVICE_KEY)
+    if service is not None:
+        return getattr(service, "source", None) == "mt5"
+    return os.environ.get("MARKET_SOURCE", "reference").strip().lower() == "mt5"
+
+
+def _analysis_guidance(context) -> str:
+    if _uses_mt5(context):
+        return MTF_ANALYSIS_GUIDANCE
+    return (
+        "المصدر المرجعي يوفّر أسعار الذهب وملاحظات ورقية، وليس سعر تنفيذ من وسيطك. "
+        "استخدم /market للتقرير و/signals للحالة الورقية. شرح الصورة التعليمي منفصل عن اقتراحات MT5 المؤهلة."
+    )
+
+
+def _mt5_workflow_guidance(context) -> str:
+    service = getattr(context, "bot_data", {}).get(market_monitor.SERVICE_KEY)
+    if getattr(service, "manual_tickets_enabled", False) is True:
+        return (
+            "على جهاز Demo المقترن بحجم 0.01 lot، زر «جهّز على اللابتوب» يفتح نافذة MT5 "
+            "ويملأ TP وSL فقط. بتراجعها وبتضغط Buy أو Sell بنفسك داخل MT5 على اللابتوب."
+        )
+    return (
+        "تجهيز نافذة MT5 غير مفعّل حالياً. هذه النسخة لا ترسل أوامر تداول تلقائية؛ "
+        "كل تنفيذ داخل MT5 يحتاج ضغطة نهائية منك."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -186,12 +226,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     greeting = "أهلاً" if is_new else "أهلاً من جديد"
     await message.reply_text(
         f"{greeting}, {name}!\n\n"
-        "بقرأ شارت الذهب XAUUSD من شموع MT5 المكتملة على إطار M15، "
-        "وبعرض الاتجاه والدعم والمقاومة وسبب اقتراح الصفقة أو الانتظار.\n\n"
-        "اضغط «تحليل الشارت» للتحليل الحالي، أو «اقتراح صفقة» للدخول والوقف والهدف عند تحقق الإشارة. "
-        "«متابعة الشارت» بتفعّل التقارير كل 15 دقيقة، من دون روابط أخبار.\n\n"
-        "على جهاز Demo المقترن، Accept يوافق على محاولة تنفيذ واحدة بحجم 0.01 lot؛ "
-        "التنفيذ يتأكد برسالة MT5. ما في صفقة مضمونة، وما بنفرض صفقة إذا الشروط مش متحققة.",
+        + _analysis_guidance(context) + "\n\n"
+        "اضغط «تحليل الشارت» للتحليل الحالي، أو «اقتراح صفقة» للحالة والاقتراح المؤهل. "
+        "«متابعة الشارت» بتفعّل المتابعة؛ الأخبار بطلب /news فقط.\n\n"
+        + _mt5_workflow_guidance(context)
+        + " ما في صفقة مضمونة، وما بنفرض صفقة إذا الشروط مش متحققة.",
         reply_markup=_main_menu_keyboard(),
     )
     dynamic_keyboard = _dynamic_commands_keyboard()
@@ -200,7 +239,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
     if message is None:
         return
@@ -209,25 +247,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         HELP_TEXT
         + _dynamic_commands_text()
         + "\n\n"
-        + "التحليل المباشر بيستخدم شموع MT5 المكتملة، من دون الحاجة إلى صورة. "
-        "الاقتراحات الحالية تعتمد EMA9/21 وATR14 بعد 22 شمعة M15 متتابعة على الأقل، "
-        "وبتظهر فقط عند تحقق الشروط.\n\n"
-        + GOLD_PHOTO_GUIDANCE,
+        + _analysis_guidance(context) + "\n\n"
+        + _mt5_workflow_guidance(context) + "\n\n"
+        + ("صور MT5 تُحوّل إلى /market ببياناته المباشرة وشروطه؛ الصورة لا تثبت فرصة مؤهلة." if _uses_mt5(context) else GOLD_PHOTO_GUIDANCE),
         reply_markup=_dynamic_commands_keyboard(),
     )
 
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     message = update.effective_message
     if message is None:
         return
 
     await message.reply_text(
-        "بقرأ شموع الذهب XAUUSD على M15 وبحلّل الاتجاه والدعم والمقاومة باستخدام EMA9/21 وATR14. "
-        "عند تحقق إشارة صالحة، بعرض اتجاه الصفقة والدخول المرجعي والوقف والهدف وسبب الاقتراح. "
-        "المتابعة التلقائية للشارت فقط؛ الأخبار متاحة بأمر /news إذا طلبتها. "
-        "التنفيذ على Demo بحجم 0.01 lot يحتاج Accept منك وتأكيد MT5."
+        _analysis_guidance(context) + "\n\n"
+        "الأخبار متاحة بأمر /news إذا طلبتها. "
+        + _mt5_workflow_guidance(context)
     )
 
 
@@ -253,9 +288,11 @@ async def gold_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def gold_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Explain how to resend image files through the supported photo flow."""
-    del context
     message = update.effective_message
     if message is None or message.document is None:
+        return
+    if _uses_mt5(context):
+        await _show_current_mt5_chart(update, context)
         return
 
     await message.reply_text(
@@ -264,20 +301,37 @@ async def gold_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def _show_current_mt5_chart(update, context) -> None:
+    await update.effective_message.reply_text(
+        "رح أعرض تحليل الشارت من بيانات MT5 المباشرة على M15 وM5 وM1، بدل تفاصيل الصورة؛ "
+        "الاقتراح يبقى خاضعاً للأدلة خارج العينة والمخاطر والصلاحية.",
+        parse_mode=None,
+    )
+    await market_monitor.market_command(update, context)
+
+
 async def gold_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Download a Telegram photo and explain its chart using async vision."""
     message = update.effective_message
     if message is None or not message.photo:
         return
+    # A configured MT5 workflow always uses its real guarded feed. Enabling
+    # the separate educational image feature cannot qualify a live proposal.
+    if _uses_mt5(context):
+        await _show_current_mt5_chart(update, context)
+        return
 
     if os.environ.get("OPENAI_ENABLED", "false").strip().lower() != "true":
         if getattr(context, "bot_data", {}).get(market_monitor.SERVICE_KEY) is not None:
-            await message.reply_text("رح أعرض تحليل الشارت الحالي من بيانات MT5 المتصل عندك، بدل تفاصيل الصورة.", parse_mode=None)
+            service = context.bot_data[market_monitor.SERVICE_KEY]
+            text = "رح أعرض تقرير الأسعار المرجعية المتاح، بدل تفاصيل الصورة." if getattr(service, "source", None) == "reference" else "رح أعرض تحليل الشارت الحالي من بيانات MT5 المتصل عندك، بدل تفاصيل الصورة."
+            await message.reply_text(text, parse_mode=None)
             await market_monitor.market_command(update, context)
             return
         await message.reply_text(
             "التحليل المباشر يحتاج اتصال MT5. بعد اتصاله، استخدم /market لتحليل الشارت، "
-            "/signals لاقتراح صفقة، و/watch للمتابعة كل 15 دقيقة، و/reviews لمراجعة النتائج.",
+            "/signals للحالة أو اقتراح مؤهل بأدلة خارج العينة، و/watch للمتابعة، و/reviews للمراجعات الورقية السابقة. "
+            "MT5 يستخدم M15 للاتجاه وM5 للتأكيد وM1 للتوقيت؛ الصورة لا تعوّض شروط التأهيل.",
             parse_mode=None,
         )
         return

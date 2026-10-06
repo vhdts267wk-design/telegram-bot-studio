@@ -35,14 +35,18 @@ class MT5BridgeTests(unittest.TestCase):
             }
             for index in range(64)
         ]
-        # A restricted SDK mock makes any accidental account/trade API a failure.
+        # Only data and broker arithmetic calls exist; execution APIs are absent.
         self.mt5 = Mock(
             spec=[
                 "initialize", "shutdown", "terminal_info", "symbol_info",
-                "symbol_info_tick", "copy_rates_from_pos", "TIMEFRAME_M15",
+                "symbol_info_tick", "copy_rates_from_pos", "TIMEFRAME_M15", "TIMEFRAME_M5", "TIMEFRAME_M1",
+                "account_info", "positions_get", "orders_get", "order_calc_profit", "order_calc_margin",
+                "ORDER_TYPE_BUY", "ORDER_TYPE_SELL", "ACCOUNT_TRADE_MODE_DEMO",
             ]
         )
         self.mt5.TIMEFRAME_M15 = 15
+        self.mt5.TIMEFRAME_M5, self.mt5.TIMEFRAME_M1 = 5, 1
+        self.mt5.ORDER_TYPE_BUY, self.mt5.ORDER_TYPE_SELL, self.mt5.ACCOUNT_TRADE_MODE_DEMO = 0, 1, 0
         self.mt5.initialize.return_value = True
         self.mt5.terminal_info.return_value = SimpleNamespace(
             connected=True, path=str(self.terminal.parent)
@@ -51,24 +55,30 @@ class MT5BridgeTests(unittest.TestCase):
             currency_base="XAU", currency_profit="USD"
         )
         self.mt5.symbol_info_tick.return_value = SimpleNamespace(
-            bid=2502.0, ask=2502.5, time=self.now_seconds - 15
+            bid=2502.0, ask=2502.5, time=self.now_seconds - 5
         )
+        self.mt5.account_info.return_value = SimpleNamespace(trade_mode=0, login=123, server="synthetic", currency="USD", equity=10000.0, margin_free=9000.0)
+        self.mt5.positions_get.return_value, self.mt5.orders_get.return_value = (), ()
+        self.mt5.order_calc_margin.return_value = 25.0
+        self.mt5.order_calc_profit.side_effect = lambda side, symbol, volume, start, end: (end - start) * (1 if side == 0 else -1)
+        self.mtf_rates = {frame: [{**rate, "time": self.now_seconds - (64 - index) * frame * 60} for index, rate in enumerate(self.rates)] for frame in (5, 1)}
         self.mt5.copy_rates_from_pos.return_value = self.rates
+        self.mt5.copy_rates_from_pos.side_effect = lambda symbol, frame, start, count: self.mt5.copy_rates_from_pos.return_value if frame == 15 else self.mtf_rates[frame]
 
     def payload(self):
         return bridge.build_payload(self.mt5, self.settings, self.now)
 
     def test_exact_symbol_completed_bar_read_and_utc_payload(self):
         result = self.payload()
-        self.mt5.copy_rates_from_pos.assert_called_once_with("XAUUSD.test", 15, 1, 64)
+        self.assertEqual([call.args for call in self.mt5.copy_rates_from_pos.call_args_list], [("XAUUSD.test", frame, 1, 64) for frame in (15, 5, 1)])
         self.mt5.symbol_info.assert_called_once_with("XAUUSD.test")
         self.mt5.symbol_info_tick.assert_called_once_with("XAUUSD.test")
-        self.assertEqual(set(result), {"symbol", "timeframe", "source", "quote", "candles"})
+        self.assertEqual(set(result), {"schema_version", "as_of", "broker_utc_offset_minutes", "symbol", "timeframe", "source", "quote", "candles", "timeframes", "risk_context"})
         self.assertEqual(result["symbol"], "XAUUSD.test")
         self.assertEqual(result["timeframe"], "M15")
         self.assertEqual(result["source"], "MetaTrader 5")
         self.assertEqual(result["quote"], {
-            "bid": 2502.0, "ask": 2502.5, "time": "2026-10-04T11:59:45Z"
+            "bid": 2502.0, "ask": 2502.5, "time": "2026-10-04T11:59:55Z"
         })
         self.assertEqual(result["candles"][-1], {
             "time": "2026-10-04T11:45:00Z", "open": 2500.0, "high": 2504.0,
@@ -117,28 +127,25 @@ class MT5BridgeTests(unittest.TestCase):
         self.assertIsNone(error.reason_code)
         self.mt5.symbol_info.assert_not_called()
 
-    def test_weekend_quote_keeps_original_time_and_gaps_are_never_filled(self):
+    def test_weekend_quote_is_stale_and_no_candles_are_fabricated(self):
         friday = self.now - timedelta(days=2)
         friday_seconds = int(friday.timestamp())
         self.mt5.symbol_info_tick.return_value.time = friday_seconds
         self.mt5.copy_rates_from_pos.return_value = [
             {**rate, "time": rate["time"] - 2 * 86400} for rate in self.rates[-4:]
         ]
-        result = self.payload()
-        self.assertEqual(result["quote"]["time"], "2026-10-02T12:00:00Z")
-        self.assertEqual(len(result["candles"]), 4)
-        self.assertEqual(result["candles"][-1]["time"], "2026-10-02T11:45:00Z")
-        self.assertNotIn("received_at", result)
+        with self.assertRaises(bridge.MarketDataError):
+            self.payload()
+        self.mt5.copy_rates_from_pos.assert_not_called()
 
     def test_available_history_is_sorted_without_interpolation(self):
-        self.mt5.copy_rates_from_pos.return_value = [self.rates[-1], self.rates[-4],
-                                                   self.rates[-2], self.rates[-8]]
+        self.mt5.copy_rates_from_pos.return_value = list(reversed(self.rates))
         result = self.payload()["candles"]
-        self.assertEqual(len(result), 4)
+        self.assertEqual(len(result), 64)
         self.assertEqual([item["time"] for item in result], sorted(item["time"] for item in result))
-        self.assertEqual(result[0]["time"], "2026-10-04T10:00:00Z")
+        self.assertEqual(result[0]["time"], "2026-10-03T20:00:00Z")
 
-    def test_missing_or_insufficient_history_is_rejected(self):
+    def test_missing_old_or_overlong_history_is_rejected(self):
         for rates in (None, [], self.rates[:3], self.rates + [self.rates[-1]]):
             with self.subTest(count=None if rates is None else len(rates)):
                 self.mt5.copy_rates_from_pos.return_value = rates
@@ -189,11 +196,13 @@ class MT5BridgeTests(unittest.TestCase):
         self.mt5.copy_rates_from_pos.return_value = [
             {**rate, "time": rate["time"] + 3 * 3600} for rate in self.rates
         ]
+        self.mtf_rates = {frame: [{**rate, "time": rate["time"] + 10800} for rate in rates] for frame, rates in self.mtf_rates.items()}
         # UTC remains the default. A broker-clock quote requires an explicit
         # verified conversion, rather than a larger future-date tolerance.
         with self.assertRaises(bridge.MarketDataError):
             self.payload()
         configured = replace(self.settings, broker_utc_offset_minutes=180)
+        expected["broker_utc_offset_minutes"] = 180
         self.assertEqual(bridge.build_payload(self.mt5, configured, self.now), expected)
 
     def test_corrected_broker_quote_preserves_stale_and_future_rejections(self):
@@ -305,6 +314,7 @@ class MT5BridgeTests(unittest.TestCase):
         self.assertLessEqual(called, {
             "initialize", "shutdown", "terminal_info", "symbol_info",
             "symbol_info_tick", "copy_rates_from_pos",
+            "account_info", "positions_get", "orders_get", "order_calc_profit", "order_calc_margin",
         })
         self.assertEqual(stdout.getvalue(), "Market update sent.\n")
         self.assertEqual(stderr.getvalue(), "")

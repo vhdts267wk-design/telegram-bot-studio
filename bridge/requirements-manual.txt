@@ -1,0 +1,2 @@
+# Local Windows helper only; never add this UI dependency to the bot server.
+-r requirements.txt

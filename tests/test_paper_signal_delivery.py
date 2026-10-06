@@ -1,36 +1,21 @@
-"""Paper delivery safety with synthetic feeds and in-memory persistence only."""
+"""MTF delivery and preserved reference coverage with synthetic local data."""
 
 import asyncio
 import copy
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bot import market_monitor as monitor
-from bot.market_news import NewsBriefing
+from bot import market_monitor as monitor, mtf_runtime
+from tests import test_mtf_runtime as mtf_fixtures
+from tests import test_multi_timeframe as candle_fixtures
 
-
-NOW = datetime(2026, 10, 4, 12, 30, tzinfo=timezone.utc)
+NOW = candle_fixtures.MultiTimeframeTests.now
 
 
 def broker_snapshot(count=24):
-    candles = []
-    for index in range(count):
-        price = 2700.0 + index
-        candles.append({
-            "time": (NOW - timedelta(minutes=15 * (count - index))).isoformat(),
-            "open": price, "high": price + 2, "low": price - 1,
-            "close": price + 1, "tick_volume": 100,
-        })
-    return {
-        "payload": {
-            "symbol": "XAUUSD", "timeframe": "M15", "source": "MetaTrader 5",
-            "quote": {"bid": 2724.0, "ask": 2724.2, "time": NOW.isoformat()},
-            "candles": candles,
-        },
-        "updated_at": NOW,
-    }
+    return {"payload": candle_fixtures.MultiTimeframeTests().feed(count=count), "updated_at": NOW}
 
 
 def reference_snapshot(periods=24, partial=None):
@@ -39,83 +24,90 @@ def reference_snapshot(periods=24, partial=None):
     for period in range(periods):
         minutes = range(9) if period == partial else range(15)
         for minute in minutes:
-            samples.append({
-                "time": (start + timedelta(minutes=period * 15 + minute)).isoformat(),
-                "price": 2700.0 + period + minute / 100,
-            })
-    return {
-        "payload": {"price": 2725.0, "as_of": NOW.isoformat(), "samples": samples},
-        "updated_at": NOW,
-    }
+            samples.append({"time": (start + timedelta(minutes=period * 15 + minute)).isoformat(),
+                            "price": 2700.0 + period + minute / 100})
+    return {"payload": {"price": 2725.0, "as_of": NOW.isoformat(), "samples": samples}, "updated_at": NOW}
 
 
-def setup_result(**changes):
-    result = {
-        "state": "signal", "strategy_id": "ema9-21-atr14-v1",
-        "bar_time": "2026-10-04T12:15:00Z", "direction": "BUY",
-        "entry": 2725.0, "stop": 2722.0, "target": 2731.0, "atr": 2.0,
-        "candle_count": 24,
-    }
-    result.update(changes)
-    return result
+class PinnedSyntheticEvidenceMixin:
+    def evidence(self):
+        return mtf_fixtures.pinned_synthetic_evidence(broker_snapshot()["payload"], NOW)
+
+    def assert_no_trade(self, text):
+        self.assertNotRegex(text, r"(?i)\b(?:BUY|SELL)\b")
+        self.assertNotIn("SL:", text)
+        self.assertNotIn("الدخول المقترح:", text)
 
 
-class PaperSourceGateTests(unittest.TestCase):
+class PaperSourceGateTests(PinnedSyntheticEvidenceMixin, unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(monitor.os.environ, {"MARKET_GOLD_SYMBOL": "XAUUSD"}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
 
-    def test_fresh_complete_broker_history_reaches_engine_with_source_identity(self):
-        with patch.object(monitor.paper_signals, "analyze_paper_signal", return_value=setup_result()) as engine:
+    def test_fresh_complete_broker_history_uses_actual_mtf_engine_and_local_artifact(self):
+        with self.evidence(), patch.object(monitor.paper_signals, "analyze_paper_signal") as retired_engine:
             result, label, identity = monitor.paper_result(broker_snapshot(), NOW, "mt5")
-        self.assertEqual(result["state"], "signal")
+        self.assertEqual(result["state"], "signal", result)
+        self.assertEqual(result["display_timeframe"], "M1")
         self.assertEqual(identity, "mt5:XAUUSD")
         self.assertIn("MetaTrader 5", label)
-        bars = engine.call_args.args[0]
-        self.assertEqual(len(bars), 24)
-        self.assertEqual(bars[-1]["time"], (NOW - timedelta(minutes=15)).isoformat())
-        self.assertEqual(engine.call_args.kwargs, {"now": NOW})
+        self.assertIn("qualification_id", result)
+        retired_engine.assert_not_called()
 
-    def test_stale_or_excess_future_quote_and_receipt_gate_even_full_covered_history(self):
-        for source, make_snapshot, quote_path in (
-            ("mt5", broker_snapshot, ("quote", "time")),
-            ("reference", reference_snapshot, ("as_of",)),
-        ):
+    def test_stale_or_future_quote_and_receipt_gate_full_covered_history(self):
+        for source, make_snapshot, quote_path in (("mt5", broker_snapshot, ("quote", "time")),
+                                                   ("reference", reference_snapshot, ("as_of",))):
             for field in ("quote_old", "quote_future", "receipt_old", "receipt_future"):
                 snapshot = make_snapshot()
                 if field.startswith("quote"):
                     stamp = NOW - timedelta(minutes=4) if field == "quote_old" else NOW + timedelta(seconds=6 if source == "mt5" else 1)
                     target = snapshot["payload"]
-                    for name in quote_path[:-1]:
-                        target = target[name]
+                    for name in quote_path[:-1]: target = target[name]
                     target[quote_path[-1]] = stamp.isoformat()
                 else:
-                    snapshot["updated_at"] = (
-                        NOW - timedelta(minutes=4) if field == "receipt_old" else NOW + timedelta(seconds=1)
-                    )
-                with self.subTest(source=source, field=field), patch.object(
-                    monitor.paper_signals, "analyze_paper_signal"
-                ) as engine:
+                    snapshot["updated_at"] = NOW - timedelta(minutes=4) if field == "receipt_old" else NOW + timedelta(seconds=1)
+                with self.subTest(source=source, field=field), patch.object(monitor.paper_signals, "analyze_paper_signal") as engine:
                     result, _, _ = monitor.paper_result(snapshot, NOW, source)
-                    self.assertEqual(result["state"], "stale")
+                    self.assertIn(result["state"], ("stale", "invalid"))
                     engine.assert_not_called()
 
     def test_only_mt5_quote_allows_five_seconds_clock_skew(self):
-        for lead in (1, 3, 5):
+        with self.evidence():
+            for lead in (1, 3, 5):
+                snapshot = broker_snapshot()
+                snapshot["payload"]["quote"]["time"] = (NOW + timedelta(seconds=lead)).isoformat()
+                with self.subTest(lead=lead):
+                    result, _, _ = monitor.paper_result(snapshot, NOW, "mt5")
+                    self.assertEqual(result["state"], "signal", result)
+
+    def test_mt5_receipt30_and_quote10_second_bounds_are_independent(self):
+        with self.evidence():
             snapshot = broker_snapshot()
-            snapshot["payload"]["quote"]["time"] = (NOW + timedelta(seconds=lead)).isoformat()
-            with self.subTest(lead=lead), patch.object(
-                monitor.paper_signals, "analyze_paper_signal", return_value=setup_result()
-            ) as engine:
-                result, _, _ = monitor.paper_result(snapshot, NOW, "mt5")
-                self.assertEqual(result["state"], "signal")
-                engine.assert_called_once()
+            snapshot["updated_at"] = NOW - timedelta(seconds=31)
+            self.assertEqual(monitor.paper_result(snapshot, NOW, "mt5")[0]["state"], "stale")
+        clock = NOW + timedelta(seconds=10)
+        feed = candle_fixtures.MultiTimeframeTests().feed(now=clock, count=24)
+        with mtf_fixtures.pinned_synthetic_evidence(feed, clock):
+            for age, state in ((10, "signal"), (11, "stale")):
+                snapshot = {"payload": copy.deepcopy(feed), "updated_at": clock}
+                snapshot["payload"]["quote"]["time"] = (clock - timedelta(seconds=age)).isoformat()
+                self.assertEqual(monitor.paper_result(snapshot, clock, "mt5")[0]["state"], state)
+
+    def test_fresh_receipt_and_quote_cannot_extend_the_absolute_m1_entry_window(self):
+        clock = NOW + timedelta(seconds=11)
+        feed = candle_fixtures.MultiTimeframeTests().feed(now=clock, count=24)
+        with mtf_fixtures.pinned_synthetic_evidence(feed, clock):
+            result, _, _ = monitor.paper_result({"payload": feed, "updated_at": clock}, clock, "mt5")
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason"], "entry_window_expired")
+        self.assertNotIn("direction", result)
 
     def test_fresh_quote_does_not_make_old_completed_bars_fresh(self):
         snapshot = broker_snapshot()
-        for bar in snapshot["payload"]["candles"]:
-            bar["time"] = (monitor._utc(bar["time"]) - timedelta(hours=1)).isoformat()
+        for rows in snapshot["payload"]["timeframes"].values():
+            for bar in rows: bar["time"] = (monitor._utc(bar["time"]) - timedelta(hours=1)).isoformat()
+        snapshot["payload"]["candles"] = copy.deepcopy(snapshot["payload"]["timeframes"]["M15"])
         result, _, _ = monitor.paper_result(snapshot, NOW, "mt5")
         self.assertEqual(result["state"], "stale")
 
@@ -131,30 +123,36 @@ class PaperSourceGateTests(unittest.TestCase):
         self.assertEqual(result["candle_count"], 19)
         self.assertEqual(result["remaining_bars"], 3)
 
-    def test_missing_broker_interval_cannot_be_bridged_by_old_history(self):
+    def test_missing_broker_interval_resets_only_actual_contiguous_suffix(self):
         snapshot = broker_snapshot()
-        snapshot["payload"]["candles"].pop(-10)
+        snapshot["payload"]["timeframes"]["M5"].pop(-10)
         result, _, _ = monitor.paper_result(snapshot, NOW, "mt5")
         self.assertEqual(result["state"], "warmup")
-        self.assertEqual(result["candle_count"], 9)
+        self.assertEqual(result["contiguous_counts"]["M5"], 9)
+
+    def test_legacy_m15_alone_never_reaches_retired_buy_sell_engine(self):
+        snapshot = broker_snapshot()
+        for key in ("schema_version", "timeframes", "risk_context", "as_of", "broker_utc_offset_minutes"):
+            snapshot["payload"].pop(key)
+        with self.evidence(), patch.object(monitor.paper_signals, "analyze_paper_signal") as engine:
+            result, _, _ = monitor.paper_result(snapshot, NOW, "mt5")
+        self.assertNotEqual(result["state"], "signal")
+        self.assertNotIn("direction", result)
+        engine.assert_not_called()
 
 
-class PaperDeliveryTests(unittest.IsolatedAsyncioTestCase):
+class PaperDeliveryTests(PinnedSyntheticEvidenceMixin, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.env = patch.dict(monitor.os.environ, {"MARKET_SOURCE": "mt5"}, clear=True)
+        self.env = patch.dict(monitor.os.environ, {"MARKET_SOURCE": "mt5", "MT5_MANUAL_TICKETS_ENABLED": "true"}, clear=True)
         self.clock = patch.object(monitor, "utc_now", return_value=NOW)
-        self.env.start()
-        self.clock.start()
-        self.addCleanup(self.env.stop)
-        self.addCleanup(self.clock.stop)
+        self.env.start(); self.clock_mock = self.clock.start()
+        self.addCleanup(self.env.stop); self.addCleanup(self.clock.stop)
         self.service = monitor.MarketService(object(), 9901)
-        self.saved = {}
+        self.saved = {"broker_feed": broker_snapshot()}
         self.cache_read = patch.object(monitor.market_store, "get_cache", side_effect=self.read_cache)
         self.cache_write = patch.object(monitor.market_store, "save_cache", side_effect=self.write_cache)
-        self.read = self.cache_read.start()
-        self.write = self.cache_write.start()
-        self.addCleanup(self.cache_read.stop)
-        self.addCleanup(self.cache_write.stop)
+        self.read = self.cache_read.start(); self.write = self.cache_write.start()
+        self.addCleanup(self.cache_read.stop); self.addCleanup(self.cache_write.stop)
 
     async def read_cache(self, pool, bot_id, key):
         self.assertEqual(bot_id, 9901)
@@ -166,139 +164,200 @@ class PaperDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     def reporting_service(self):
         service = monitor.MarketService(self.service.pool, 9901)
-        service.market = AsyncMock(return_value="synthetic price report")
-        service.signals = AsyncMock(return_value=(setup_result(), "synthetic BUY paper setup", "setup-id"))
-        service.news = AsyncMock(return_value=NewsBriefing(NOW, ("synthetic cited news",)))
+        service.market = AsyncMock(side_effect=AssertionError("MTF status delivery does not fetch a chart"))
+        service.news = AsyncMock(side_effect=AssertionError("MTF status delivery does not fetch news"))
         return service
 
-    async def test_per_chat_dedup_survives_service_recreation_without_suppressing_other_chat(self):
-        first = self.reporting_service()
-        initial_bot = SimpleNamespace(send_message=AsyncMock())
-        await first.send_report(initial_bot, 4401)
-        self.assertEqual(self.saved["paper_delivery:4401"]["payload"]["id"], "setup-id")
-        restarted = self.reporting_service()
-        repeated_bot = SimpleNamespace(send_message=AsyncMock())
-        await restarted.send_report(repeated_bot, 4401)
-        repeated_texts = [call.args[1] for call in repeated_bot.send_message.await_args_list]
-        self.assertNotIn("synthetic BUY paper setup", repeated_texts)
-        self.assertTrue(any("سبق إرسال" in text for text in repeated_texts))
-        new_chat_bot = SimpleNamespace(send_message=AsyncMock())
-        await restarted.send_report(new_chat_bot, 4402)
-        self.assertIn("synthetic BUY paper setup", [call.args[1] for call in new_chat_bot.send_message.await_args_list])
-        self.assertEqual(self.saved["paper_delivery:4402"]["payload"]["id"], "setup-id")
-        delivery_writes = [call.args[2] for call in self.write.await_args_list]
-        self.assertEqual(delivery_writes.count("paper_delivery:4401"), 1)
-        self.assertEqual(delivery_writes.count("paper_delivery:4402"), 1)
+    async def test_per_chat_status_dedup_survives_recreation_and_other_chat_is_independent(self):
+        with self.evidence():
+            first = self.reporting_service()
+            bot = SimpleNamespace(send_message=AsyncMock())
+            await first.send_report(bot, 4401)
+            bot.send_message.assert_awaited_once()
+            self.assertIn("شراء BUY", bot.send_message.await_args.args[1])
+            token = self.saved["mtf_status:4401"]["payload"]["token"]
+            self.assertEqual(token, self.saved["paper_setup"]["payload"]["id"])
+            restarted = self.reporting_service()
+            repeated = SimpleNamespace(send_message=AsyncMock())
+            await restarted.send_report(repeated, 4401)
+            repeated.send_message.assert_not_awaited()
+            other = SimpleNamespace(send_message=AsyncMock())
+            await restarted.send_report(other, 4402)
+            other.send_message.assert_awaited_once()
+            self.assertEqual(self.saved["mtf_status:4402"]["payload"]["token"], token)
+            restarted.market.assert_not_awaited(); restarted.news.assert_not_awaited()
+        writes = [call.args[2] for call in self.write.await_args_list]
+        self.assertEqual(writes.count("mtf_status:4401"), 1)
+        self.assertEqual(writes.count("mtf_status:4402"), 1)
 
-    async def test_manual_inspection_freezes_setup_but_does_not_acknowledge_worker_delivery(self):
-        update = SimpleNamespace(
-            effective_message=SimpleNamespace(reply_text=AsyncMock()),
-            effective_chat=SimpleNamespace(type="private", id=4401),
-        )
-        context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
-        with patch.object(monitor, "paper_result", return_value=(setup_result(), "synthetic source", "reference:XAUUSD")):
-            await monitor.signals_command(update, context)
-        update.effective_message.reply_text.assert_awaited_once()
-        text = update.effective_message.reply_text.await_args.args[0]
-        self.assertIn("BUY", text)
-        self.assertEqual(update.effective_message.reply_text.await_args.kwargs, {"parse_mode": None})
-        self.assertIn("paper_setup", self.saved)
-        self.assertFalse(any(key.startswith("paper_delivery:") for key in self.saved))
-        self.assertEqual(self.service.active_users, set())
-        self.service.market = AsyncMock(return_value="synthetic price report")
-        self.service.news = AsyncMock(side_effect=monitor.market_news.BriefingUnavailable())
+    async def test_status_only_notifies_when_waiting_state_or_reason_changes(self):
+        self.saved["broker_feed"]["payload"]["risk_context"]["costs_verified"] = False
+        service = self.reporting_service()
         bot = SimpleNamespace(send_message=AsyncMock())
-        with patch.object(monitor, "paper_result", return_value=(setup_result(), "synthetic source", "reference:XAUUSD")):
+        with self.evidence():
+            await service.send_report(bot, 4401)
+            await service.send_report(bot, 4401)
+            self.assertEqual(bot.send_message.await_count, 1)
+            self.assert_no_trade(bot.send_message.await_args.args[1])
+            self.saved["broker_feed"]["payload"]["risk_context"].update(costs_verified=True, open_positions=1)
+            await service.send_report(bot, 4401)
+            self.assertEqual(bot.send_message.await_count, 2)
+            self.assertIn("فرصة عالية المخاطر", bot.send_message.await_args.args[1])
+        self.assertNotIn("paper_setup", self.saved)
+
+    async def test_manual_inspection_freezes_qualified_setup_without_acknowledging_delivery(self):
+        update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=AsyncMock()), effective_chat=SimpleNamespace(type="private", id=4401))
+        context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
+        with self.evidence():
+            await monitor.signals_command(update, context)
+            text = update.effective_message.reply_text.await_args.args[0]
+            self.assertIn("شراء BUY", text)
+            self.assertEqual(update.effective_message.reply_text.await_args.kwargs, {"parse_mode": None})
+            self.assertIn("paper_setup", self.saved)
+            self.assertNotIn("mtf_status:4401", self.saved)
+            bot = SimpleNamespace(send_message=AsyncMock())
             await self.service.send_report(bot, 4401)
-        self.assertTrue(any("BUY" in call.args[1] for call in bot.send_message.await_args_list))
-        self.assertIn("paper_delivery:4401", self.saved)
+        self.assertIn("شراء BUY", bot.send_message.await_args.args[1])
+        self.assertIn("mtf_status:4401", self.saved)
+        self.assertEqual(self.service.active_users, set())
 
-    async def test_original_levels_remain_frozen_for_same_source_strategy_bar_and_side(self):
-        initial = setup_result()
-        recalculated = setup_result(entry=2726.0, stop=2720.0, target=2738.0, atr=4.0)
-        with patch.object(monitor, "paper_result", return_value=(initial, "synthetic source", "reference:XAUUSD")):
-            first_result, _, first_id = await self.service.signals()
-        restarted = monitor.MarketService(self.service.pool, 9901)
-        with patch.object(monitor, "paper_result", return_value=(recalculated, "synthetic source", "reference:XAUUSD")):
-            frozen_result, text, second_id = await restarted.signals()
+    async def test_original_levels_remain_frozen_for_same_source_strategy_bar_and_direction(self):
+        with self.evidence():
+            first, _, first_id = await self.service.signals()
+            self.saved["broker_feed"]["payload"]["quote"].update(bid=2000.011, ask=2000.013)
+            restarted = self.reporting_service()
+            frozen, text, second_id = await restarted.signals()
         self.assertEqual(first_id, second_id)
-        self.assertEqual(frozen_result, first_result)
-        self.assertIn("2725.00", text)
-        self.assertNotIn("2738.00", text)
-        self.assertEqual(self.write.await_count, 1)
+        self.assertEqual(frozen, first)
+        self.assertIn("2000.003", text)
+        self.assertEqual([call.args[2] for call in self.write.await_args_list].count("paper_setup"), 1)
 
-    async def test_same_bar_from_different_provider_has_different_setup_identity(self):
+    async def test_original_frozen_result_is_rechecked_against_current_quote_and_risk(self):
+        with self.evidence():
+            initial, _, _ = await self.service.signals()
+            self.saved["broker_feed"]["payload"]["quote"].update(bid=initial["entry"] + .2, ask=initial["entry"] + .202)
+            result, text, signal_id = await self.service.signals()
+            self.assertNotEqual(result["state"], "signal")
+            self.assertIsNone(signal_id)
+            self.assert_no_trade(text)
+
+    async def test_same_bar_from_different_paired_devices_has_distinct_setup_identity(self):
         ids = []
-        for identity in ("reference:XAUUSD", "mt5:XAUUSD.m"):
-            with patch.object(monitor, "paper_result", return_value=(setup_result(), "synthetic source", identity)):
+        with self.evidence():
+            for device_id in ("11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"):
+                self.saved["broker_feed"]["payload"]["device_id"] = device_id
                 _, _, signal_id = await self.service.signals()
                 ids.append(signal_id)
         self.assertNotEqual(*ids)
 
-    async def test_unwatch_during_signal_computation_stops_paper_and_news(self):
+    async def test_unqualified_or_legacy_mt5_data_never_freezes_a_setup(self):
+        self.saved["broker_feed"]["payload"]["risk_context"]["costs_verified"] = False
+        result, text, signal_id = await self.service.signals()
+        self.assertEqual(result["reason"], "unverified_costs")
+        self.assertIsNone(signal_id); self.assert_no_trade(text)
+        self.assertNotIn("paper_setup", self.saved)
+        self.saved["broker_feed"] = broker_snapshot()
+        for key in ("schema_version", "timeframes", "risk_context", "as_of", "broker_utc_offset_minutes"):
+            self.saved["broker_feed"]["payload"].pop(key)
+        result, text, signal_id = await self.service.signals()
+        self.assertNotEqual(result["state"], "signal")
+        self.assertIsNone(signal_id); self.assert_no_trade(text)
+        self.assertNotIn("paper_setup", self.saved)
+
+    async def test_invalid_legacy_cached_result_is_not_reused_for_current_qualified_setup(self):
+        with self.evidence():
+            current, _, signal_id = await self.service.signals()
+            self.saved["paper_setup"]["payload"]["result"] = {"state": "signal", "strategy_id": "ema9-21-atr14-v1", "direction": "BUY", "entry": 9000, "stop": 8990, "target": 9020}
+            returned, text, returned_id = await self.service.signals()
+        self.assertEqual(returned_id, signal_id)
+        self.assertEqual(returned["entry"], current["entry"])
+        self.assertNotIn("9000", text)
+
+    async def test_unwatch_during_signal_computation_stops_entire_mt5_report(self):
         entered, proceed = asyncio.Event(), asyncio.Event()
         consent = {"active": True}
         service = self.reporting_service()
-
         async def delayed_signals():
-            entered.set()
-            await proceed.wait()
-            return setup_result(), "synthetic BUY paper setup", "setup-id"
-
+            entered.set(); await proceed.wait()
+            return {"state": "warmup", "reason": "insufficient_contiguous_history"}, "جارٍ جمع البيانات", None
         service.signals = delayed_signals
         bot = SimpleNamespace(send_message=AsyncMock())
-        with patch.object(monitor.market_store, "delivery_active", new_callable=AsyncMock,
-                          side_effect=lambda *args: consent["active"]):
+        with patch.object(monitor.market_store, "delivery_active", new_callable=AsyncMock, side_effect=lambda *args: consent["active"]):
             task = asyncio.create_task(service.send_report(bot, 4401, "synthetic-lease"))
             await asyncio.wait_for(entered.wait(), 1)
-            consent["active"] = False
-            proceed.set()
+            consent["active"] = False; proceed.set()
             await asyncio.wait_for(task, 1)
-        bot.send_message.assert_awaited_once_with(4401, "synthetic price report", parse_mode=None)
-        service.news.assert_not_awaited()
-        self.assertNotIn("paper_delivery:4401", self.saved)
+        bot.send_message.assert_not_awaited(); service.news.assert_not_awaited()
+        self.assertNotIn("mtf_status:4401", self.saved)
 
-    async def test_unwatch_during_delivery_cache_lookup_stops_paper_and_news(self):
+    async def test_unwatch_during_status_cache_lookup_stops_qualified_delivery(self):
         entered, proceed = asyncio.Event(), asyncio.Event()
         consent = {"active": True}
         service = self.reporting_service()
-
         async def delayed_read(pool, bot_id, key):
-            if key.startswith("paper_delivery:"):
-                entered.set()
-                await proceed.wait()
-            return None
-
+            if key.startswith("mtf_status:"):
+                entered.set(); await proceed.wait()
+            return await self.read_cache(pool, bot_id, key)
         self.read.side_effect = delayed_read
         bot = SimpleNamespace(send_message=AsyncMock())
-        with patch.object(monitor.market_store, "delivery_active", new_callable=AsyncMock,
-                          side_effect=lambda *args: consent["active"]):
+        with self.evidence(), patch.object(monitor.market_store, "delivery_active", new_callable=AsyncMock, side_effect=lambda *args: consent["active"]):
             task = asyncio.create_task(service.send_report(bot, 4401, "synthetic-lease"))
             await asyncio.wait_for(entered.wait(), 1)
-            consent["active"] = False
-            proceed.set()
+            consent["active"] = False; proceed.set()
             await asyncio.wait_for(task, 1)
-        bot.send_message.assert_awaited_once_with(4401, "synthetic price report", parse_mode=None)
-        service.news.assert_not_awaited()
-        self.assertNotIn("paper_delivery:4401", self.saved)
+        bot.send_message.assert_not_awaited(); service.news.assert_not_awaited()
+        self.assertNotIn("mtf_status:4401", self.saved)
 
-    async def test_paused_report_never_shows_proposal_or_opens_another_trade(self):
+    async def test_expiry_during_status_lookup_cannot_send_old_buy_levels(self):
         service = self.reporting_service()
-        service.journal_enabled = True
+        async def delayed_read(pool, bot_id, key):
+            value = await self.read_cache(pool, bot_id, key)
+            if key.startswith("mtf_status:"):
+                self.clock_mock.return_value = NOW + timedelta(seconds=76)
+            return value
+        self.read.side_effect = delayed_read
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with self.evidence(), patch.object(mtf_runtime, "_clock", side_effect=lambda *args: self.clock_mock.return_value):
+            await service.send_report(bot, 4401)
+        for call in bot.send_message.await_args_list: self.assert_no_trade(call.args[1])
+
+    async def test_signals_command_rechecks_timing_after_async_risk_lookup(self):
+        update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=AsyncMock()), effective_chat=SimpleNamespace(type="private", id=4401))
+        context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
+        async def delayed_risk(chat_id):
+            await asyncio.sleep(0)
+            self.clock_mock.return_value = NOW + timedelta(seconds=76)
+            return None
+        self.service.risk_pause = delayed_risk
+        with self.evidence(), patch.object(mtf_runtime, "_clock", side_effect=lambda *args: self.clock_mock.return_value):
+            await monitor.signals_command(update, context)
+        update.effective_message.reply_text.assert_awaited_once()
+        self.assert_no_trade(update.effective_message.reply_text.await_args.args[0])
+        self.assertEqual(self.service.active_users, set())
+
+    async def test_signals_command_rechecks_current_exposure_after_async_risk_lookup(self):
+        update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=AsyncMock()), effective_chat=SimpleNamespace(type="private", id=4401))
+        context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
+        async def delayed_risk(chat_id):
+            await asyncio.sleep(0)
+            self.saved["broker_feed"]["payload"]["risk_context"]["open_positions"] = 1
+            return None
+        self.service.risk_pause = delayed_risk
+        with self.evidence():
+            await monitor.signals_command(update, context)
+        self.assert_no_trade(update.effective_message.reply_text.await_args.args[0])
+
+    async def test_paused_report_never_shows_proposal_or_creates_automatic_trade(self):
+        service = self.reporting_service(); service.journal_enabled = True
         service.risk_pause = AsyncMock(return_value=NOW + timedelta(minutes=15))
         bot = SimpleNamespace(send_message=AsyncMock())
-        with patch.object(monitor.journal_store, "open_trade", new_callable=AsyncMock) as journal, patch.object(
+        with self.evidence(), patch.object(monitor.journal_store, "open_trade", new_callable=AsyncMock) as journal, patch.object(
             monitor.trade_store, "create_offer", new_callable=AsyncMock
         ) as offer:
             await service.send_report(bot, 4401)
-        texts = [call.args[1] for call in bot.send_message.await_args_list]
-        self.assertTrue(any("موقوفة" in text for text in texts))
-        self.assertFalse(any("BUY" in text for text in texts))
-        journal.assert_not_awaited()
-        offer.assert_not_awaited()
-        service.news.assert_not_awaited()
-        self.assertNotIn("paper_delivery:4401", self.saved)
+        self.assertIn("موقوفة", bot.send_message.await_args.args[1]); self.assert_no_trade(bot.send_message.await_args.args[1])
+        journal.assert_not_awaited(); offer.assert_not_awaited(); service.news.assert_not_awaited()
+        self.assertFalse(service.trading_enabled)
 
 
-if __name__ == "__main__":
-    unittest.main()
+if __name__ == "__main__": unittest.main()

@@ -1,4 +1,4 @@
-"""Chart reports and explicitly subscribed 15-minute Telegram delivery."""
+"""Chart analysis and explicitly subscribed, deduplicated Telegram delivery."""
 
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CommandHandler
 
-from bot import chart_analysis, free_news, journal_store, market_news, market_store, mt5_api, mt5_notifications, paper_journal, paper_policy, paper_signals, reference_market, trade_store
+from bot import chart_analysis, free_news, journal_store, manual_ticket_store, market_news, market_store, mt5_api, mt5_notifications, mtf_runtime, multi_timeframe, paper_journal, paper_policy, paper_signals, proposal_overlay, reference_market, trade_store
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ SERVICE_KEY = "market_service"
 WORKER_KEY = "market_worker"
 REPORT_INTERVAL = timedelta(minutes=15)
 NEWS_DAILY_LIMIT = 96
-MAX_FEED_BYTES = 65536
+MAX_FEED_BYTES = 131072
 QUOTE_FRESH_SECONDS = 180
 QUOTE_CLOCK_SKEW_SECONDS = 5
 NOTICE = "للتثقيف فقط. ليس نصيحة مالية أو توصية شراء أو بيع."
@@ -57,9 +57,9 @@ def _number(value):
 
 
 def validate_feed(payload, now, expected_symbol=None):
-    """Accept completed M15 broker bars only; never fabricate or fill gaps."""
+    """Validate broker data; legacy M15 alone never qualifies a new proposal."""
     required = {"symbol", "timeframe", "source", "quote", "candles"}
-    if not isinstance(payload, dict) or not required <= set(payload) or not set(payload) <= required | {"device_id", "execution"}:
+    if not isinstance(payload, dict) or not required <= set(payload) or not set(payload) <= required | {"device_id", "execution", "schema_version", "timeframes", "risk_context", "as_of", "broker_utc_offset_minutes"}:
         raise ValueError("Invalid feed")
     device_id = payload.get("device_id")
     if "device_id" in payload and (type(device_id) is not str or str(UUID(device_id)) != device_id):
@@ -81,7 +81,7 @@ def validate_feed(payload, now, expected_symbol=None):
     if bid > ask or stamp > now + timedelta(seconds=30) or stamp < now - timedelta(days=10):
         raise ValueError("Invalid quote")
     bars = payload["candles"]
-    if not isinstance(bars, list) or not 4 <= len(bars) <= 64:
+    if not isinstance(bars, list) or not (1 if payload.get("schema_version") == 2 else 4) <= len(bars) <= 64:
         raise ValueError("Insufficient history")
     clean_bars = []
     previous = None
@@ -127,6 +127,60 @@ def validate_feed(payload, now, expected_symbol=None):
         if type(digits) is not int or not 0 <= digits <= 10 or type(stops) is not int or not 0 <= stops <= 1000000:
             raise ValueError("Invalid execution metadata")
         cleaned["execution"] = {"tick_size": _number(execution["tick_size"]), "point": _number(execution["point"]), "digits": digits, "stops_level": stops}
+    if "timeframes" in payload or "schema_version" in payload or "risk_context" in payload:
+        if type(payload.get("schema_version")) is not int or payload["schema_version"] != 2:
+            raise ValueError("Version 2 multi-timeframe data is required")
+        if not {"as_of", "broker_utc_offset_minutes", "execution"} <= set(payload):
+            raise ValueError("Complete normalized snapshot metadata is required")
+        as_of = _utc(payload["as_of"])
+        offset = payload["broker_utc_offset_minutes"]
+        if not timedelta(0) <= now - as_of <= timedelta(seconds=30) or type(offset) is not int or not -720 <= offset <= 840 or offset % 15:
+            raise ValueError("Invalid normalized snapshot clock")
+        frames = payload.get("timeframes")
+        if type(frames) is not dict or set(frames) != {"M15", "M5", "M1"}:
+            raise ValueError("All three timeframes are required")
+        clean_frames = {"M15": clean_bars}
+        if frames["M15"] != payload["candles"]:
+            raise ValueError("Conflicting M15 history")
+        for frame, seconds in (("M5", 300), ("M1", 60)):
+            rows = frames[frame]
+            if type(rows) is not list or not 1 <= len(rows) <= 64:
+                raise ValueError("Insufficient timeframe history")
+            clean_rows, prior = [], None
+            for row in rows:
+                if type(row) is not dict or set(row) != {"time", "open", "high", "low", "close", "tick_volume"}:
+                    raise ValueError("Invalid timeframe candle")
+                opened = _utc(row["time"])
+                if opened.microsecond or int(opened.timestamp()) % seconds or opened + timedelta(seconds=seconds) > now or opened < now - timedelta(days=30) or (prior is not None and opened <= prior):
+                    raise ValueError("Invalid completed candle time")
+                prices = {name: _number(row[name]) for name in ("open", "high", "low", "close")}
+                if prices["low"] > min(prices["open"], prices["close"]) or prices["high"] < max(prices["open"], prices["close"]) or prices["low"] > prices["high"]:
+                    raise ValueError("Invalid timeframe candle range")
+                volume = row["tick_volume"]
+                if type(volume) is not int or not 0 <= volume <= 10**12:
+                    raise ValueError("Invalid timeframe tick count")
+                clean_rows.append({"time": opened.isoformat(), **prices, "tick_volume": volume})
+                prior = opened
+            if _utc(clean_rows[-1]["time"]) + timedelta(seconds=seconds) > stamp + timedelta(seconds=5):
+                raise ValueError("Quote predates completed timeframe history")
+            clean_frames[frame] = clean_rows
+        risk = payload.get("risk_context")
+        risk_fields = {"account_mode", "volume", "equity", "free_margin", "margin_required", "open_positions", "pending_orders", "loss_cash_per_price_unit", "profit_cash_per_price_unit", "commission_round_turn", "slippage_price", "costs_verified", "as_of", "broker_fingerprint"}
+        if type(risk) is not dict or set(risk) != risk_fields:
+            raise ValueError("Exact risk metadata is required")
+        if risk["account_mode"] != "demo" or risk["volume"] != 0.01 or type(risk["costs_verified"]) is not bool or re.fullmatch(r"[0-9a-f]{64}", risk["broker_fingerprint"]) is None:
+            raise ValueError("Invalid Demo risk metadata")
+        for key in ("open_positions", "pending_orders"):
+            if type(risk[key]) is not int or not 0 <= risk[key] <= 1000000:
+                raise ValueError("Invalid exposure count")
+        for key in ("equity", "free_margin", "margin_required", "loss_cash_per_price_unit", "profit_cash_per_price_unit", "commission_round_turn", "slippage_price"):
+            value = risk[key]
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value < 1e12):
+                raise ValueError("Invalid risk value")
+        risk_stamp = _utc(risk["as_of"])
+        if not timedelta(seconds=-5) <= now - risk_stamp <= timedelta(seconds=30):
+            raise ValueError("Stale risk metadata")
+        cleaned.update(schema_version=2, as_of=as_of.isoformat(), broker_utc_offset_minutes=offset, timeframes=clean_frames, risk_context={**risk, "as_of": risk_stamp.isoformat()})
     return cleaned
 
 
@@ -148,18 +202,19 @@ def _pause_text(until):
     )
 
 
-def market_text(snapshot, now):
+def market_text(snapshot, now, *, result=None, include_proposal=False):
     """Explain the real broker chart; order delivery stays on its existing path."""
     if snapshot is None:
-        return chart_analysis.format_chart_analysis(None, None, now, include_proposal=False)
+        return chart_analysis.format_chart_analysis(None, None, now, include_proposal=include_proposal)
     try:
         payload = validate_feed(snapshot["payload"], now)
         received_at = snapshot["updated_at"]
     except (KeyError, TypeError, ValueError):
         return "بيانات الأسعار المتاحة غير صالحة حالياً. يلزم تحديث مصدر الوسيط."
-    result, _, _ = paper_result(snapshot, now, "mt5")
+    if result is None:
+        result, _, _ = paper_result(snapshot, now, "mt5")
     return chart_analysis.format_chart_analysis(
-        payload, result, now, received_at=received_at, include_proposal=False,
+        payload, result, now, received_at=received_at, include_proposal=include_proposal,
     )
 
 
@@ -265,7 +320,7 @@ def paper_result(snapshot, now, source):
         quote_min_age = timedelta(seconds=-QUOTE_CLOCK_SKEW_SECONDS) if source == "mt5" else timedelta(0)
         if not (
             quote_min_age <= now - stamp <= timedelta(seconds=QUOTE_FRESH_SECONDS)
-            and timedelta(0) <= now - received <= timedelta(minutes=3)
+            and timedelta(0) <= now - received <= timedelta(seconds=30 if source == "mt5" else 180)
         ):
             return {"state": "stale", "candle_count": len(bars)}, label, identity
         # A missing interval ends the usable history; never fill a strategy gap.
@@ -274,6 +329,8 @@ def paper_result(snapshot, now, source):
             if contiguous and _utc(contiguous[0]["time"]) - _utc(bar["time"]) != timedelta(minutes=15):
                 break
             contiguous.insert(0, bar)
+        if source == "mt5":
+            return mtf_runtime.evaluate_feed(payload, now), label, identity
         return paper_signals.analyze_paper_signal(contiguous, now=now), label, identity
     except (KeyError, TypeError, ValueError, OverflowError):
         return {"state": "invalid", "candle_count": 0}, label, identity
@@ -296,12 +353,16 @@ class MarketService:
         self.next_reference_at = 0.0
         self.journal_enabled = False
         self.trading_enabled = False
+        self.manual_tickets_enabled = (
+            self.source == "mt5"
+            and os.getenv("MT5_MANUAL_TICKETS_ENABLED", "false").strip().lower() == "true"
+        )
         self.review_lock = asyncio.Lock()
         self.news_source = os.getenv("NEWS_SOURCE", "rss").strip().lower()
         if self.news_source not in {"rss", "openai"}:
             raise ValueError("Unsupported news source")
         self.openai_enabled = os.getenv("OPENAI_ENABLED", "false").strip().lower() == "true"
-        self.trade_minutes = 15
+        self.trade_minutes = 60 if self.source == "mt5" else 15
 
     async def refresh_reference(self):
         async with self.reference_lock:
@@ -364,7 +425,7 @@ class MarketService:
             previous = await market_store.get_cache(self.pool, self.bot_id, "paper_setup")
             if previous is not None and previous["payload"].get("id") == signal_id:
                 frozen = previous["payload"].get("result")
-                if isinstance(frozen, dict) and frozen.get("state") == "signal":
+                if isinstance(frozen, dict) and frozen.get("state") == "signal" and (self.source != "mt5" or mtf_runtime.eligible_result(frozen, utc_now())):
                     result = frozen
             else:
                 await market_store.save_cache(
@@ -372,9 +433,14 @@ class MarketService:
                     {"id": signal_id, "result": result}, utc_now(),
                 )
         if self.source == "mt5":
+            if result.get("state") == "signal" and (snapshot is None or not mtf_runtime.eligible_payload(
+                dict(result, workflow="manual_ticket"), snapshot.get("payload"), utc_now(),
+            )):
+                result, signal_id = mtf_runtime.blocked(), None
             text = chart_analysis.format_chart_proposal(
                 result, symbol=source.removeprefix("MetaTrader 5 — "),
                 execution_enabled=self.trading_enabled,
+                manual_ticket_enabled=self.manual_tickets_enabled,
             )
         else:
             text = paper_signals.format_paper_signal(result, source=source)
@@ -427,7 +493,7 @@ class MarketService:
 
     async def review_trades(self):
         """Advance durable paper setups from actual post-send quote samples."""
-        if not self.journal_enabled:
+        if self.source == "mt5" or not self.journal_enabled:
             return
         async with self.review_lock:
             now = utc_now()
@@ -462,7 +528,7 @@ class MarketService:
                     logger.warning("Paper review skipped invalid observations or journal row.")
 
     async def send_reviews(self, bot):
-        if not self.journal_enabled:
+        if self.source == "mt5" or not self.journal_enabled:
             return True
         for row in await journal_store.list_reviews(self.pool, self.bot_id):
             try:
@@ -488,7 +554,7 @@ class MarketService:
         return True
 
     async def risk_pause(self, chat_id):
-        if not self.journal_enabled:
+        if self.source == "mt5" or not self.journal_enabled:
             return None
         identity = await self.source_identity()
         history = await journal_store.recent_trades(self.pool, self.bot_id, chat_id, limit=20)
@@ -519,6 +585,55 @@ class MarketService:
             return lease_id is None or await market_store.delivery_active(
                 self.pool, self.bot_id, chat_id, lease_id, utc_now()
             )
+        if self.source == "mt5":
+            result, signal_text, signal_id = await self.signals()
+            until = await self.risk_pause(chat_id)
+            if until is not None:
+                result, signal_id, signal_text = {"state": "blocked", "reason": "risk_pause"}, None, _pause_text(until)
+            delivery_key = f"mtf_status:{chat_id}"
+            previous = await market_store.get_cache(self.pool, self.bot_id, delivery_key)
+            current = await market_store.get_cache(self.pool, self.bot_id, "broker_feed") if result.get("state") == "signal" else None
+            if not await may_send():
+                return
+            offered, device = None, None
+            if result.get("state") == "signal" and self.manual_tickets_enabled and signal_id and current is not None:
+                try:
+                    device_id = UUID(current["payload"]["device_id"])
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    device_id = None
+                if device_id is not None:
+                    device = await trade_store.get_device(self.pool, self.bot_id, device_id)
+                    if device is not None and device.get("owner_chat_id") == chat_id and device.get("owner_user_id") == chat_id:
+                        offered = await manual_ticket_store.get_chart_offer(self.pool, self.bot_id, device_id, utc_now())
+                    # The lookup may outlast the entry window or a new feed.
+                    current = await market_store.get_cache(self.pool, self.bot_id, "broker_feed")
+                    if not await may_send():
+                        return
+            # Recheck after storage/consent awaits. Never deliver stale text or
+            # let a legacy signal supplied by a caller bypass qualification.
+            if result.get("state") == "signal":
+                candidate = dict(result, workflow="manual_ticket")
+                if current is None or not mtf_runtime.eligible_payload(candidate, current.get("payload"), utc_now()):
+                    result, signal_id = mtf_runtime.blocked(), None
+                elif (
+                    offered is not None and offered.get("signal_id") == signal_id
+                    and proposal_overlay.build_chart_overlay(offered, device, current.get("payload"), utc_now()) is not None
+                ):
+                    # A published, currently valid owner-bound offer already
+                    # contains this proposal. Waiting/blocked reports still flow.
+                    if previous is None or previous["payload"].get("token") != signal_id:
+                        await market_store.save_cache(self.pool, self.bot_id, delivery_key, {"token": signal_id}, utc_now())
+                    return
+            if until is None:
+                signal_text = chart_analysis.format_chart_proposal(
+                    result, manual_ticket_enabled=self.manual_tickets_enabled,
+                )
+            token = signal_id or f"{result.get('state')}:{result.get('reason')}"
+            if previous is not None and previous["payload"].get("token") == token:
+                return
+            await bot.send_message(chat_id, signal_text, parse_mode=None)
+            await market_store.save_cache(self.pool, self.bot_id, delivery_key, {"token": token}, utc_now())
+            return
         text = await self.market()
         if not await may_send():
             return
@@ -574,7 +689,7 @@ async def send_news(bot, chat_id, briefing, may_send=None):
 
 async def _worker(application, service):
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(5 if service.source == "mt5" else 60)
         if not application.running:
             continue
         try:
@@ -592,8 +707,9 @@ async def _worker(application, service):
                     pass
             if not await service.send_reviews(application.bot):
                 continue
-            if service.trading_enabled:
-                await trade_store.expire_offers(service.pool, service.bot_id, utc_now())
+            if service.trading_enabled or service.manual_tickets_enabled:
+                store = manual_ticket_store if service.manual_tickets_enabled else trade_store
+                await store.expire_offers(service.pool, service.bot_id, utc_now())
                 if not await mt5_notifications.send_results(service, application.bot):
                     continue
                 if not await mt5_notifications.send_offers(service, application.bot):
@@ -608,8 +724,9 @@ async def _worker(application, service):
                     ):
                         continue
                     await service.send_report(application.bot, chat_id, lease_id)
+                    delivery_kwargs = {"interval": market_store.MTF_DELIVERY_INTERVAL} if service.source == "mt5" else {}
                     await market_store.mark_delivered(
-                        service.pool, service.bot_id, chat_id, lease_id, utc_now()
+                        service.pool, service.bot_id, chat_id, lease_id, utc_now(), **delivery_kwargs
                     )
                 except Forbidden:
                     await market_store.disable_subscription(
@@ -638,12 +755,11 @@ async def setup(application):
         await market_store.initialize_schema(pool)
         await journal_store.initialize_schema(pool)
         await trade_store.initialize_schema(pool)
+        await manual_ticket_store.initialize_schema(pool)
         service = MarketService(pool, application.bot.id)
         service.journal_enabled = True
-        service.trading_enabled = (
-            service.source == "mt5"
-            and os.getenv("MT5_TRADING_ENABLED", "false").strip().lower() == "true"
-        )
+        # Every new trade remains a human click inside the native MT5 ticket.
+        service.trading_enabled = False
         application.bot_data[SERVICE_KEY] = service
         # Do not use Application.create_task for an endless worker: stop() waits
         # for those tasks. This task is explicitly canceled before client shutdown.
@@ -694,12 +810,21 @@ async def market_command(update, context):
     service.active_users.add(actor)
     service.market_command_times[actor] = now
     try:
-        chart_text = await service.market()
-        _, signal_text, _ = await service.signals()
-        until = await service.risk_pause(actor)
-        if until is not None:
-            signal_text = _pause_text(until)
-        await update.effective_message.reply_text(chart_text + "\n\n" + signal_text, parse_mode=None)
+        if service.source == "mt5":
+            result, _, _ = await service.signals()
+            current = await market_store.get_cache(service.pool, service.bot_id, "broker_feed")
+            current_time = utc_now()
+            if result.get("state") == "signal" and (current is None or not mtf_runtime.eligible_payload(dict(result, workflow="manual_ticket"), current.get("payload"), current_time)):
+                result = mtf_runtime.blocked()
+            text = market_text(current, current_time, result=result, include_proposal=True)
+        else:
+            chart_text = await service.market()
+            _, signal_text, _ = await service.signals()
+            until = await service.risk_pause(actor)
+            if until is not None:
+                signal_text = _pause_text(until)
+            text = chart_text + "\n\n" + signal_text
+        await update.effective_message.reply_text(text, parse_mode=None)
     finally:
         service.active_users.discard(actor)
 
@@ -750,10 +875,15 @@ async def signals_command(update, context):
     service.active_users.add(actor)
     service.market_command_times[actor] = now
     try:
-        _, text, _ = await service.signals()
+        result, text, _ = await service.signals()
         until = await service.risk_pause(actor)
         if until is not None:
             text = _pause_text(until)
+        elif service.source == "mt5":
+            current = await market_store.get_cache(service.pool, service.bot_id, "broker_feed") if result.get("state") == "signal" else None
+            if result.get("state") == "signal" and (current is None or not mtf_runtime.eligible_payload(dict(result, workflow="manual_ticket"), current.get("payload"), utc_now())):
+                result = mtf_runtime.blocked()
+            text = chart_analysis.format_chart_proposal(result, manual_ticket_enabled=service.manual_tickets_enabled)
         await message.reply_text(text, parse_mode=None)
     finally:
         service.active_users.discard(actor)
@@ -773,12 +903,29 @@ async def reviews_command(update, context):
         return
     service.active_users.add(actor)
     try:
-        await service.review_trades()
+        historical = service.source == "mt5"
+        if not historical:
+            await service.review_trades()
         trades = await journal_store.recent_trades(service.pool, service.bot_id, actor, limit=3)
+        if historical:
+            await message.reply_text(
+                "أرشيف السجل الورقي القديم — عرض عند الطلب فقط.\n"
+                "هذه سجلات محفوظة كما كانت، ولا تُحدّث الآن. لا تخص استراتيجية M15/M5/M1 الحالية أو تقييمها لمدة 60 دقيقة، "
+                "ولا تُستخدم كأدلة لتأهيل الإشارات أو لإيقافها. /signals لعرض الحالة الحالية.",
+                parse_mode=None,
+            )
         if not trades:
-            await message.reply_text("لا توجد صفقات ورقية مسجلة بعد. /watch لتفعيل الإشارات ومراجعتها.", parse_mode=None)
+            await message.reply_text(
+                "لا توجد سجلات ورقية قديمة محفوظة في الأرشيف." if historical else
+                "لا توجد صفقات ورقية مسجلة بعد. /watch لتفعيل الإشارات ومراجعتها.", parse_mode=None,
+            )
         for trade in trades:
-            await message.reply_text(paper_journal.format_review(trade), parse_mode=None)
+            text = paper_journal.format_review(trade)
+            if historical:
+                if trade.get("status") == "open":
+                    text = text.replace("المتابعة مستمرة", "الحالة المحفوظة: مفتوح؛ المتابعة القديمة متوقفة", 1)
+                text = "سجل تاريخي كما حُفظ — لا توجد متابعة حالية لهذا السجل.\n\n" + text
+            await message.reply_text(text, parse_mode=None)
     finally:
         service.active_users.discard(actor)
 
@@ -792,8 +939,19 @@ async def watch_command(update, context):
         await message.reply_text("التقارير التلقائية تتطلب محادثة خاصة وقاعدة بيانات متصلة.")
         return
     await market_store.enable_subscription(
-        service.pool, service.bot_id, update.effective_chat.id, utc_now()
+        service.pool, service.bot_id, update.effective_chat.id, utc_now(),
+        **({"interval": market_store.MTF_DELIVERY_INTERVAL} if service.source == "mt5" else {}),
     )
+    if service.source == "mt5":
+        await message.reply_text(
+            "تم تفعيل المتابعة: M15 للاتجاه، M5 للتأكيد، وM1 لتوقيت الدخول، من شموع مكتملة وأسعار حديثة.\n"
+            "اقتراح الصفقة مشروط بتوافق الأطر وفلاتر المخاطر والسبريد والنشاط، وبأدلة خارج العينة: 200 صفقة مستقلة على الأقل والحد الأدنى لفاصل الثقة 95% ≥70% بعد التكاليف.\n"
+            "النجاح للاختبار: TP1 قبل SL خلال 60 دقيقة من الدخول؛ انتهاء المدة يُحسب غير ناجح. الأداء التاريخي لا يضمن نتيجة الصفقة.\n"
+            "إذا غابت الشروط تظهر حالة مختصرة عند تغيرها، دون تكرار التنبيه نفسه. التنفيذ يظل يدوياً لكل صفقة: تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك.\n"
+            "/market للتحليل، /signals للحالة والاقتراح المؤهل، /unwatch للإيقاف. الأخبار بطلب /news فقط.",
+            parse_mode=None,
+        )
+        return
     await message.reply_text(
         "تم تفعيل تحليل شارت XAUUSD كل 15 دقيقة. أول تقرير خلال 15 دقيقة.\n"
         "يشمل اتجاه الشارت، الدعوم والمقاومات المرصودة، وEMA9/21 وATR14.\n"
@@ -802,7 +960,11 @@ async def watch_command(update, context):
         "مدة الصفقة الورقية 15 دقيقة، مع مراجعة النتيجة وملاحظات محفوظة.\n"
         "استخدم /market للتحليل والاقتراح الآن، و/signals للاقتراح، و/reviews للنتائج، "
         "و/unwatch لإيقاف التقارير.\n"
-        "الأخبار عند طلب /news فقط. التنفيذ على MT5 يتطلب موافقتك على الطلب."
+        "الأخبار عند طلب /news فقط. "
+        + (
+            "زر «جهّز على اللابتوب» يجهّز نافذة MT5 مع TP وSL؛ التنفيذ يتم حين تضغط Buy أو Sell بنفسك على اللابتوب."
+            if service.manual_tickets_enabled else "التنفيذ على MT5 يتطلب موافقتك على الطلب."
+        )
     )
 
 
@@ -819,9 +981,13 @@ async def unwatch_command(update, context):
     )
     if service.trading_enabled:
         await trade_store.cancel_offers(service.pool, service.bot_id, update.effective_chat.id, utc_now())
+    if service.manual_tickets_enabled:
+        await manual_ticket_store.cancel_offers(service.pool, service.bot_id, update.effective_chat.id, utc_now())
     text = "تم إيقاف التقارير التلقائية. /watch لإعادة التفعيل."
     if service.trading_enabled:
         text += "\nأُلغيت طلبات MT5 المعلقة. الطلب الذي بدأ تنفيذه والصفقات المفتوحة يجب متابعتها داخل MT5؛ سيصلك إشعار نتيجة التنفيذ."
+    if service.manual_tickets_enabled:
+        text += "\nأُلغيت طلبات تجهيز MT5 المعلقة. راجع وأغلق بنفسك أي نافذة صفقة سبق تجهيزها على اللابتوب؛ /unwatch لا يغلقها."
     await message.reply_text(text)
 
 
@@ -838,14 +1004,20 @@ def register_handlers(application):
 def install_feed_route(app, application, settings):
     mt5_api.install_routes(app, application, settings)
     async def ingest(request: Request):
-        key = getattr(settings, "market_bridge_key", "")
-        if len(key) < 32:
+        service = application.bot_data.get(SERVICE_KEY)
+        manual_flag = getattr(service, "manual_tickets_enabled", None)
+        if manual_flag is not None and type(manual_flag) is not bool:
+            return JSONResponse({"detail": "Market feed is not configured"}, status_code=404)
+        # The configured manual mode must never fall back to the legacy key,
+        # including requests arriving before the market service is available.
+        manual = manual_flag is True or os.getenv("MT5_MANUAL_TICKETS_ENABLED", "false").strip().lower() == "true"
+        key = os.getenv("MT5_MANUAL_BRIDGE_KEY", "") if manual else getattr(settings, "market_bridge_key", "")
+        if not isinstance(key, str) or len(key) < 32:
             return JSONResponse({"detail": "Market feed is not configured"}, status_code=404)
         expected = ("Bearer " + key).encode("utf-8")
         supplied = request.headers.get("authorization", "").encode("utf-8")
         if not hmac.compare_digest(expected, supplied):
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-        service = application.bot_data.get(SERVICE_KEY)
         if service is None:
             return JSONResponse({"detail": "Market service unavailable"}, status_code=503)
         size, parts = 0, []
@@ -865,8 +1037,9 @@ def install_feed_route(app, application, settings):
                 )
                 if device is None or device["symbol"] != cleaned["symbol"]:
                     raise ValueError("Unregistered market device")
+            cleaned = validate_feed(cleaned, utc_now(), os.getenv("MARKET_GOLD_SYMBOL", "XAUUSD").strip())
         except (ValueError, TypeError, UnicodeDecodeError, OverflowError):
-            return JSONResponse({"detail": "Invalid M15 broker data"}, status_code=422)
+            return JSONResponse({"detail": "Invalid broker data"}, status_code=422)
         accepted = await market_store.save_feed_cache(
             service.pool, service.bot_id, "broker_feed", cleaned, utc_now(),
             _utc(cleaned["quote"]["time"]),

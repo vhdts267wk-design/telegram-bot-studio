@@ -13,9 +13,11 @@ from telegram import Chat, Message, User
 from telegram.error import Forbidden, RetryAfter
 
 from bot import mt5_notifications as notifications
+from bot import mtf_runtime
+from tests.test_mtf_runtime import pinned_synthetic_evidence, synthetic_case
 
 
-NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+NOW = synthetic_case()[2]
 BOT_ID, OWNER_ID, MESSAGE_ID = 999, 101, 77
 DEVICE_ID = UUID("12345678-1234-5678-1234-567812345678")
 OFFER_ID = UUID("87654321-4321-8765-4321-876543218765")
@@ -30,41 +32,26 @@ def device():
 
 
 def signal():
-    return {
-        "state": "signal", "strategy_id": "ema9-21-atr14-v1",
-        "bar_time": "2026-10-04T11:45:00Z", "direction": "BUY",
-        "entry": 100.0, "stop": 97.0, "target": 106.0,
-    }
+    return mtf_runtime.evaluate_feed(synthetic_case()[0], NOW)
 
 
 def offer(status="offered"):
-    payload = signal()
+    payload = notifications._normalise_signal(signal(), synthetic_case()[0])
     payload.update(symbol="XAUUSD", account_mode="demo", volume=0.01, max_drift_r=0.1,
-                   price_digits=3, original_stop_distance=3.0,
-                   execution={"tick_size": 0.001, "point": 0.001, "digits": 3, "stops_level": 0})
+                   workflow="manual_ticket")
     return {
         "id": OFFER_ID, "bot_id": BOT_ID, "device_id": DEVICE_ID,
         "chat_id": OWNER_ID, "user_id": OWNER_ID, "signal_id": "f" * 64,
         "payload": payload, "status": status, "message_id": MESSAGE_ID,
-        "created_at": NOW - timedelta(minutes=1), "expires_at": NOW + timedelta(minutes=5),
+        "created_at": NOW, "expires_at": NOW + timedelta(minutes=5),
         "result": None, "decided_at": None, "executing_at": None,
     }
 
 
 def snapshot():
-    return {
-        "updated_at": NOW,
-        "payload": {
-            "symbol": "XAUUSD", "timeframe": "M15", "source": "MetaTrader 5", "device_id": str(DEVICE_ID),
-            "quote": {"bid": 100.0, "ask": 100.2, "time": NOW.isoformat()},
-            "execution": {"tick_size": 0.001, "point": 0.001, "digits": 3, "stops_level": 0},
-            "candles": [
-                {"time": (NOW - timedelta(minutes=15 * (22 - i))).isoformat(),
-                 "open": 100.0, "high": 102.0, "low": 98.0, "close": 100.0, "tick_volume": 100}
-                for i in range(22)
-            ],
-        },
-    }
+    payload = synthetic_case()[0]
+    payload["device_id"] = str(DEVICE_ID)
+    return {"updated_at": NOW, "payload": payload}
 
 
 def message(*, chat_id=OWNER_ID, user_id=BOT_ID, message_id=MESSAGE_ID, chat_type="private"):
@@ -73,6 +60,12 @@ def message(*, chat_id=OWNER_ID, user_id=BOT_ID, message_id=MESSAGE_ID, chat_typ
 
 class MT5NotificationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.patches = []
+        self.start(patch.dict(notifications.os.environ, {"MARKET_GOLD_SYMBOL": "XAUUSD"}, clear=True))
+        self.enterContext(pinned_synthetic_evidence(synthetic_case()[0], NOW))
+        # The shared evidence fixture freezes the default clock; explicit
+        # callback/result clocks must still exercise real temporal admission.
+        self.start(patch.object(mtf_runtime, "_clock", side_effect=lambda now=None: NOW if now is None else now))
         self.device, self.offer, self.snapshot = device(), offer(), snapshot()
         self.service = SimpleNamespace(
             pool=object(), bot_id=BOT_ID, source="mt5", trading_enabled=True,
@@ -87,7 +80,6 @@ class MT5NotificationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.update = SimpleNamespace(callback_query=self.query, effective_message=None, effective_user=self.query.from_user)
         self.bot = SimpleNamespace(send_message=AsyncMock(return_value=message()), edit_message_reply_markup=AsyncMock())
-        self.patches = []
         self.store = {}
         defaults = {
             "get_offer": None, "get_device": None, "decide": None, "pair_device": None,
@@ -104,7 +96,6 @@ class MT5NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.disabled = self.start(patch.object(notifications.market_store, "disable_subscription", new_callable=AsyncMock))
         self.reply = self.start(patch.object(Message, "reply_text", new_callable=AsyncMock))
         self.start(patch.object(notifications.market_monitor, "utc_now", return_value=NOW))
-        self.start(patch.dict(notifications.os.environ, {"MARKET_GOLD_SYMBOL": "XAUUSD"}, clear=True))
         self.store["decide"].side_effect = self.decide
 
     def start(self, patcher):
@@ -122,353 +113,418 @@ class MT5NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.query.data = f"mt5:{action}:{OFFER_ID.hex}"
         await notifications.decision_callback(self.update, self.context)
 
-    async def test_authorised_accept_only_queues_and_replay_does_not_reapprove_or_claim_fill(self):
-        await self.run_callback()
-        self.assertEqual(self.offer["status"], "accepted")
-        self.assertEqual(self.store["decide"].await_args.args[-2], "accepted")
-        self.assertIn("لم يتأكد تنفيذ", self.query.answer.await_args.args[0])
-        self.assertEqual(self.query.edit_message_text.await_args.kwargs["reply_markup"], None)
-        await self.run_callback("r")
-        self.assertEqual(self.offer["status"], "accepted")
-        self.assertEqual(self.store["decide"].await_count, 1)
+
+
+class ManualMT5NotificationTests(unittest.IsolatedAsyncioTestCase):
+    start = MT5NotificationTests.start
+    decide = MT5NotificationTests.decide
+
+    def setUp(self):
+        MT5NotificationTests.setUp(self)
+        self.service.manual_tickets_enabled = True
+        self.service.trading_enabled = False
+        self.offer["payload"]["workflow"] = "manual_ticket"
+        self.offer["preparing_at"] = None
+        self.manual_store = {}
+        for name, value in {
+            "get_offer": None, "decide": None, "create_offer": None,
+            "publish_offer": True, "expire_offers": 0,
+            "list_notifications": [], "mark_notified": True,
+        }.items():
+            self.manual_store[name] = self.start(patch.object(
+                notifications.manual_ticket_store, name, new_callable=AsyncMock, return_value=value,
+            ))
+        self.manual_store["get_offer"].side_effect = lambda *args: deepcopy(self.offer)
+        self.manual_store["decide"].side_effect = self.decide
+
+    async def run_manual_callback(self, action="p"):
+        self.query.data = f"mt5manual:{action}:{OFFER_ID.hex}"
+        await notifications.manual_decision_callback(self.update, self.context)
+
+    async def prepare_manual_offer(self):
+        self.store["list_paired_devices"].return_value = [self.device]
+
+        async def create(*args):
+            self.offer = offer("draft")
+            self.offer.update(payload=deepcopy(args[6]), created_at=args[7], expires_at=args[8], message_id=None, preparing_at=None)
+            return deepcopy(self.offer)
+
+        self.manual_store["create_offer"].side_effect = create
+
+    async def test_prepare_button_only_requests_a_manual_ticket_and_replay_cannot_queue_again(self):
+        await self.run_manual_callback()
+        self.assertEqual(self.offer["status"], "requested")
+        self.assertEqual(self.manual_store["decide"].await_args.args[-2], "requested")
+        self.assertIn("TP وSL فقط", self.query.answer.await_args.args[0])
+        self.assertIn("بنفسك", self.query.answer.await_args.args[0])
+        self.assertIn("Buy أو Sell", self.query.answer.await_args.args[0])
+        await self.run_manual_callback("r")
+        self.assertEqual(self.manual_store["decide"].await_count, 1)
+        self.assertEqual(self.offer["status"], "requested")
+        self.store["decide"].assert_not_awaited()
         self.service.order_send.assert_not_awaited()
 
-    async def test_reject_remains_available_when_quote_stale_source_changes_and_risk_pause_active(self):
-        self.snapshot["payload"]["quote"]["time"] = (NOW - timedelta(hours=1)).isoformat()
+    async def test_manual_mode_rejects_old_automatic_accept_even_if_both_flags_are_true(self):
+        self.service.trading_enabled = True
+        self.query.data = f"mt5:a:{OFFER_ID.hex}"
+        await notifications.decision_callback(self.update, self.context)
+        self.assertIn("التنفيذ التلقائي متوقف", self.query.answer.await_args.args[0])
+        self.store["get_offer"].assert_not_awaited()
+        self.store["decide"].assert_not_awaited()
+        self.manual_store["decide"].assert_not_awaited()
+        self.service.order_send.assert_not_awaited()
+
+    async def test_manual_reject_stays_available_when_source_quote_or_risk_changes(self):
         self.service.source = "reference"
+        self.snapshot["payload"]["quote"]["time"] = (NOW - timedelta(hours=1)).isoformat()
         self.service.risk_pause.return_value = NOW + timedelta(minutes=45)
-        await self.run_callback("r")
+        await self.run_manual_callback("r")
         self.assertEqual(self.offer["status"], "rejected")
         self.feed.assert_not_awaited()
         self.service.risk_pause.assert_not_awaited()
-        self.service.order_send.assert_not_awaited()
-
-    async def test_concurrent_accept_reject_has_one_durable_winner(self):
-        lock = asyncio.Lock()
-        async def decide_once(*args):
-            async with lock:
-                return await self.decide(*args)
-        self.store["decide"].side_effect = decide_once
-        second = deepcopy(self.query)
-        second.data = f"mt5:r:{OFFER_ID.hex}"
-        update2 = SimpleNamespace(callback_query=second)
-        await asyncio.gather(notifications.decision_callback(self.update, self.context), notifications.decision_callback(update2, self.context))
-        self.assertIn(self.offer["status"], ("accepted", "rejected"))
-        self.service.order_send.assert_not_awaited()
-
-    async def test_wrong_owner_chat_bot_message_or_device_never_mutates_offer(self):
-        for field, value in (("user_id", 202), ("chat_id", 202), ("bot_id", 202), ("message_id", 202)):
-            with self.subTest(field=field):
-                self.offer = offer()
-                self.offer[field] = value
-                await self.run_callback()
-                self.assertEqual(self.offer["status"], "offered")
-        self.offer = offer()
-        self.device["owner_user_id"] = 202
-        await self.run_callback()
         self.store["decide"].assert_not_awaited()
-        self.assertTrue(self.query.answer.await_args.kwargs["show_alert"])
 
-    async def test_groups_inline_inaccessible_wrong_sender_and_malformed_callbacks_are_answered(self):
+    async def test_prepare_is_bound_to_owner_bot_message_device_workflow_and_active_subscription(self):
+        for field in ("chat_id", "user_id", "bot_id", "message_id"):
+            self.offer[field] = 202
+            await self.run_manual_callback()
+            self.offer[field] = {"chat_id": OWNER_ID, "user_id": OWNER_ID, "bot_id": BOT_ID, "message_id": MESSAGE_ID}[field]
+        self.device["owner_user_id"] = 202
+        await self.run_manual_callback()
+        self.device = device()
+        self.offer["payload"]["workflow"] = "automatic"
+        await self.run_manual_callback()
+        self.offer["payload"]["workflow"] = "manual_ticket"
+        self.store["subscription_active"].return_value = False
+        await self.run_manual_callback()
+        self.manual_store["decide"].assert_not_awaited()
+        self.assertEqual(self.offer["status"], "offered")
+
+    async def test_prepare_obeys_strict_cache_device_freshness_quote_skew_and_risk_pause(self):
+        for condition in ("old_quote", "future_quote", "future_receipt", "old_device", "risk_pause"):
+            self.snapshot, self.device = snapshot(), device()
+            self.service.risk_pause.return_value = None
+            if condition == "old_quote":
+                self.snapshot["payload"]["quote"]["time"] = (NOW - timedelta(minutes=4)).isoformat()
+            elif condition == "future_quote":
+                self.snapshot["payload"]["quote"]["time"] = (NOW + timedelta(seconds=6)).isoformat()
+            elif condition == "future_receipt":
+                self.snapshot["updated_at"] = NOW + timedelta(seconds=1)
+            elif condition == "old_device":
+                self.device["last_seen_at"] = NOW - timedelta(minutes=4)
+            else:
+                self.service.risk_pause.return_value = NOW + timedelta(minutes=15)
+            with self.subTest(condition=condition):
+                await self.run_manual_callback()
+                self.assertEqual(self.offer["status"], "offered")
+        self.manual_store["decide"].assert_not_awaited()
+        self.snapshot, self.device = snapshot(), device()
+        self.snapshot["payload"]["quote"]["time"] = (NOW + timedelta(seconds=3)).isoformat()
+        self.service.risk_pause.return_value = None
+        await self.run_manual_callback()
+        self.assertEqual(self.offer["status"], "requested")
+
+    async def test_manual_offer_uses_separate_store_and_buttons_and_does_not_duplicate_requested_ticket(self):
+        await self.prepare_manual_offer()
+        await notifications.send_offers(self.service, self.bot)
+        self.manual_store["publish_offer"].assert_awaited_once_with(self.service.pool, BOT_ID, OFFER_ID, MESSAGE_ID, NOW)
+        payload = self.manual_store["create_offer"].await_args.args[6]
+        self.assertEqual(self.manual_store["create_offer"].await_args.args[8], NOW + timedelta(seconds=10))
+        self.assertEqual(payload["workflow"], "manual_ticket")
+        self.assertEqual((payload["stop"], payload["target"]), (signal()["stop"], signal()["target"]))
+        sent = self.bot.send_message.await_args
+        for text in ("Demo", "0.01", "TP", "SL", "لا يرسل صفقة", "بنفسك"):
+            self.assertIn(text, sent.args[1])
+        self.assertIn("منطقة الدخول:", sent.args[1])
+        for detail in ("TP2", "M15", "M5", "M1", "عشر ثوانٍ", "60 دقيقة", "الأداء التاريخي لا يضمن"):
+            self.assertIn(detail, sent.args[1])
+        buttons = sent.kwargs["reply_markup"].inline_keyboard[0]
+        self.assertEqual(buttons[0].text, "جهّز على اللابتوب")
+        for button in buttons:
+            self.assertIsNotNone(notifications.MANUAL_CALLBACK_PATTERN.fullmatch(button.callback_data))
+            self.assertLessEqual(len(button.callback_data.encode()), 64)
+        self.manual_store["create_offer"].side_effect = None
+        self.offer["status"] = "requested"
+        self.manual_store["create_offer"].return_value = deepcopy(self.offer)
+        await notifications.send_offers(self.service, self.bot)
+        self.assertEqual(self.bot.send_message.await_count, 1)
+        self.store["create_offer"].assert_not_awaited()
+        self.store["publish_offer"].assert_not_awaited()
+        self.service.order_send.assert_not_awaited()
+
+    async def test_manual_pairing_explains_human_native_buy_sell_with_auto_disabled(self):
+        self.update.effective_message = message(user_id=OWNER_ID)
+        self.context.args = ["AB12CD34EF56"]
+        self.store["pair_device"].return_value = self.device
+        await notifications.connect_mt5_command(self.update, self.context)
+        self.enabled.assert_awaited_once()
+        text = self.reply.await_args.args[0]
+        self.assertIn("جهّز على اللابتوب", text)
+        self.assertIn("Buy أو Sell بنفسك", text)
+        self.assertNotIn("Accept", text)
+
+    async def test_manual_results_distinguish_prepared_failed_unknown_and_never_claim_order_fill(self):
+        for status in ("prepared", "failed", "unknown", "filled"):
+            current = deepcopy(self.offer)
+            current.update(status=status, preparing_at=NOW, result={"status": status, "order_ticket": 123456})
+            self.manual_store["list_notifications"].return_value = [current]
+            await notifications.send_results(self.service, self.bot)
+            text = self.bot.send_message.await_args.args[1]
+            self.assertNotIn("أكد MT5 تنفيذ", text)
+            self.assertNotIn("123456", text)
+            if status == "prepared":
+                self.assertIn("تم تجهيز", text)
+                self.assertIn("Buy أو Sell بنفسك", text)
+                self.assertIn("لم تُرسل صفقة", text)
+                self.assertIn("القرار والتنفيذ يدويان", text)
+                self.assertIn("الأداء التاريخي لا يضمن", text)
+                self.assertIn("إذا كانت مهلة الدخول ما زالت مفتوحة", text)
+            elif status == "failed":
+                self.assertIn("تعذّر تجهيز", text)
+            else:
+                self.assertIn("غير مؤكدة", text)
+        self.assertEqual(self.manual_store["mark_notified"].await_count, 4)
+        self.store["list_notifications"].assert_not_awaited()
+        self.store["mark_notified"].assert_not_awaited()
+        self.service.order_send.assert_not_awaited()
+
+    def test_prepared_receipt_cannot_extend_absolute_m1_window_or_missing_clocks(self):
+        current = deepcopy(self.offer)
+        current.update(status="prepared", preparing_at=NOW, result={"status": "prepared"})
+        # This fixture deliberately retains the old five-minute offer expiry.
+        # A new receipt must not make its ten-second M1 admission valid again.
+        current["completed_at"] = NOW + timedelta(seconds=11)
+        fresh = notifications._manual_result_text(current, NOW + timedelta(seconds=10))
+        self.assertIn("Buy أو Sell بنفسك", fresh)
+        for stamp in (NOW - timedelta(seconds=1), NOW + timedelta(seconds=10, microseconds=1), NOW + timedelta(seconds=11)):
+            with self.subTest(stamp=stamp):
+                text = notifications._manual_result_text(current, stamp)
+                self.assertIn("ألغِ", text)
+                self.assertIn("انتظر فرصة جديدة", text)
+                self.assertNotIn("Buy", text)
+                self.assertNotIn("Sell", text)
+        for field in ("bar_time", "decision_time"):
+            malformed = deepcopy(current)
+            malformed["payload"].pop(field)
+            with self.subTest(missing_clock=field):
+                text = notifications._manual_result_text(malformed, NOW)
+                self.assertIn("ألغِ", text)
+                self.assertNotIn("Buy", text)
+
+    async def test_result_delivery_rechecks_window_after_device_lookup(self):
+        current = deepcopy(self.offer)
+        current.update(status="prepared", preparing_at=NOW, result={"status": "prepared"})
+        self.manual_store["list_notifications"].return_value = [current]
+        clock = [NOW]
+
+        async def delayed_device(*args):
+            clock[0] = NOW + timedelta(seconds=11)
+            return deepcopy(self.device)
+
+        self.store["get_device"].side_effect = delayed_device
+        with patch.object(notifications.market_monitor, "utc_now", side_effect=lambda: clock[0]):
+            await notifications.send_results(self.service, self.bot)
+        text = self.bot.send_message.await_args.args[1]
+        self.assertIn("ألغِ", text)
+        self.assertIn("انتظر فرصة جديدة", text)
+        self.assertNotIn("Buy", text)
+        self.manual_store["mark_notified"].assert_awaited_once()
+        self.manual_store["decide"].assert_not_awaited()
+        self.service.order_send.assert_not_awaited()
+
+    async def test_old_prepared_button_replaces_stale_buy_sell_instructions(self):
+        self.offer.update(status="prepared", preparing_at=NOW, result={"status": "prepared"})
+        self.query.message = Message(
+            MESSAGE_ID, NOW, Chat(OWNER_ID, "private"), from_user=User(BOT_ID, "synthetic", True),
+            text="اقتراح قديم: اضغط Buy أو Sell بنفسك داخل MT5.",
+        )
+        with patch.object(notifications.market_monitor, "utc_now", return_value=NOW + timedelta(seconds=11)):
+            await self.run_manual_callback()
+        for text in (self.query.answer.await_args.args[0], self.query.edit_message_text.await_args.args[0]):
+            self.assertIn("ألغِ", text)
+            self.assertIn("انتظر فرصة جديدة", text)
+            self.assertNotIn("Buy", text)
+            self.assertNotIn("Sell", text)
+        self.assertIsNone(self.query.edit_message_text.await_args.kwargs["reply_markup"])
+        self.manual_store["decide"].assert_not_awaited()
+        self.feed.assert_not_awaited()
+        self.service.order_send.assert_not_awaited()
+
+    async def test_callback_edit_rechecks_window_after_telegram_acknowledgement(self):
+        self.offer.update(status="prepared", preparing_at=NOW, result={"status": "prepared"})
+        clock = [NOW]
+
+        async def delayed_answer(*args, **kwargs):
+            clock[0] = NOW + timedelta(seconds=11)
+
+        self.query.answer.side_effect = delayed_answer
+        with patch.object(notifications.market_monitor, "utc_now", side_effect=lambda: clock[0]):
+            await self.run_manual_callback()
+        self.assertIn("تجهيز", self.query.answer.await_args.args[0])
+        self.assertIn("الأداء التاريخي لا يضمن", self.query.answer.await_args.args[0])
+        edited = self.query.edit_message_text.await_args.args[0]
+        self.assertIn("ألغِ", edited)
+        self.assertNotIn("Buy", edited)
+        self.manual_store["decide"].assert_not_awaited()
+
+    async def test_lost_decision_race_uses_current_prepared_window_for_acknowledgement(self):
+        clock = [NOW]
+
+        async def already_prepared(*args):
+            self.offer.update(status="prepared", preparing_at=NOW, result={"status": "prepared"})
+            clock[0] = NOW + timedelta(seconds=11)
+            return None
+
+        self.manual_store["decide"].side_effect = already_prepared
+        with patch.object(notifications.market_monitor, "utc_now", side_effect=lambda: clock[0]):
+            await self.run_manual_callback()
+        self.manual_store["decide"].assert_awaited_once()
+        self.assertIn("ألغِ", self.query.answer.await_args.args[0])
+        self.assertNotIn("Buy", self.query.edit_message_text.await_args.args[0])
+        self.service.order_send.assert_not_awaited()
+
+    async def test_expired_or_cancelled_button_removes_original_execution_instructions(self):
+        for status in ("expired", "cancelled"):
+            with self.subTest(status=status):
+                self.offer["status"] = status
+                self.query.message = Message(
+                    MESSAGE_ID, NOW, Chat(OWNER_ID, "private"), from_user=User(BOT_ID, "synthetic", True),
+                    text="اقتراح قديم: اضغط Buy أو Sell بنفسك داخل MT5.",
+                )
+                await self.run_manual_callback()
+                edited = self.query.edit_message_text.await_args.args[0]
+                self.assertIn("ألغِ", edited)
+                self.assertIn("انتظر فرصة جديدة", edited)
+                self.assertNotIn("Buy", edited)
+        self.manual_store["decide"].assert_not_awaited()
+
+    async def test_inconsistent_prepared_result_is_unknown_and_notification_failure_is_not_acknowledged(self):
+        current = deepcopy(self.offer)
+        current.update(status="prepared", preparing_at=NOW, result={"status": "failed"})
+        self.manual_store["list_notifications"].return_value = [current]
+        await notifications.send_results(self.service, self.bot)
+        self.assertIn("غير مؤكدة", self.bot.send_message.await_args.args[1])
+        self.manual_store["mark_notified"].reset_mock()
+        self.bot.send_message.side_effect = RetryAfter(10)
+        self.assertFalse(await notifications.send_results(self.service, self.bot))
+        self.manual_store["mark_notified"].assert_not_awaited()
+
+    async def test_automatic_mode_cannot_request_manual_ticket(self):
+        self.service.manual_tickets_enabled = False
+        self.service.trading_enabled = True
+        await self.run_manual_callback()
+        self.manual_store["get_offer"].assert_not_awaited()
+        self.manual_store["decide"].assert_not_awaited()
+
+    async def test_exact_expiry_and_unwatch_cannot_request_preparation(self):
+        self.offer["expires_at"] = NOW
+        await self.run_manual_callback()
+        self.assertIn("انتهت", self.query.answer.await_args.args[0])
+        self.offer = offer()
+        self.store["subscription_active"].return_value = False
+        await self.run_manual_callback()
+        self.manual_store["decide"].assert_not_awaited()
+
+    async def test_groups_inline_wrong_sender_and_malformed_callbacks_never_read_offer(self):
         cases = (
             {"message": message(chat_type="group")}, {"message": None},
             {"message": SimpleNamespace(chat=Chat(OWNER_ID, "private"), message_id=MESSAGE_ID)},
             {"inline_message_id": "inline-id"}, {"message": message(user_id=202)},
             {"from_user": User(202, "other", False)},
-            {"data": "mt5:a:" + "x" * 64}, {"data": "mt5:x:" + OFFER_ID.hex}, {"data": 42},
+            {"data": "mt5manual:p:" + "x" * 64}, {"data": "mt5manual:x:" + OFFER_ID.hex}, {"data": 42},
         )
         baseline = dict(vars(self.query))
+        baseline["data"] = f"mt5manual:p:{OFFER_ID.hex}"
         for changes in cases:
             with self.subTest(changes=list(changes)):
                 self.query.__dict__.update(baseline)
                 self.query.__dict__.update(changes)
-                await notifications.decision_callback(self.update, self.context)
-        self.store["get_offer"].assert_not_awaited()
-        self.store["decide"].assert_not_awaited()
+                await notifications.manual_decision_callback(self.update, self.context)
+        self.manual_store["get_offer"].assert_not_awaited()
+        self.manual_store["decide"].assert_not_awaited()
         self.assertEqual(self.query.answer.await_count, len(cases))
 
-    async def test_exact_expiry_inactive_subscription_and_paused_risk_block_accept(self):
-        self.offer["expires_at"] = NOW
-        await self.run_callback()
-        self.assertIn("انتهت", self.query.answer.await_args.args[0])
-        self.offer = offer()
-        self.store["subscription_active"].return_value = False
-        await self.run_callback()
-        self.store["subscription_active"].return_value = True
-        self.service.risk_pause.return_value = NOW + timedelta(minutes=45)
-        await self.run_callback()
-        self.store["decide"].assert_not_awaited()
-
-    async def test_original_quote_receipt_and_device_heartbeat_must_all_be_fresh(self):
-        for kind in ("quote", "receipt", "device", "future"):
-            with self.subTest(kind=kind):
-                self.snapshot, self.device = snapshot(), device()
-                if kind == "quote":
-                    self.snapshot["payload"]["quote"]["time"] = (NOW - timedelta(seconds=181)).isoformat()
-                elif kind == "receipt":
-                    self.snapshot["updated_at"] = NOW - timedelta(seconds=181)
-                elif kind == "device":
-                    self.device["last_seen_at"] = NOW - timedelta(seconds=181)
-                else:
-                    self.snapshot["payload"]["quote"]["time"] = (NOW + timedelta(seconds=6)).isoformat()
-                await self.run_callback()
-        self.store["decide"].assert_not_awaited()
-
-    async def test_quote_clock_skew_is_bounded_independently_of_receipt_and_heartbeat(self):
-        for seconds, allowed in ((5, True), (6, False), (-180, True), (-181, False)):
-            with self.subTest(seconds=seconds):
-                data = snapshot()
-                data["payload"]["quote"]["time"] = (NOW + timedelta(seconds=seconds)).isoformat()
-                self.assertEqual(notifications._fresh_feed(data, device(), NOW) is not None, allowed)
-        for field in ("receipt", "heartbeat"):
-            with self.subTest(field=field):
-                data, bound_device = snapshot(), device()
-                data["payload"]["quote"]["time"] = (NOW + timedelta(seconds=3)).isoformat()
-                if field == "receipt":
-                    data["updated_at"] = NOW + timedelta(seconds=1)
-                else:
-                    bound_device["last_seen_at"] = NOW + timedelta(seconds=1)
-                self.assertIsNone(notifications._fresh_feed(data, bound_device, NOW))
-
-    async def test_source_symbol_device_and_changed_account_settings_block_accept(self):
-        self.service.source = "reference"
-        await self.run_callback()
-        self.service.source = "mt5"
-        self.snapshot["payload"]["device_id"] = str(UUID(int=1))
-        await self.run_callback()
-        self.snapshot = snapshot()
-        self.snapshot["payload"]["symbol"] = "XAUUSD.m"
-        await self.run_callback()
-        self.snapshot = snapshot()
-        self.device["volume"] = 0.02
-        await self.run_callback()
-        self.device = device()
-        self.device["account_mode"] = "real"
-        await self.run_callback()
-        self.store["decide"].assert_not_awaited()
-
-    async def test_slow_approval_work_cannot_use_snapshot_that_has_become_stale(self):
-        with patch.object(notifications.market_monitor, "utc_now", side_effect=[NOW, NOW + timedelta(minutes=4)]):
-            await self.run_callback()
-        self.store["decide"].assert_not_awaited()
-
-    async def test_store_failure_and_message_edit_failure_do_not_echo_private_errors_or_change_replay(self):
-        self.store["decide"].side_effect = RuntimeError("PRIVATE credentials")
-        with self.assertLogs(notifications.logger, level="WARNING") as logs:
-            await self.run_callback()
-        self.assertNotIn("PRIVATE", " ".join(logs.output))
-        self.assertNotIn("PRIVATE", self.query.answer.await_args.args[0])
-        self.store["decide"].side_effect = self.decide
-        self.query.edit_message_text.side_effect = RuntimeError("PRIVATE url")
-        with self.assertLogs(notifications.logger, level="WARNING"):
-            await self.run_callback()
-            await self.run_callback("r")
-        self.assertEqual(self.offer["status"], "accepted")
-        self.assertEqual(self.store["decide"].await_count, 2)
-
-    async def test_pairing_hashes_normalised_short_code_and_enables_owner_subscription(self):
-        self.update.effective_message = message(user_id=OWNER_ID)
-        self.context.args = ["ab12-cd34", "ef56"]
-        self.store["pair_device"].return_value = self.device
-        await notifications.connect_mt5_command(self.update, self.context)
-        self.assertEqual(self.store["pair_device"].await_args.args[2], hashlib.sha256(b"AB12CD34EF56").hexdigest())
-        self.enabled.assert_awaited_once_with(self.service.pool, BOT_ID, OWNER_ID, NOW)
-        self.assertIn("Demo", self.reply.await_args.args[0])
-        self.assertIn("0.01", self.reply.await_args.args[0])
-        self.assertNotIn("AB12", self.reply.await_args.args[0])
-
-    async def test_bad_used_expired_codes_and_public_pairing_do_not_subscribe(self):
-        self.update.effective_message = message(user_id=OWNER_ID)
-        for args in ([], ["short"], ["x" * 65], ["invalid!"]):
-            self.context.args = args
-            await notifications.connect_mt5_command(self.update, self.context)
-        self.store["pair_device"].assert_not_awaited()
-        self.context.args = ["AB12CD34EF56"]
-        await notifications.connect_mt5_command(self.update, self.context)
-        self.update.effective_message = message(user_id=OWNER_ID, chat_type="group")
-        await notifications.connect_mt5_command(self.update, self.context)
-        self.enabled.assert_not_awaited()
-
-    async def prepare_offer(self):
-        self.store["list_paired_devices"].return_value = [self.device]
-        async def create(*args):
-            self.offer = offer("draft")
-            self.offer.update(payload=deepcopy(args[6]), created_at=args[7], expires_at=args[8], message_id=None)
-            return deepcopy(self.offer)
-        self.store["create_offer"].side_effect = create
-
-    async def test_offer_is_draft_before_send_binds_message_and_displays_demo_lot_drift_and_short_callbacks(self):
-        await self.prepare_offer()
-        async def send(*args, **kwargs):
-            self.store["create_offer"].assert_awaited_once()
-            self.store["publish_offer"].assert_not_awaited()
-            return message()
-        self.bot.send_message.side_effect = send
-        self.assertTrue(await notifications.send_offers(self.service, self.bot))
-        self.store["publish_offer"].assert_awaited_once_with(self.service.pool, BOT_ID, OFFER_ID, MESSAGE_ID, NOW)
-        sent = self.bot.send_message.await_args
-        for phrase in ("Demo", "0.01", "0.1R", "مرجعي", "لا يؤكد"):
-            self.assertIn(phrase, sent.args[1])
-        for button in sent.kwargs["reply_markup"].inline_keyboard[0]:
-            self.assertLessEqual(len(button.callback_data.encode("utf-8")), 64)
-            self.assertIsNotNone(notifications.CALLBACK_PATTERN.fullmatch(button.callback_data))
-        self.assertEqual(self.store["create_offer"].await_args.args[-1], NOW + timedelta(minutes=5))
-
-    async def test_broker_raw_close_and_outward_tick_grid_are_frozen_before_display(self):
-        await self.prepare_offer()
-        for direction, stop, target, rounded_stop, rounded_target in (
-            ("BUY", 97.13, 106.13, 97.10, 106.15),
-            ("SELL", 103.13, 94.13, 103.15, 94.10),
-        ):
-            with self.subTest(direction=direction):
-                current = signal()
-                # The paper signal uses two decimals; execution must preserve
-                # the matching broker candle's actual three-decimal close.
-                current.update(direction=direction, entry=100.12, stop=stop, target=target)
-                self.service.signals.return_value = (current, "MetaTrader 5", "f" * 64)
-                self.snapshot["payload"]["candles"][-1]["close"] = 100.125
-                self.snapshot["payload"]["execution"]["tick_size"] = 0.05
-                await notifications.send_offers(self.service, self.bot)
-                payload = self.store["create_offer"].await_args.args[6]
-                self.assertEqual(payload["entry"], 100.125)
-                self.assertEqual(payload["stop"], rounded_stop)
-                self.assertEqual(payload["target"], rounded_target)
-                self.assertEqual(payload["price_digits"], 3)
-                self.assertAlmostEqual(payload["original_stop_distance"], 3.025)
-                self.assertTrue(notifications._offer_grid_matches(payload, self.snapshot["payload"]))
-                text = self.bot.send_message.await_args.args[1]
-                for value in ("100.125", f"{rounded_stop:.3f}", f"{rounded_target:.3f}"):
-                    self.assertIn(value, text)
-                frozen = deepcopy(payload)
-                self.snapshot["payload"]["candles"][-1]["close"] = 101.0
-                self.assertEqual(self.offer["payload"], frozen)
-
-    def test_non_power_of_ten_tick_is_a_grid_and_not_just_display_precision(self):
-        current, feed = signal(), snapshot()["payload"]
-        current.update(stop=97.131, target=106.131)
-        feed["execution"]["tick_size"] = 0.025
-        payload = notifications._normalise_signal(current, feed)
-        self.assertEqual((payload["stop"], payload["target"]), (97.125, 106.15))
-        self.assertTrue(notifications._offer_grid_matches(payload, feed))
-
-    async def test_missing_invalid_or_unrepresentable_broker_metadata_never_drafts_an_offer(self):
-        await self.prepare_offer()
-        cases = (
-            None, {"tick_size": 0.001},
-            {"tick_size": 0, "point": 0.001, "digits": 3, "stops_level": 0},
-            {"tick_size": 0.0005, "point": 0.001, "digits": 3, "stops_level": 0},
-            {"tick_size": 0.001, "point": 0.001, "digits": True, "stops_level": 0},
-            {"tick_size": 0.001, "point": 0.001, "digits": 3, "stops_level": -1},
+    async def test_concurrent_prepare_and_reject_commit_one_decision(self):
+        other = SimpleNamespace(**vars(self.query))
+        other.data = f"mt5manual:r:{OFFER_ID.hex}"
+        self.query.data = f"mt5manual:p:{OFFER_ID.hex}"
+        await asyncio.gather(
+            notifications.manual_decision_callback(self.update, self.context),
+            notifications.manual_decision_callback(SimpleNamespace(callback_query=other), self.context),
         )
-        for metadata in cases:
-            with self.subTest(metadata=metadata):
-                self.snapshot = snapshot()
-                if metadata is None:
-                    del self.snapshot["payload"]["execution"]
-                else:
-                    self.snapshot["payload"]["execution"] = metadata
+        self.assertIn(self.offer["status"], ("requested", "rejected"))
+        self.assertEqual(self.manual_store["decide"].await_count, 1)
+        self.service.order_send.assert_not_awaited()
+
+    async def test_legacy_or_provisional_or_unpinned_signal_never_publishes_offer(self):
+        await self.prepare_manual_offer()
+        current = signal()
+        for changes in ({"strategy_id": "ema9-21-atr14-v1"}, {"provisional": True},
+                        {"qualification_id": "f" * 64}, {"confidence": .99, "qualification_id": None}):
+            with self.subTest(changes=changes):
+                result = dict(current, **changes)
+                self.service.signals.return_value = result, "BUY 99%", "f" * 64
                 await notifications.send_offers(self.service, self.bot)
-        self.store["create_offer"].assert_not_awaited()
         self.bot.send_message.assert_not_awaited()
+        self.manual_store["create_offer"].assert_not_awaited()
 
-    async def test_missing_trigger_candle_unrepresentable_close_and_invalid_rounded_levels_suppress_offer(self):
-        await self.prepare_offer()
-        for condition in ("missing", "precision", "collapse", "nonpositive"):
+    async def test_revoked_pin_blocks_existing_prepare_button(self):
+        with patch.dict(notifications.os.environ, {"MT5_EVIDENCE_SHA256": "f" * 64}):
+            await self.run_manual_callback()
+        self.manual_store["decide"].assert_not_awaited()
+
+    async def test_missing_frame_unknown_cost_or_existing_exposure_blocks_offer(self):
+        await self.prepare_manual_offer()
+        for condition in ("missing_m5", "unknown_costs", "exposure", "margin"):
+            self.snapshot = snapshot()
+            if condition == "missing_m5":
+                self.snapshot["payload"]["timeframes"].pop("M5")
+            else:
+                self.snapshot["payload"]["risk_context"].update({
+                    "unknown_costs": {"costs_verified": False}, "exposure": {"open_positions": 1},
+                    "margin": {"free_margin": 1},
+                }[condition])
             with self.subTest(condition=condition):
-                self.snapshot = snapshot()
-                current = signal()
-                if condition == "missing":
-                    self.snapshot["payload"]["candles"].pop()
-                elif condition == "precision":
-                    self.snapshot["payload"]["candles"][-1]["close"] = 100.1234
-                elif condition == "collapse":
-                    current["target"] = 100.0
-                else:
-                    current["stop"] = 0.0001
-                self.service.signals.return_value = (current, "MetaTrader 5", "f" * 64)
-                with self.assertLogs(notifications.logger, level="WARNING"):
-                    await notifications.send_offers(self.service, self.bot)
-        self.store["create_offer"].assert_not_awaited()
-        self.bot.send_message.assert_not_awaited()
-
-    async def test_accept_rechecks_frozen_grid_precision_and_stop_distance(self):
-        for condition in ("digits", "tick", "distance", "unbounded"):
-            with self.subTest(condition=condition):
-                self.snapshot, self.offer = snapshot(), offer()
-                if condition == "digits":
-                    self.snapshot["payload"]["execution"]["digits"] = 2
-                    self.snapshot["payload"]["execution"]["tick_size"] = 0.01
-                elif condition == "tick":
-                    self.snapshot["payload"]["execution"]["tick_size"] = 0.3
-                elif condition == "distance":
-                    self.offer["payload"]["original_stop_distance"] = 2.9
-                else:
-                    self.offer["payload"]["entry"] = 1e308
-                await self.run_callback()
-                self.assertEqual(self.offer["status"], "offered")
-        self.store["decide"].assert_not_awaited()
-
-    async def test_offer_expiry_is_anchored_to_trigger_bar_and_retries_use_frozen_draft(self):
-        await self.prepare_offer()
-        late = NOW + timedelta(minutes=14)
-        self.device["last_seen_at"] = late
-        self.snapshot["updated_at"] = late
-        self.snapshot["payload"]["quote"]["time"] = late.isoformat()
-        with patch.object(notifications.market_monitor, "utc_now", return_value=late):
-            await notifications.send_offers(self.service, self.bot)
-        self.assertEqual(self.store["create_offer"].await_args.args[-1], NOW + timedelta(minutes=15))
-        original = deepcopy(self.offer)
-        self.store["create_offer"].side_effect = None
-        self.store["create_offer"].return_value = original
-        with patch.object(notifications.market_monitor, "utc_now", return_value=late + timedelta(seconds=20)):
-            await notifications.send_offers(self.service, self.bot)
-        self.assertIn("12:15:00", self.bot.send_message.await_args.args[1])
-
-    async def test_offline_inactive_wrong_device_no_signal_and_paused_owners_get_no_offer(self):
-        await self.prepare_offer()
-        self.device["last_seen_at"] = NOW - timedelta(minutes=4)
-        await notifications.send_offers(self.service, self.bot)
-        self.device = device()
-        self.store["list_paired_devices"].return_value = [self.device]
-        self.store["subscription_active"].return_value = False
-        await notifications.send_offers(self.service, self.bot)
-        self.store["subscription_active"].return_value = True
-        self.service.risk_pause.return_value = NOW + timedelta(minutes=45)
-        await notifications.send_offers(self.service, self.bot)
-        self.service.risk_pause.return_value = None
-        self.snapshot["payload"]["device_id"] = str(UUID(int=1))
-        await notifications.send_offers(self.service, self.bot)
-        self.snapshot = snapshot()
-        self.service.signals.return_value = ({"state": "no_signal"}, "", None)
-        await notifications.send_offers(self.service, self.bot)
-        self.bot.send_message.assert_not_awaited()
-        self.store["create_offer"].assert_not_awaited()
-
-    async def test_persisted_real_or_different_volume_cannot_offer_or_accept_but_can_be_rejected(self):
-        await self.prepare_offer()
-        for account_mode, volume in (("real", 0.01), ("demo", 0.02)):
-            with self.subTest(account_mode=account_mode, volume=volume):
-                self.device = device()
-                self.device.update(account_mode=account_mode, volume=volume)
-                self.store["list_paired_devices"].return_value = [self.device]
-                self.offer = offer()
-                self.offer["payload"].update(account_mode=account_mode, volume=volume)
                 await notifications.send_offers(self.service, self.bot)
-                await self.run_callback()
-                self.assertEqual(self.offer["status"], "offered")
-                await self.run_callback("r")
-                self.assertEqual(self.offer["status"], "rejected")
         self.bot.send_message.assert_not_awaited()
-        self.store["create_offer"].assert_not_awaited()
-        self.assertTrue(all(call.args[-2] == "rejected" for call in self.store["decide"].await_args_list))
+        self.manual_store["create_offer"].assert_not_awaited()
 
-    async def test_delivery_failure_never_publishes_and_throttle_or_forbidden_handle_subscription(self):
-        await self.prepare_offer()
+    async def test_prepare_rechecks_quote_after_risk_await(self):
+        async def change(*args):
+            self.snapshot["payload"]["quote"]["time"] = (NOW - timedelta(seconds=11)).isoformat()
+            return None
+        self.service.risk_pause.side_effect = change
+        await self.run_manual_callback()
+        self.manual_store["decide"].assert_not_awaited()
+
+    async def test_offer_rechecks_quote_after_draft_creation(self):
+        await self.prepare_manual_offer()
+        original = self.manual_store["create_offer"].side_effect
+        async def change(*args):
+            result = await original(*args)
+            self.snapshot["payload"]["quote"]["time"] = (NOW - timedelta(seconds=11)).isoformat()
+            return result
+        self.manual_store["create_offer"].side_effect = change
+        await notifications.send_offers(self.service, self.bot)
+        self.manual_store["create_offer"].assert_awaited_once()
+        self.bot.send_message.assert_not_awaited()
+        self.manual_store["publish_offer"].assert_not_awaited()
+
+    async def test_offer_drift_does_not_recalculate_frozen_stop_or_target(self):
+        original = deepcopy(self.offer["payload"])
+        for key in ("bid", "ask"):
+            self.snapshot["payload"]["quote"][key] += .2
+        await self.run_manual_callback()
+        self.manual_store["decide"].assert_not_awaited()
+        self.assertEqual(self.offer["payload"], original)
+
+    async def test_send_failure_throttling_and_forbidden_preserve_publication_rules(self):
+        await self.prepare_manual_offer()
         self.bot.send_message.side_effect = RuntimeError("PRIVATE endpoint")
         with self.assertLogs(notifications.logger, level="WARNING") as logs:
             await notifications.send_offers(self.service, self.bot)
         self.assertNotIn("PRIVATE", " ".join(logs.output))
-        self.store["publish_offer"].assert_not_awaited()
+        self.manual_store["publish_offer"].assert_not_awaited()
         self.bot.send_message.side_effect = RetryAfter(10)
         self.assertFalse(await notifications.send_offers(self.service, self.bot))
         self.service.telegram_backoff.assert_awaited_once()
@@ -476,115 +532,76 @@ class MT5NotificationTests(unittest.IsolatedAsyncioTestCase):
         await notifications.send_offers(self.service, self.bot)
         self.disabled.assert_awaited_once_with(self.service.pool, BOT_ID, OWNER_ID)
 
-    async def test_failed_publication_removes_buttons_and_existing_terminal_offer_is_not_resent(self):
-        await self.prepare_offer()
-        self.store["publish_offer"].return_value = False
+    async def test_unpublished_offer_removes_buttons_and_requested_offer_not_resent(self):
+        await self.prepare_manual_offer()
+        self.manual_store["publish_offer"].return_value = False
         await notifications.send_offers(self.service, self.bot)
         self.bot.edit_message_reply_markup.assert_awaited_once_with(OWNER_ID, MESSAGE_ID, reply_markup=None)
-        self.store["create_offer"].side_effect = None
-        self.store["create_offer"].return_value = offer("accepted")
+        self.manual_store["create_offer"].side_effect = None
+        self.manual_store["create_offer"].return_value = offer("requested")
         await notifications.send_offers(self.service, self.bot)
         self.assertEqual(self.bot.send_message.await_count, 1)
 
-    async def test_results_use_reported_status_and_unknown_never_claims_fill_or_retries_order(self):
-        for status in ("filled", "failed", "unknown"):
-            current = offer(status)
-            current["result"] = {"status": status}
-            self.store["list_notifications"].return_value = [current]
-            await notifications.send_results(self.service, self.bot)
-            text = self.bot.send_message.await_args.args[1]
-            self.assertEqual("أكد MT5 تنفيذ" in text, status == "filled")
-            if status == "unknown":
-                self.assertIn("تحقق من MT5", text)
-                self.assertIn("لا تُجرى إعادة", text)
-        self.assertEqual(self.store["mark_notified"].await_count, 3)
-        inconsistent = offer("filled")
-        inconsistent["result"] = {"status": "unknown"}
-        self.store["list_notifications"].return_value = [inconsistent]
-        await notifications.send_results(self.service, self.bot)
-        self.assertNotIn("أكد MT5 تنفيذ", self.bot.send_message.await_args.args[1])
-        self.service.order_send.assert_not_awaited()
-
-    async def test_approved_unclaimed_expiry_or_cancellation_reports_that_no_order_was_sent(self):
-        for status in ("expired", "cancelled"):
-            current = offer(status)
-            current["decided_at"] = NOW - timedelta(minutes=1)
-            self.store["list_notifications"].return_value = [current]
-            await notifications.send_results(self.service, self.bot)
-            text = self.bot.send_message.await_args.args[1]
-            self.assertIn("لم يُرسل أي أمر تداول", text)
-            self.assertNotIn("غير مؤكدة", text)
-            self.assertNotIn("أكد MT5 تنفيذ", text)
-        self.assertEqual(self.store["mark_notified"].await_count, 2)
-        self.bot.send_message.reset_mock()
-        self.store["mark_notified"].reset_mock()
-        for status in ("expired", "cancelled"):
-            for clicked, executing in ((False, False), (True, True)):
-                current = offer(status)
-                current["decided_at"] = NOW if clicked else None
-                current["executing_at"] = NOW if executing else None
-                self.store["list_notifications"].return_value = [current]
-                await notifications.send_results(self.service, self.bot)
-        self.bot.send_message.assert_not_awaited()
-        self.store["mark_notified"].assert_not_awaited()
-
-    async def test_confirmed_fill_displays_actual_order_ticket_and_time_only_for_matching_status(self):
-        current = offer("filled")
-        current["result"] = {"status": "filled", "code": 10009,
-                             "order_ticket": 123456789, "executed_at": NOW.isoformat()}
-        self.store["list_notifications"].return_value = [current]
-        await notifications.send_results(self.service, self.bot)
-        text = self.bot.send_message.await_args.args[1]
-        self.assertIn("أكد MT5 تنفيذ", text)
-        self.assertIn("رقم الأمر: 123456789", text)
-        self.assertIn("2026-10-04 12:00:00 UTC", text)
-        self.assertNotIn("السعر المؤكد", text)
-        current["status"] = "unknown"
-        await notifications.send_results(self.service, self.bot)
-        text = self.bot.send_message.await_args.args[1]
-        self.assertIn("غير مؤكدة", text)
-        self.assertNotIn("123456789", text)
-
-    async def test_results_still_deliver_after_unwatch_but_owner_change_or_send_failure_is_not_acknowledged(self):
-        current = offer("unknown")
-        current["result"] = {"status": "unknown"}
-        self.store["list_notifications"].return_value = [current]
+    async def test_results_after_unwatch_but_owner_change_prevents_notification(self):
+        current = deepcopy(self.offer)
+        current.update(status="unknown", preparing_at=NOW, result={"status": "unknown"})
+        self.manual_store["list_notifications"].return_value = [current]
         self.store["subscription_active"].return_value = False
         await notifications.send_results(self.service, self.bot)
-        self.bot.send_message.assert_awaited_once()
-        self.store["mark_notified"].assert_awaited_once()
+        self.manual_store["mark_notified"].assert_awaited_once()
         self.store["subscription_active"].assert_not_awaited()
         self.bot.send_message.reset_mock()
-        self.store["mark_notified"].reset_mock()
-        self.store["subscription_active"].return_value = True
+        self.manual_store["mark_notified"].reset_mock()
         self.device["owner_user_id"] = 202
         await notifications.send_results(self.service, self.bot)
-        self.device = device()
-        self.bot.send_message.side_effect = RetryAfter(10)
-        self.assertFalse(await notifications.send_results(self.service, self.bot))
-        self.store["mark_notified"].assert_not_awaited()
+        self.bot.send_message.assert_not_awaited()
+        self.manual_store["mark_notified"].assert_not_awaited()
 
-    async def test_trading_switch_disabled_blocks_pairing_callbacks_offers_and_results(self):
-        self.service.trading_enabled = False
+    async def test_pair_code_hashed_and_never_echoed_or_logged(self):
+        self.update.effective_message = message(user_id=OWNER_ID)
+        code = "AB12CD34EF56"
+        self.context.args = [code]
+        self.store["pair_device"].return_value = self.device
+        await notifications.connect_mt5_command(self.update, self.context)
+        args = self.store["pair_device"].await_args.args
+        self.assertEqual(args[2], hashlib.sha256(code.encode()).hexdigest())
+        self.assertNotIn(code, self.reply.await_args.args[0])
+        self.store["pair_device"].side_effect = RuntimeError(code)
+        with self.assertLogs(notifications.logger, level="WARNING") as logs:
+            await notifications.connect_mt5_command(self.update, self.context)
+        self.assertNotIn(code, " ".join(logs.output))
+
+    async def test_pairing_real_account_or_nondefault_volume_never_enables_alerts(self):
+        self.update.effective_message = message(user_id=OWNER_ID)
+        self.context.args = ["AB12CD34EF56"]
+        for changes in ({"account_mode": "real"}, {"volume": .02}):
+            self.store["pair_device"].return_value = dict(device(), **changes)
+            await notifications.connect_mt5_command(self.update, self.context)
+        self.enabled.assert_not_awaited()
+
+    async def test_legacy_auto_flag_alone_disables_pair_offers_results_and_callbacks(self):
+        self.service.manual_tickets_enabled = False
+        self.service.trading_enabled = True
         self.update.effective_message = message(user_id=OWNER_ID)
         self.context.args = ["AB12CD34EF56"]
         await notifications.connect_mt5_command(self.update, self.context)
-        await self.run_callback()
+        self.query.data = f"mt5:a:{OFFER_ID.hex}"
+        await notifications.decision_callback(self.update, self.context)
         await notifications.send_offers(self.service, self.bot)
         await notifications.send_results(self.service, self.bot)
-        self.store["pair_device"].assert_not_awaited()
-        self.store["get_offer"].assert_not_awaited()
-        self.store["create_offer"].assert_not_awaited()
-        self.store["list_notifications"].assert_not_awaited()
+        for name in ("pair_device", "get_offer", "create_offer", "list_notifications", "decide"):
+            self.store[name].assert_not_awaited()
+        self.manual_store["create_offer"].assert_not_awaited()
 
-    def test_registration_uses_separate_callback_namespace(self):
+    def test_registration_separates_manual_and_disabled_legacy_callbacks(self):
         application = SimpleNamespace(add_handler=Mock())
         notifications.register_handlers(application)
-        command, callback = [call.args[0] for call in application.add_handler.call_args_list]
+        command, callback, manual_callback = [call.args[0] for call in application.add_handler.call_args_list]
         self.assertIn("connect_mt5", command.commands)
         self.assertIsNotNone(callback.pattern.match(f"mt5:a:{OFFER_ID.hex}"))
-        self.assertIsNotNone(callback.pattern.match("mt5:a:invalid"))
         self.assertIsNone(callback.pattern.match("command:help"))
+        self.assertIsNotNone(manual_callback.pattern.match(f"mt5manual:p:{OFFER_ID.hex}"))
+        self.assertIsNone(manual_callback.pattern.match(f"mt5:a:{OFFER_ID.hex}"))
 
 
 if __name__ == "__main__":

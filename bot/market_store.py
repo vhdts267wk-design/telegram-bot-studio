@@ -6,6 +6,7 @@ from uuid import UUID
 
 
 DELIVERY_INTERVAL = timedelta(minutes=15)
+MTF_DELIVERY_INTERVAL = timedelta(minutes=1)
 DELIVERY_LEASE = timedelta(minutes=5)
 MAX_DELIVERY_BATCH = 100
 
@@ -91,7 +92,13 @@ async def initialize_schema(pool) -> None:
                 await connection.execute(statement)
 
 
-async def enable_subscription(pool, bot_id: int, chat_id: int, now: datetime) -> None:
+def _delivery_interval(value):
+    if type(value) is not timedelta or value not in (DELIVERY_INTERVAL, MTF_DELIVERY_INTERVAL):
+        raise ValueError("Unsupported market delivery interval")
+    return value
+
+
+async def enable_subscription(pool, bot_id: int, chat_id: int, now: datetime, *, interval=DELIVERY_INTERVAL) -> None:
     """Opt in; repeated /watch calls preserve an active subscription's due time."""
     await pool.execute(
         """
@@ -109,7 +116,7 @@ async def enable_subscription(pool, bot_id: int, chat_id: int, now: datetime) ->
         """,
         _identifier(bot_id),
         _identifier(chat_id),
-        _utc(now) + DELIVERY_INTERVAL,
+        _utc(now) + _delivery_interval(interval),
     )
 
 
@@ -197,9 +204,9 @@ async def claim_due(
 
 
 async def mark_delivered(
-    pool, bot_id: int, chat_id: int, lease_id: UUID | str, now: datetime
+    pool, bot_id: int, chat_id: int, lease_id: UUID | str, now: datetime, *, interval=DELIVERY_INTERVAL
 ) -> bool:
-    """Acknowledge only the current lease and schedule 15 minutes after delivery."""
+    """Acknowledge only the current lease and schedule the configured next check."""
     now = _utc(now)
     result = await pool.fetchval(
         """
@@ -213,7 +220,7 @@ async def mark_delivered(
         _identifier(chat_id),
         _lease_id(lease_id),
         now,
-        now + DELIVERY_INTERVAL,
+        now + _delivery_interval(interval),
     )
     return bool(result)
 
