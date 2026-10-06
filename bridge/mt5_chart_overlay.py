@@ -15,12 +15,14 @@ from uuid import UUID
 
 
 DISPLAY_TTL_SECONDS = 25
-FEED_REFRESH_SECONDS = 20
+FEED_REFRESH_SECONDS = 5
 STATES = frozenset({"offered", "requested", "preparing", "prepared"})
 FIELDS = frozenset({
     "version", "workflow", "offer_id", "status", "symbol", "timeframe", "direction",
     "entry", "entry_zone_low", "entry_zone_high", "stop", "target", "price_digits",
     "execution", "bar_time", "expires_at",
+    "strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint",
+    "qualification_id", "direction_bar_time", "confirmation_bar_time",
 })
 
 
@@ -87,7 +89,7 @@ def fresh_quote(value, now):
         raise OverlayError("Invalid chart quote")
     bid, ask = positive(value["bid"]), positive(value["ask"])
     stamp = utc(value["time"])
-    if ask < bid or not timedelta(seconds=-5) <= now - stamp <= timedelta(seconds=30):
+    if ask < bid or not timedelta(seconds=-5) <= now - stamp <= timedelta(seconds=10):
         raise OverlayError("Stale chart quote")
     return stamp
 
@@ -99,13 +101,21 @@ def validate_proposal(value, *, symbol, execution, quote, observed_at):
     if type(value) is not dict or set(value) != FIELDS:
         raise OverlayError("Invalid chart proposal")
     if (
-        type(value["version"]) is not int or value["version"] != 1
+        type(value["version"]) is not int or value["version"] != 2
         or type(value["workflow"]) is not str or value["workflow"] != "chart_overlay"
         or type(value["status"]) is not str or value["status"] not in STATES
-        or value["symbol"] != symbol or value["timeframe"] != "M15"
+        or value["symbol"] != symbol or value["timeframe"] != "M1"
         or type(value["direction"]) is not str or value["direction"] not in ("BUY", "SELL")
     ):
         raise OverlayError("Incompatible chart proposal")
+    if (
+        value["strategy_id"] != "mtf-ema-pullback-60m-v1"
+        or type(value["strategy_version"]) is not int or value["strategy_version"] != 1
+        or value["policy_id"] != "mtf-manual-demo-cost-risk-v1"
+        or type(value["horizon_seconds"]) is not int or value["horizon_seconds"] != 3600
+        or any(type(value[key]) is not str or re.fullmatch(r"[0-9a-f]{64}", value[key]) is None for key in ("strategy_fingerprint", "qualification_id"))
+    ):
+        raise OverlayError("Unqualified chart proposal")
     try:
         if type(value["offer_id"]) is not str or str(UUID(value["offer_id"])) != value["offer_id"]:
             raise ValueError
@@ -128,9 +138,16 @@ def validate_proposal(value, *, symbol, execution, quote, observed_at):
     if low != expected_low or high != expected_high:
         raise OverlayError("Changed chart entry zone")
     bar, expires = utc(value["bar_time"]), utc(value["expires_at"])
-    if bar.timestamp() % 900 or not bar + timedelta(minutes=15) <= now <= bar + timedelta(minutes=45):
+    direction, confirmation = utc(value["direction_bar_time"]), utc(value["confirmation_bar_time"])
+    trigger = bar.timestamp()
+    if (
+        any(stamp.microsecond for stamp in (bar, direction, confirmation)) or trigger % 60
+        or not trigger + 60 <= now.timestamp() <= trigger + 360
+        or direction.timestamp() != int((trigger + 60) // 900) * 900 - 900
+        or confirmation.timestamp() != int((trigger + 60) // 300) * 300 - 300
+    ):
         raise OverlayError("Invalid chart reference candle")
-    if not now < expires <= now + timedelta(minutes=5):
+    if not now < expires <= min(now + timedelta(minutes=5), bar + timedelta(minutes=6)):
         raise OverlayError("Expired chart proposal")
     return DisplayProposal(value["direction"], entry, low, high, stop, target, digits, bar, expires)
 
@@ -224,7 +241,7 @@ class ChartExporter:
     def clear(self, observed_at):
         now = utc(observed_at)
         observed = int(now.timestamp())
-        self._write([1, "waiting", self.symbol, "M15", "NONE", 0, 0, 0, 0, 0, 2,
+        self._write([2, "waiting", self.symbol, "M1", "NONE", 0, 0, 0, 0, 0, 2,
                      observed, observed + DISPLAY_TTL_SECONDS, 0, self.offset,
                      self.terminal_key, self.nonce, self.binding_hash])
 
@@ -234,13 +251,13 @@ class ChartExporter:
             return
         proposal = validate_proposal(value, symbol=self.symbol, execution=execution, quote=quote, observed_at=observed_at)
         now = utc(observed_at)
-        deadline = min(proposal.expires, now + timedelta(seconds=DISPLAY_TTL_SECONDS),
-                       fresh_quote(quote, now) + timedelta(seconds=30))
+        deadline = min(proposal.expires, now + timedelta(seconds=10),
+                       fresh_quote(quote, now) + timedelta(seconds=10))
         if int(deadline.timestamp()) <= int(now.timestamp()):
             raise OverlayError("Chart freshness elapsed")
         prices = [format(price, f".{proposal.digits}f") for price in (
             proposal.entry, proposal.zone_low, proposal.zone_high, proposal.stop, proposal.target,
         )]
-        self._write([1, "active", self.symbol, "M15", proposal.direction, *prices, proposal.digits,
+        self._write([2, "active", self.symbol, "M1", proposal.direction, *prices, proposal.digits,
                      int(now.timestamp()), int(deadline.timestamp()), int(proposal.bar.timestamp()),
                      self.offset, self.terminal_key, self.nonce, self.binding_hash])

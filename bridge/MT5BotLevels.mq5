@@ -1,5 +1,5 @@
 #property copyright "MT5 Bot"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 0
@@ -168,8 +168,8 @@ bool ReadProposal(Proposal &p,string &message)
    string fields[];
    string row=CharArrayToString(bytes,0,(int)size,CP_UTF8);
    if(StringSplit(row,';',fields)!=OVERLAY_FIELD_COUNT
-      || fields[0]!="1" || (fields[1]!="active" && fields[1]!="waiting")
-      || fields[2]!="XAUUSD" || fields[3]!="M15")
+      || fields[0]!="2" || (fields[1]!="active" && fields[1]!="waiting")
+      || fields[2]!="XAUUSD" || fields[3]!="M1")
      {
       message="Waiting: invalid proposal format";
       return(false);
@@ -207,6 +207,7 @@ bool ReadProposal(Proposal &p,string &message)
    p.offset_minutes=(int)offset;
    if(!p.active)
      {
+      message="No qualified opportunity: evidence or market conditions not met";
       if(p.direction!="NONE" || p.entry!=0.0 || p.zone_low!=0.0 || p.zone_high!=0.0
          || p.stop!=0.0 || p.target!=0.0 || bar!=0)
          message="Waiting: invalid empty proposal";
@@ -225,8 +226,8 @@ bool ReadProposal(Proposal &p,string &message)
    bool ordered=(p.direction=="BUY" && p.stop<p.zone_low && p.zone_high<p.target)
                 || (p.direction=="SELL" && p.target<p.zone_low && p.zone_high<p.stop);
    datetime chart_bar=(datetime)(bar+offset*60);
-   if(!ordered || bar<=0 || bar%900!=0 || bar+900>observed || observed-bar>2700
-      || iBarShift(_Symbol,PERIOD_M15,chart_bar,true)<1)
+   if(!ordered || bar<=0 || bar%60!=0 || bar+60>observed || observed-bar>135
+      || iBarShift(_Symbol,PERIOD_M1,chart_bar,true)<1)
      {
       message="Waiting: invalid direction or chart time";
       return(false);
@@ -344,7 +345,7 @@ bool DrawProposal(const Proposal &p)
 void UpdateOverlay()
   {
    if(MQLInfoInteger(MQL_TESTER)) { ShowWaiting("Live terminal required"); return; }
-   if(_Symbol!="XAUUSD" || _Period!=PERIOD_M15) { ShowWaiting("Use XAUUSD / M15"); return; }
+   if(_Symbol!="XAUUSD" || _Period!=PERIOD_M1) { ShowWaiting("Use XAUUSD / M1: M15 direction + M5 confirmation"); return; }
    if(g_terminal_key=="") { ShowWaiting("Terminal folder unavailable"); return; }
    if(AccountInfoInteger(ACCOUNT_TRADE_MODE)!=ACCOUNT_TRADE_MODE_DEMO) { ShowWaiting("Demo account required"); return; }
    if(AccountInfoInteger(ACCOUNT_LOGIN)!=g_session_login || AccountInfoString(ACCOUNT_SERVER)!=g_session_server)

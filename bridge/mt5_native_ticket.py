@@ -39,6 +39,16 @@ class Draft:
     target: Decimal
     digits: int
     expires_at: datetime
+    display_timeframe: str = "M15"
+    strategy_id: str = ""
+    strategy_version: int | None = None
+    policy_id: str = ""
+    horizon_seconds: int | None = None
+    strategy_fingerprint: str = ""
+    qualification_id: str = ""
+    direction_bar_time: datetime | None = None
+    confirmation_bar_time: datetime | None = None
+    bar_time: datetime | None = None
 
     def __post_init__(self):
         if (
@@ -63,6 +73,31 @@ class Draft:
 def require_unexpired(draft, now):
     if not isinstance(now, datetime) or now.utcoffset() is None or now >= draft.expires_at:
         raise TicketError("expired")
+
+
+def require_qualified(draft, now):
+    """Reject legacy or unqualified drafts before any native window action."""
+    if (
+        draft.display_timeframe != "M1" or draft.strategy_id != "mtf-ema-pullback-60m-v1"
+        or type(draft.strategy_version) is not int or draft.strategy_version != 1
+        or draft.policy_id != "mtf-manual-demo-cost-risk-v1"
+        or type(draft.horizon_seconds) is not int or draft.horizon_seconds != 3600
+        or type(draft.strategy_fingerprint) is not str or re.fullmatch(r"[0-9a-f]{64}", draft.strategy_fingerprint) is None
+        or type(draft.qualification_id) is not str or re.fullmatch(r"[0-9a-f]{64}", draft.qualification_id) is None
+    ):
+        raise TicketError("invalid_draft")
+    bars = (draft.direction_bar_time, draft.confirmation_bar_time, draft.bar_time)
+    if any(not isinstance(bar, datetime) or bar.utcoffset() is None or bar.microsecond for bar in bars):
+        raise TicketError("invalid_draft")
+    direction, confirmation, trigger = (bar.timestamp() for bar in bars)
+    if (
+        direction % 900 or confirmation % 300 or trigger % 60
+        or not trigger + 60 <= now.timestamp() <= trigger + 360
+        or direction != int((trigger + 60) // 900) * 900 - 900
+        or confirmation != int((trigger + 60) // 300) * 300 - 300
+        or draft.expires_at.timestamp() > trigger + 360
+    ):
+        raise TicketError("invalid_draft")
 
 
 def _decimal_text(value):
@@ -104,12 +139,13 @@ class NativeTicketAdapter:
 
     def _prepare(self, draft: Draft, *, recheck_account, ticket_ready):
         require_unexpired(draft, self.clock())
+        require_qualified(draft, self.clock())
         recheck_account()
         self.backend.verify_terminal()
         if self.backend.existing_tickets():
             raise TicketError("existing_ticket")
         self.backend.verify_absolute_stop_mode()
-        chart = self.backend.activate_chart(draft.symbol, "M15")
+        chart = self.backend.activate_chart(draft.symbol, "M1")
         # An independently opened ticket must never be overwritten.
         if self.backend.existing_tickets():
             raise TicketError("existing_ticket")

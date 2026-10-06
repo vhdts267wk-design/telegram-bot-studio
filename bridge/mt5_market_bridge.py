@@ -6,6 +6,7 @@ import argparse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import importlib
+import hashlib
 import json
 import math
 import os
@@ -22,8 +23,10 @@ BAR_COUNT = 64
 BAR_SECONDS = 15 * 60
 POLL_SECONDS = 60
 REQUEST_TIMEOUT = 15
-MAX_QUOTE_AGE_SECONDS = 10 * 24 * 60 * 60
-FUTURE_TOLERANCE_SECONDS = 30
+MAX_QUOTE_AGE_SECONDS = 10
+FUTURE_TOLERANCE_SECONDS = 5
+TIMEFRAMES = {"M15": 900, "M5": 300, "M1": 60}
+FIXED_VOLUME = 0.01
 TERMINAL_FAILURE_MESSAGES = {
     "terminal_unavailable": "The MT5 client connection is unavailable. Check that the selected terminal is open and connected.",
     "terminal_disconnected": "MT5 is disconnected. Reconnect the selected terminal to its broker.",
@@ -56,9 +59,17 @@ class Settings:
     url: str
     key: str = field(repr=False)
     broker_utc_offset_minutes: int = 0
+    cost_model_verified: bool = False
+    commission_round_turn_per_lot: float | None = None
+    slippage_price: float | None = None
 
     def __post_init__(self) -> None:
         validate_broker_utc_offset_minutes(self.broker_utc_offset_minutes)
+        if type(self.cost_model_verified) is not bool:
+            raise ConfigurationError("Use an explicit verified cost-model flag.")
+        for value in (self.commission_round_turn_per_lot, self.slippage_price):
+            if value is not None and (type(value) not in (int, float) or not 0 <= value <= 1e9 or not math.isfinite(value)):
+                raise ConfigurationError("Use bounded nonnegative verified cost values.")
 
 
 class PrivateArgumentParser(argparse.ArgumentParser):
@@ -129,8 +140,26 @@ def load_settings(args: argparse.Namespace, environ: Any = None) -> Settings:
     if not symbol or len(symbol) > 64 or symbol != symbol.strip() or any(ord(c) < 32 for c in symbol):
         raise ConfigurationError("Choose the exact broker gold symbol.")
     offset = parse_broker_utc_offset_minutes(environ.get("MT5_BROKER_UTC_OFFSET_MINUTES", "0"))
+    verified = environ.get("MT5_COST_MODEL_VERIFIED", "false")
+    if type(verified) is not str or verified.strip().lower() not in {"true", "false"}:
+        raise ConfigurationError("Use true or false for the verified cost-model flag.")
+    def optional_cost(name):
+        raw = environ.get(name)
+        if raw is None or raw == "":
+            return None
+        if type(raw) is not str or raw != raw.strip():
+            raise ConfigurationError("Invalid verified cost value.")
+        try:
+            number = float(raw)
+        except (ValueError, TypeError, OverflowError):
+            raise ConfigurationError("Invalid verified cost value.") from None
+        if not math.isfinite(number) or not 0 <= number <= 1e9:
+            raise ConfigurationError("Invalid verified cost value.")
+        return number
     return Settings(terminal=terminal, symbol=symbol, url=url, key=key,
-                    broker_utc_offset_minutes=offset)
+                    broker_utc_offset_minutes=offset, cost_model_verified=verified.strip().lower() == "true",
+                    commission_round_turn_per_lot=optional_cost("MT5_COMMISSION_ROUND_TURN_PER_LOT"),
+                    slippage_price=optional_cost("MT5_SLIPPAGE_PRICE"))
 
 
 def check_terminal(mt5: Any, terminal: Path) -> None:
@@ -186,35 +215,12 @@ def broker_timestamp_utc(value: Any, settings: Settings) -> int:
     return normalized
 
 
-def build_payload(mt5: Any, settings: Settings, now: datetime | None = None) -> dict:
-    now = datetime.now(timezone.utc) if now is None else now
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise MarketDataError("Use a timezone-aware clock.")
-    now_seconds = now.timestamp()
-    check_terminal(mt5, settings.terminal)
-    symbol = mt5.symbol_info(settings.symbol)
-    if (
-        symbol is None
-        or getattr(symbol, "currency_base", "") != "XAU"
-        or getattr(symbol, "currency_profit", "") != "USD"
-    ):
-        raise MarketDataError("The broker must explicitly identify this symbol as gold in US dollars.")
-    tick = mt5.symbol_info_tick(settings.symbol)
-    if tick is None:
-        raise MarketDataError("A fresh broker quote is required.")
-    bid, ask = positive_price(tick.bid), positive_price(tick.ask)
-    quote_time = broker_timestamp_utc(tick.time, settings)
-    if (
-        ask < bid
-        or quote_time <= 0
-        or quote_time > now_seconds + FUTURE_TOLERANCE_SECONDS
-        or now_seconds - quote_time > MAX_QUOTE_AGE_SECONDS
-    ):
-        raise MarketDataError("A fresh, valid broker quote is required.")
-    # Index zero is the forming bar. Do not include it in educational analysis.
-    rates = mt5.copy_rates_from_pos(settings.symbol, mt5.TIMEFRAME_M15, 1, BAR_COUNT)
-    if rates is None or not 4 <= len(rates) <= BAR_COUNT:
-        raise MarketDataError("Load at least four completed M15 bars in MT5.")
+def closed_candles(mt5, settings, label, seconds, now_seconds):
+    # All three frames share the same UTC snapshot boundary; index zero is
+    # always the forming bar and is never requested.
+    rates = mt5.copy_rates_from_pos(settings.symbol, getattr(mt5, "TIMEFRAME_" + label), 1, BAR_COUNT)
+    if rates is None or not 1 <= len(rates) <= BAR_COUNT:
+        raise MarketDataError("Load completed bars in every required timeframe.")
     candles = []
     seen_times = set()
     for rate in rates:
@@ -226,8 +232,8 @@ def build_payload(mt5: Any, settings: Settings, now: datetime | None = None) -> 
             raise MarketDataError("Incomplete broker candle.") from exc
         if (
             bar_time <= 0
-            or bar_time % BAR_SECONDS
-            or bar_time + BAR_SECONDS > now_seconds + FUTURE_TOLERANCE_SECONDS
+            or bar_time % seconds
+            or bar_time + seconds > now_seconds
             or bar_time in seen_times
             or volume < 0
             or prices["high"] < max(prices["open"], prices["close"], prices["low"])
@@ -237,12 +243,89 @@ def build_payload(mt5: Any, settings: Settings, now: datetime | None = None) -> 
         seen_times.add(bar_time)
         candles.append({"time": utc_timestamp(bar_time), **prices, "tick_volume": volume})
     candles.sort(key=lambda candle: candle["time"])
+    times = sorted(seen_times)
+    if times[-1] != int(now_seconds // seconds) * seconds - seconds:
+        raise MarketDataError("Required closed histories must be current.")
+    # Broker session breaks are real missing intervals. Preserve them instead
+    # of fabricating candles; the analyzer resets its indicator warmup after
+    # each gap and decides whether the final contiguous suffix is sufficient.
+    return candles
+
+
+def build_risk_context(mt5, settings, bid, ask, now):
+    """Read-only broker arithmetic for exactly .01 lot in account currency."""
+    try:
+        account = mt5.account_info()
+        if account is None or type(account.trade_mode) is not int or account.trade_mode != getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0):
+            raise MarketDataError("Current Demo risk data is required.")
+        if (type(getattr(account, "server", None)) is not str or not 0 < len(account.server) <= 256
+            or type(getattr(account, "login", None)) is not int or account.login <= 0
+            or type(getattr(account, "currency", None)) is not str or not 0 < len(account.currency) <= 16):
+            raise MarketDataError("Broker risk identity unavailable.")
+        equity, free_margin = positive_price(account.equity), positive_price(account.margin_free)
+        positions, orders = mt5.positions_get(), mt5.orders_get()
+        if positions is None or orders is None:
+            raise MarketDataError("Complete account exposure data is required.")
+        losses, profits, margins = [], [], []
+        for order_type, entry, sign in ((mt5.ORDER_TYPE_BUY, ask, 1), (mt5.ORDER_TYPE_SELL, bid, -1)):
+            if entry <= 1:
+                raise MarketDataError("Broker cash-risk conversion unavailable.")
+            loss = mt5.order_calc_profit(order_type, settings.symbol, FIXED_VOLUME, entry, entry - sign)
+            profit = mt5.order_calc_profit(order_type, settings.symbol, FIXED_VOLUME, entry, entry + sign)
+            if type(loss) not in (int, float) or not math.isfinite(loss) or loss >= 0:
+                raise MarketDataError("Broker cash-risk conversion unavailable.")
+            losses.append(positive_price(-loss))
+            profits.append(positive_price(profit))
+            margins.append(positive_price(mt5.order_calc_margin(order_type, settings.symbol, FIXED_VOLUME, entry)))
+        # Re-reading the non-secret mode/currency/equity snapshot prevents an
+        # account switch from mixing two broker models in a single feed.
+        current = mt5.account_info()
+        if current is None or any(getattr(current, key, None) != getattr(account, key, None) for key in ("login", "server", "trade_mode", "currency")):
+            raise MarketDataError("Account risk snapshot changed during collection.")
+        verified = settings.cost_model_verified and settings.commission_round_turn_per_lot is not None and settings.slippage_price is not None
+        return {
+            "account_mode": "demo", "volume": FIXED_VOLUME, "equity": equity, "free_margin": free_margin,
+            "margin_required": max(margins), "open_positions": len(positions), "pending_orders": len(orders),
+            "loss_cash_per_price_unit": max(losses), "profit_cash_per_price_unit": min(profits),
+            "commission_round_turn": settings.commission_round_turn_per_lot * FIXED_VOLUME if settings.commission_round_turn_per_lot is not None else None,
+            "slippage_price": settings.slippage_price, "costs_verified": verified,
+            "broker_fingerprint": hashlib.sha256(("MT5|" + account.server + "|" + settings.symbol).encode("utf-8")).hexdigest(),
+            "as_of": now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+    except MarketDataError:
+        raise
+    except Exception:
+        raise MarketDataError("Complete broker risk data is required.") from None
+
+
+def build_payload(mt5: Any, settings: Settings, now: datetime | None = None) -> dict:
+    now = datetime.now(timezone.utc) if now is None else now
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise MarketDataError("Use a timezone-aware clock.")
+    now = now.astimezone(timezone.utc)
+    now_seconds = now.timestamp()
+    check_terminal(mt5, settings.terminal)
+    symbol = mt5.symbol_info(settings.symbol)
+    if symbol is None or getattr(symbol, "currency_base", "") != "XAU" or getattr(symbol, "currency_profit", "") != "USD":
+        raise MarketDataError("The broker must explicitly identify this symbol as gold in US dollars.")
+    tick = mt5.symbol_info_tick(settings.symbol)
+    if tick is None:
+        raise MarketDataError("A fresh broker quote is required.")
+    bid, ask = positive_price(tick.bid), positive_price(tick.ask)
+    quote_time = broker_timestamp_utc(tick.time, settings)
+    if ask < bid or not -FUTURE_TOLERANCE_SECONDS <= now_seconds - quote_time <= MAX_QUOTE_AGE_SECONDS:
+        raise MarketDataError("A fresh, valid broker quote is required.")
+    frames = {label: closed_candles(mt5, settings, label, seconds, now_seconds) for label, seconds in TIMEFRAMES.items()}
+    risk = build_risk_context(mt5, settings, bid, ask, now)
+    check_terminal(mt5, settings.terminal)
     return {
+        "schema_version": 2, "as_of": now.isoformat().replace("+00:00", "Z"),
+        "broker_utc_offset_minutes": settings.broker_utc_offset_minutes,
         "symbol": settings.symbol,
         "timeframe": "M15",
         "source": "MetaTrader 5",
         "quote": {"bid": bid, "ask": ask, "time": utc_timestamp(quote_time)},
-        "candles": candles,
+        "candles": frames["M15"], "timeframes": frames, "risk_context": risk,
     }
 
 

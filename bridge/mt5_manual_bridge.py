@@ -16,10 +16,11 @@ import importlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from urllib import request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 
 try:
@@ -81,7 +82,7 @@ def prepare_draft(mt5, settings, ledger, preparation, now):
     """Validate fixed protection, spread/drift and expiry without any trading API."""
     if not isinstance(preparation, dict) or preparation.get("workflow") != "manual_ticket":
         raise trade.GuardError("The preparation has an unsupported workflow.")
-    payload, entry, stop, target = trade.validate_offer(preparation, settings, now)
+    payload, entry, stop, target = validate_manual_offer(preparation, settings, now)
     expires = trade.utc_date(preparation["expires_at"])
     if expires > now + timedelta(minutes=5):
         raise trade.GuardError("The manual ticket deadline exceeds five minutes.")
@@ -112,16 +113,15 @@ def prepare_draft(mt5, settings, ledger, preparation, now):
     margin_mode = getattr(account, "margin_mode", None)
     if type(margin_mode) is not int or margin_mode not in (0, 1, 2):
         raise trade.GuardError("The account position model could not be verified.")
-    if margin_mode != 2:
-        positions, orders = mt5.positions_get(symbol=settings.market.symbol), mt5.orders_get(symbol=settings.market.symbol)
-        if positions is None or orders is None or len(positions) or len(orders):
-            raise trade.GuardError("The netting symbol must have no existing positions or pending orders.")
+    positions, orders = mt5.positions_get(), mt5.orders_get()
+    if positions is None or orders is None or len(positions) or len(orders):
+        raise trade.GuardError("The account must have no existing positions or pending orders.")
     tick = mt5.symbol_info_tick(settings.market.symbol)
     if tick is None:
         raise trade.GuardError("A fresh executable quote is required.")
     stamp = market.broker_timestamp_utc(getattr(tick, "time", None), settings.market)
     bid, ask = (trade.positive_decimal(getattr(tick, key, None)) for key in ("bid", "ask"))
-    if ask < bid or not -trade.EXECUTABLE_QUOTE_FUTURE_TOLERANCE_SECONDS <= now.timestamp() - stamp <= 30:
+    if ask <= bid or not -trade.EXECUTABLE_QUOTE_FUTURE_TOLERANCE_SECONDS <= now.timestamp() - stamp <= 10:
         raise trade.GuardError("The quote is stale, crossed or future-dated.")
     price = ask if direction == "BUY" else bid
     if ask - bid + abs(price - entry) > abs(entry - stop) * trade.MAX_DRIFT_R:
@@ -131,7 +131,66 @@ def prepare_draft(mt5, settings, ledger, preparation, now):
         raise trade.GuardError("The fixed BUY stops no longer satisfy the broker quote.")
     if direction == "SELL" and (not target < price < stop or stop - ask < distance or ask - target < distance):
         raise trade.GuardError("The fixed SELL stops no longer satisfy the broker quote.")
-    return native.Draft(settings.market.symbol, direction, settings.volume, stop, target, digits, expires)
+    try:
+        current = market.build_payload(mt5, settings.market, now)
+        risk = current["risk_context"]
+        if risk["costs_verified"] is not True or risk["open_positions"] or risk["pending_orders"]:
+            raise trade.GuardError("Verified costs and an unexposed account are required.")
+        costs = {key: float(risk[key]) for key in ("commission_round_turn", "slippage_price", "loss_cash_per_price_unit", "profit_cash_per_price_unit")}
+        if payload.get("cost_context") != costs or payload.get("broker_fingerprint") != risk["broker_fingerprint"]:
+            raise trade.GuardError("The qualified broker or cost model changed.")
+        for key, frame, seconds in (("bar_time", "M1", 60), ("confirmation_bar_time", "M5", 300), ("direction_bar_time", "M15", 900)):
+            reference = trade.utc_date(payload[key])
+            if not any(trade.utc_date(row["time"]) == reference for row in current["timeframes"][frame]):
+                raise trade.GuardError("The completed timeframe reference is unavailable.")
+        slippage = Decimal(str(risk["slippage_price"]))
+        commission = Decimal(str(risk["commission_round_turn"]))
+        loss = (abs(price - stop) + 2 * slippage) * Decimal(str(risk["loss_cash_per_price_unit"])) + commission
+        gain = (abs(target - price) - 2 * slippage) * Decimal(str(risk["profit_cash_per_price_unit"])) - commission
+        if loss <= 0 or loss > Decimal(str(risk["equity"])) * Decimal("0.01") or gain / loss < Decimal("1.5") or risk["free_margin"] < 2 * risk["margin_required"]:
+            raise trade.GuardError("The current cash risk, reward or margin guard failed.")
+    except market.MarketDataError:
+        raise trade.GuardError("Current three-timeframe risk data is unavailable.") from None
+    return native.Draft(
+        settings.market.symbol, direction, settings.volume, stop, target, digits, expires,
+        **{key: payload[key] for key in ("display_timeframe", "strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint", "qualification_id")},
+        direction_bar_time=trade.utc_date(payload["direction_bar_time"]),
+        confirmation_bar_time=trade.utc_date(payload["confirmation_bar_time"]),
+        bar_time=trade.utc_date(payload["bar_time"]),
+    )
+
+
+def validate_manual_offer(offer, settings, now):
+    """Qualified M1 requests never reuse the legacy automatic M15 validator."""
+    if type(offer) is not dict or type(offer.get("payload")) is not dict:
+        raise trade.GuardError("Invalid manual proposal.")
+    trade.uuid_text(offer.get("id"))
+    trade.uuid_text(offer.get("claim_id"))
+    payload = offer["payload"]
+    if (
+        payload.get("symbol") != settings.market.symbol or payload.get("account_mode") != "demo"
+        or trade.positive_decimal(payload.get("volume")) != settings.volume
+        or payload.get("direction") not in ("BUY", "SELL") or payload.get("provisional") is True
+        or payload.get("strategy_id") != "mtf-ema-pullback-60m-v1"
+        or type(payload.get("strategy_version")) is not int or payload["strategy_version"] != 1
+        or payload.get("policy_id") != "mtf-manual-demo-cost-risk-v1"
+        or payload.get("display_timeframe") != "M1"
+        or type(payload.get("horizon_seconds")) is not int or payload["horizon_seconds"] != 3600
+        or any(type(payload.get(key)) is not str or re.fullmatch(r"[0-9a-f]{64}", payload[key]) is None for key in ("strategy_fingerprint", "qualification_id", "broker_fingerprint"))
+    ):
+        raise trade.GuardError("A qualified three-timeframe manual Demo proposal is required.")
+    expires, bar = trade.utc_date(offer.get("expires_at")), trade.utc_date(payload.get("bar_time"))
+    decision = trade.utc_date(payload.get("decision_time"))
+    if not bar + timedelta(minutes=1) <= decision <= now < expires <= min(now + timedelta(minutes=5), bar + timedelta(minutes=6)) or now - (bar + timedelta(minutes=1)) > timedelta(seconds=10):
+        raise trade.GuardError("The manual M1 entry window of 10 seconds or its deadline expired.")
+    for key, seconds in (("bar_time", 60), ("confirmation_bar_time", 300), ("direction_bar_time", 900)):
+        stamp = trade.utc_date(payload[key])
+        if stamp.microsecond or stamp.timestamp() % seconds or not timedelta(0) <= bar + timedelta(minutes=1) - (stamp + timedelta(seconds=seconds)) < timedelta(seconds=seconds):
+            raise trade.GuardError("The closed timeframe references are invalid.")
+    entry, stop, target = (trade.positive_decimal(payload.get(key)) for key in ("entry", "stop", "target"))
+    if not (stop < entry < target if payload["direction"] == "BUY" else target < entry < stop) or trade.positive_decimal(payload.get("max_drift_r")) != trade.MAX_DRIFT_R:
+        raise trade.GuardError("The frozen manual protection or drift limit is invalid.")
+    return payload, entry, stop, target
 
 
 class ManualJournal:
@@ -188,6 +247,9 @@ def prepare_ticket(mt5, settings, ledger, journal, adapter, preparation, *, cloc
 
         def recheck():
             fresh = prepare_draft(mt5, settings, ledger, preparation, clock())
+            # SDK history/risk reads can consume the remaining entry window.
+            # Re-read the clock after them, immediately before native work.
+            validate_manual_offer(preparation, settings, clock())
             if fresh != draft:
                 raise trade.GuardError("The fixed native draft changed during preparation.")
 
@@ -205,6 +267,24 @@ def prepare_ticket(mt5, settings, ledger, journal, adapter, preparation, *, cloc
     else:
         print("Native Demo ticket prepared. Review SL/TP, then choose Buy or Sell yourself in MT5.", flush=True)
     return result
+
+
+def service_failure_reason(error):
+    """Expose only authored transport codes, never URLs, bodies or error text."""
+    if isinstance(error, HTTPError):
+        code = error.code
+        if type(code) is int:
+            return {
+                401: "bridge_authorization_rejected",
+                404: "manual_api_unavailable",
+                409: "older_snapshot",
+                422: "feed_version_or_data_rejected",
+                503: "service_not_ready",
+            }.get(code, "service_unavailable")
+        return "service_unavailable"
+    if isinstance(error, (URLError, TimeoutError)):
+        return "connection_unavailable"
+    return "service_unavailable"
 
 
 def api_post(settings, route, payload):
@@ -304,6 +384,7 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
         outage_reported = False
         chart_outage_reported = False
         latest_feed = None
+        last_mtf_state = None
 
         def chart_unavailable():
             nonlocal chart_outage_reported
@@ -320,7 +401,7 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
         def unavailable(reason):
             nonlocal feed_available, next_feed, outage_reported
             feed_available = False
-            next_feed = time.monotonic() + trade.POLL_SECONDS
+            next_feed = time.monotonic() + 5
             chart_unavailable()
             if not outage_reported:
                 print("MT5 feed unavailable (" + reason + ").", file=sys.stderr, flush=True)
@@ -336,7 +417,7 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
                     payload["execution"] = trade.execution_metadata(mt5.symbol_info(settings.market.symbol))
                     post(settings, "market", payload)
                     latest_feed = payload
-                    cadence = min(trade.FEED_SECONDS, chart.FEED_REFRESH_SECONDS) if exporter is not None else trade.FEED_SECONDS
+                    cadence = chart.FEED_REFRESH_SECONDS
                     next_feed = time.monotonic() + cadence
                     if not feed_available:
                         print("Fresh MT5 feed ready.", flush=True)
@@ -355,8 +436,14 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
                     reply = post(settings, "poll", {"device_id": ledger.device_id})
                     preparation = reply.get("preparation")
                     if preparation is not None:
+                        last_mtf_state = "qualified_preparation"
                         prepare_ticket(mt5, settings, ledger, journal, adapter, preparation, clock=clock)
                         flush_results(settings, ledger, journal, post)
+                    else:
+                        state = "unverified_costs" if latest_feed.get("risk_context", {}).get("costs_verified") is not True else "waiting_qualified_signal"
+                        if state != last_mtf_state:
+                            print("MTF status: " + state, flush=True)
+                            last_mtf_state = state
             except market.MarketDataError as error:
                 if error.reason_code == "terminal_installation_mismatch":
                     raise
@@ -364,9 +451,9 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
                 unavailable(reason)
             except (trade.GuardError, native.TicketError):
                 raise
-            except Exception:
-                unavailable("service_unavailable")
-            sleep(trade.POLL_SECONDS)
+            except Exception as error:
+                unavailable(service_failure_reason(error))
+            sleep(5)
         print("MT5 closed; manual helper stopped.", flush=True)
         return 0
     except KeyboardInterrupt:
