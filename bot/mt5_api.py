@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from bot import manual_ticket_store, market_store, proposal_overlay, trade_store
+from bot import manual_ticket_store, market_store, mtf_runtime, proposal_overlay, trade_store
 
 MAX_CONTROL_BYTES = 8192
 
@@ -60,7 +60,7 @@ def install_routes(app, application, settings):
         manual_flag = getattr(service, "manual_tickets_enabled", False)
         if type(automatic_flag) is not bool or type(manual_flag) is not bool:
             return None, None, JSONResponse({"detail": "Requested MT5 workflow is not configured"}, status_code=404)
-        automatic = automatic_flag is True
+        automatic = False
         # The configured manual mode must block legacy execution even if a
         # stale service object still advertises automatic execution.
         manual = manual_flag is True or os.getenv("MT5_MANUAL_TICKETS_ENABLED", "false").strip().lower() == "true"
@@ -203,8 +203,10 @@ def install_routes(app, application, settings):
         if (
             feed.get("device_id") != str(device_id) or "execution" not in feed
             or not timedelta(0) <= now - snapshot["updated_at"] <= timedelta(seconds=180)
-            or not timedelta(seconds=-5) <= now - _utc(feed["quote"]["time"]) <= timedelta(seconds=30)
+            or not timedelta(seconds=-5) <= now - _utc(feed["quote"]["time"]) <= timedelta(seconds=10)
         ):
+            return None
+        if mtf_runtime.evaluate_feed(feed, now).get("state") != "signal":
             return None
         return (device, now, feed) if include_feed else (device, now)
 
@@ -253,19 +255,34 @@ def install_routes(app, application, settings):
             _policy(device)
             await trade_store.heartbeat(service.pool, service.bot_id, device_id, now)
             await manual_ticket_store.expire_offers(service.pool, service.bot_id, now)
-            current = await fresh_manual_device(service, device_id)
+            current = await fresh_manual_device(service, device_id, include_feed=True)
             if current is None or await service.risk_pause(current[0]["owner_chat_id"]) is not None:
                 return {"preparation": None}
+            owner = (current[0]["owner_chat_id"], current[0]["owner_user_id"])
             # Re-read after asynchronous risk/storage work. A heartbeat cannot
             # substitute for a fresh feed or refresh the frozen offer expiry.
-            current = await fresh_manual_device(service, device_id)
-            if current is None:
+            current = await fresh_manual_device(service, device_id, include_feed=True)
+            if current is None or (current[0]["owner_chat_id"], current[0]["owner_user_id"]) != owner:
                 return {"preparation": None}
-            _, now = current
-            offer = await manual_ticket_store.claim_offer(service.pool, service.bot_id, device_id, now)
+            _, now, feed = current
+            qualified = mtf_runtime.evaluate_feed(feed, now)
+            if not mtf_runtime.eligible_result(qualified, now):
+                return {"preparation": None}
+            proposal_context = {key: qualified[key] for key in ("direction", "bar_time", "confirmation_bar_time", "direction_bar_time", "broker_fingerprint", "policy_id", "cost_context", "execution")}
+            offer = await manual_ticket_store.claim_offer(service.pool, service.bot_id, device_id, now, qualification_id=qualified["qualification_id"], strategy_fingerprint=qualified["strategy_fingerprint"], proposal_context=proposal_context)
         except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
             return JSONResponse({"detail": "Invalid device or market data"}, status_code=422)
         if offer is None:
+            return {"preparation": None}
+        try:
+            current = await fresh_manual_device(service, device_id, include_feed=True)
+            if (
+                current is None or (current[0]["owner_chat_id"], current[0]["owner_user_id"]) != owner
+                or (offer["chat_id"], offer["user_id"]) != owner
+                or not mtf_runtime.eligible_payload(offer["payload"], current[2], current[1])
+            ):
+                return {"preparation": None}
+        except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
             return {"preparation": None}
         return {"preparation": {
             "id": str(offer["id"]), "claim_id": str(offer["claim_id"]), "workflow": "manual_ticket",

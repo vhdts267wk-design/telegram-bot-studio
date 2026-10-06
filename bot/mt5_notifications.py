@@ -22,7 +22,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CallbackQueryHandler, CommandHandler
 
-from bot import manual_ticket_store, market_monitor, market_store, proposal_overlay, trade_store
+from bot import manual_ticket_store, market_monitor, market_store, mtf_runtime, proposal_overlay, trade_store
 
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ def _manual_enabled(service) -> bool:
 
 
 def _automatic_enabled(service) -> bool:
-    return service is not None and getattr(service, "trading_enabled", False) is True and not _manual_enabled(service)
+    return False
 
 
 def _service(context):
@@ -117,18 +117,20 @@ def _execution_metadata(feed):
 
 
 def _normalise_signal(result, feed):
-    """Keep the actual trigger close and round protective levels outwards."""
+    """Preserve an empirically qualified executable entry and frozen SL/TP."""
+    if not mtf_runtime.eligible_result(result):
+        raise ValueError("Qualified multi-timeframe evidence is required.")
     tick, digits, quantum = _execution_metadata(feed)
     direction = result.get("direction")
     if direction not in ("BUY", "SELL"):
         raise ValueError("An ordered BUY or SELL setup is required.")
     trigger = _utc(result["bar_time"])
-    original = next((bar for bar in feed["candles"] if _utc(bar["time"]) == trigger), None)
+    original = next((bar for bar in feed["timeframes"]["M1"] if _utc(bar["time"]) == trigger), None)
     if original is None:
         raise ValueError("The triggering broker candle is unavailable.")
-    entry = Decimal(str(_positive(original["close"])))
+    entry = Decimal(str(_positive(result["entry"])))
     if entry.quantize(quantum) != entry:
-        raise ValueError("The triggering close cannot be represented at broker precision.")
+        raise ValueError("The executable entry cannot be represented at broker precision.")
     stop, target = (Decimal(str(_positive(result[key]))) for key in ("stop", "target"))
     stop = (stop / tick).to_integral_value(rounding=ROUND_FLOOR if direction == "BUY" else ROUND_CEILING) * tick
     target = (target / tick).to_integral_value(rounding=ROUND_CEILING if direction == "BUY" else ROUND_FLOOR) * tick
@@ -144,6 +146,8 @@ def _normalise_signal(result, feed):
 
 def _offer_grid_matches(payload, feed) -> bool:
     try:
+        if not mtf_runtime.eligible_payload(payload, feed):
+            return False
         tick, digits, quantum = _execution_metadata(feed)
         if type(payload.get("price_digits")) is not int or payload["price_digits"] != digits:
             return False
@@ -187,7 +191,7 @@ def _fresh_feed(snapshot, device, now) -> dict | None:
             if not 0 <= age <= FRESH_SECONDS:
                 return None
         quote_age = (now - _utc(validated["quote"]["time"])).total_seconds()
-        if not -QUOTE_FUTURE_TOLERANCE_SECONDS <= quote_age <= FRESH_SECONDS:
+        if not -QUOTE_FUTURE_TOLERANCE_SECONDS <= quote_age <= 10:
             return None
         return validated
     except (KeyError, TypeError, ValueError, OverflowError, AttributeError, DecimalException):
@@ -235,15 +239,16 @@ def _effective_status(offer) -> str:
 
 
 def _manual_status_text(status: str) -> str:
+    if status == "expired":
+        return _manual_expired_text()
     return {
         "draft": "اقتراح تجهيز النافذة قيد التحضير؛ حاول بعد قليل.",
         "offered": "الاقتراح ينتظر اختيارك لتجهيز نافذة MT5 على اللابتوب.",
-        "requested": "طُلب تجهيز نافذة MT5 مع TP وSL فقط؛ تضغط Buy أو Sell بنفسك على اللابتوب.",
+        "requested": "طُلب تجهيز نافذة MT5 مع TP وSL فقط؛ انتظر تأكيد التجهيز. Buy أو Sell بنفسك ضمن مهلة الدخول فقط؛ الأداء التاريخي لا يضمن هذه الصفقة.",
         "preparing": "الجهاز يجهّز نافذة MT5؛ انتظر نتيجة التجهيز ولا تكرر الطلب.",
-        "prepared": "وصل تأكيد تجهيز النافذة؛ راجع TP وSL واضغط Buy أو Sell بنفسك إذا أردت التنفيذ.",
+        "prepared": "تأكد تجهيز النافذة فقط؛ لم تُرسل صفقة من طلب التجهيز. Buy أو Sell بنفسك ضمن مهلة الدخول فقط؛ الأداء التاريخي لا يضمن هذه الصفقة.",
         "rejected": "تم رفض تجهيز النافذة؛ لم يُطلب تنفيذ صفقة.",
-        "expired": "انتهت صلاحية اقتراح التجهيز؛ اطلب تحليلاً حديثاً.",
-        "cancelled": "أُلغي طلب التجهيز المعلّق؛ راجع أي نافذة مفتوحة على اللابتوب.",
+        "cancelled": "أُلغي طلب التجهيز؛ ألغِ أي نافذة طلب مفتوحة في MT5 وانتظر فرصة جديدة ببيانات حديثة.",
         "failed": "تعذّر تجهيز نافذة MT5؛ راجع إشعار النتيجة.",
         "unknown": "حالة تجهيز النافذة غير مؤكدة؛ تحقق من MT5. لا تُجرى إعادة تلقائية.",
     }.get(status, "طلب تجهيز النافذة غير متاح.")
@@ -260,14 +265,35 @@ def _manual_effective_status(offer) -> str:
     return status
 
 
-async def _show_decision(query, status: str, *, manual=False):
-    text = _manual_status_text(status) if manual else _status_text(status)
+def _manual_entry_window_expired(offer, status: str, now) -> bool:
+    # A prepared receipt, legacy five-minute expiry, or renewed heartbeat must
+    # never extend the absolute ten-second window after the triggering M1 close.
+    return status in {"requested", "preparing", "prepared", "failed", "unknown"} and not mtf_runtime.entry_window_open(
+        offer.get("payload") if offer is not None else None, now,
+    )
+
+
+def _manual_expired_text() -> str:
+    return "انتهت مهلة الدخول (10 ثوانٍ من إغلاق M1). ألغِ أي نافذة طلب مفتوحة في MT5 وانتظر فرصة جديدة ببيانات حديثة. التجهيز لا يعني تنفيذ صفقة."
+
+
+async def _show_decision(query, status: str, *, manual=False, offer=None):
+    expired = manual and _manual_entry_window_expired(offer, status, market_monitor.utc_now())
+    text = _manual_expired_text() if expired else _manual_status_text(status) if manual else _status_text(status)
     await _answer(query, text)
     if status in ("draft", "offered"):
         return
     try:
-        original = getattr(query.message, "text", "") or "إشارة MT5"
-        await query.edit_message_text(original[:3600] + "\n\n" + text, parse_mode=None, reply_markup=None)
+        # Answering Telegram can itself outlast the window. Replace old offer
+        # instructions instead of retaining a stale Buy/Sell direction above
+        # the cancellation message.
+        expired = manual and _manual_entry_window_expired(offer, status, market_monitor.utc_now())
+        if expired or (manual and status in {"expired", "cancelled"}):
+            edited = _manual_expired_text() if expired else text
+        else:
+            original = getattr(query.message, "text", "") or "إشارة MT5"
+            edited = original[:3600] + "\n\n" + text
+        await query.edit_message_text(edited, parse_mode=None, reply_markup=None)
     except Exception as error:
         logger.warning("MT5 decision message update failed (%s).", type(error).__name__)
 
@@ -297,7 +323,9 @@ async def connect_mt5_command(update, context):
         if not _demo_policy(device):
             await message.reply_text("هذه النسخة تسمح بحساب Demo وحجم 0.01 lot فقط؛ لم تُفعّل تنبيهات هذا الجهاز.", parse_mode=None)
             return
-        await market_store.enable_subscription(service.pool, service.bot_id, message.chat.id, now)
+        await market_store.enable_subscription(
+            service.pool, service.bot_id, message.chat.id, now, interval=market_store.MTF_DELIVERY_INTERVAL,
+        )
         mode = "Demo" if device["account_mode"] == "demo" else "Real"
         volume = _positive(device["volume"])
         explanation = (
@@ -363,7 +391,7 @@ async def _decision_callback(update, context, *, manual):
             await _answer(query, "هذا الجهاز غير مقترن بك حالياً.", alert=True)
             return
         if offer["status"] != "offered":
-            await _show_decision(query, effective_status(offer), manual=manual)
+            await _show_decision(query, effective_status(offer), manual=manual, offer=offer)
             return
         if not await trade_store.subscription_active(service.pool, service.bot_id, message.chat.id):
             await _show_decision(query, "cancelled", manual=manual)
@@ -398,9 +426,9 @@ async def _decision_callback(update, context, *, manual):
         )
         if updated is None:
             latest = await store.get_offer(service.pool, service.bot_id, offer_id)
-            await _show_decision(query, effective_status(latest) if latest is not None else "unavailable", manual=manual)
+            await _show_decision(query, effective_status(latest) if latest is not None else "unavailable", manual=manual, offer=latest)
         else:
-            await _show_decision(query, effective_status(updated), manual=manual)
+            await _show_decision(query, effective_status(updated), manual=manual, offer=updated)
     except Exception as error:
         logger.warning("MT5 decision failed (%s).", type(error).__name__)
         await _answer(query, "تعذر حفظ القرار؛ تحقق من الحالة قبل إعادة المحاولة.", alert=True)
@@ -426,11 +454,14 @@ def _manual_offer_text(payload, expires_at) -> str:
         f"اقتراح تجهيز صفقة على اللابتوب — {payload['symbol']}\n"
         f"{payload['direction']} | Demo | الحجم: {payload['volume']:g} lot\n"
         f"دخول مرجعي: {payload['entry']:.{digits}f}\nSL وقف: {payload['stop']:.{digits}f}\nTP هدف: {payload['target']:.{digits}f}\n"
-        f"منطقة دخول مرجعية قبل السبريد: {zone['entry_zone_low']:.{digits}f} – {zone['entry_zone_high']:.{digits}f}\n"
+        f"منطقة الدخول: {zone['entry_zone_low']:.{digits}f} – {zone['entry_zone_high']:.{digits}f}\n"
+        f"TP2: {payload['target2']:.{digits}f} | العائد/المخاطرة: {payload['nominal_reward_risk']:.2f}:1؛ بعد التكاليف {payload['effective_reward_risk']:.2f}:1\n"
+        "السبب: M15 اتجاه، M5 تأكيد ارتداد، M1 كسر متوافق بإغلاق مكتمل؛ اجتازت فلاتر المخاطر والسبريد والنشاط والأدلة خارج العينة.\n"
+        "الإلغاء: مرور عشر ثوانٍ من إغلاق M1، تغيّر الاتجاه أو التأكيد، تقادم البيانات، أو فشل المخاطر. مدة تقييم TP1 قبل SL: 60 دقيقة من الدخول.\n"
         f"صلاحية طلب التجهيز حتى: {_utc(expires_at):%Y-%m-%d %H:%M:%S} UTC\n"
         "«جهّز على اللابتوب» يفتح نافذة MT5 ويملأ TP وSL فقط؛ لا يرسل صفقة. "
         "تراجع الرمز والحجم والأسعار وتضغط Buy أو Sell بنفسك داخل MT5.\n"
-        "الدخول مرجعي؛ تُراجع حداثة السعر والجهاز ويُرفض التجهيز إذا تغير السعر بأكثر من 0.1R."
+        "يُرفض التجهيز إذا تجاوز السبريد وانحراف الدخول معاً 0.1R. الأداء التاريخي لا يضمن هذه الصفقة."
     )
 
 
@@ -444,9 +475,9 @@ async def send_offers(service, bot):
         now = market_monitor.utc_now()
         await store.expire_offers(service.pool, service.bot_id, now)
         result, _, signal_id = await service.signals()
-        if result.get("state") != "signal" or not signal_id:
+        if result.get("state") != "signal" or not signal_id or not mtf_runtime.eligible_result(result, now):
             return True
-        expiry = min(_utc(result["bar_time"]) + timedelta(minutes=30), now + timedelta(minutes=OFFER_MINUTES))
+        expiry = _utc(result["bar_time"]) + timedelta(seconds=70)
         if expiry <= now:
             return True
         snapshot = await market_store.get_cache(service.pool, service.bot_id, "broker_feed")
@@ -468,6 +499,8 @@ async def send_offers(service, bot):
                 )
                 if manual:
                     payload["workflow"] = "manual_ticket"
+                if not mtf_runtime.eligible_payload(payload, feed, market_monitor.utc_now()):
+                    continue
                 offer = await store.create_offer(
                     service.pool, service.bot_id, device["device_id"], chat_id, user_id,
                     signal_id, payload, now, expiry,
@@ -475,6 +508,10 @@ async def send_offers(service, bot):
                 if offer is None or offer["status"] != "draft" or _utc(offer["expires_at"]) <= market_monitor.utc_now():
                     continue
                 if not await trade_store.subscription_active(service.pool, service.bot_id, chat_id):
+                    continue
+                current_snapshot = await market_store.get_cache(service.pool, service.bot_id, "broker_feed")
+                current_feed = _fresh_feed(current_snapshot, device, market_monitor.utc_now())
+                if current_feed is None or not mtf_runtime.eligible_payload(offer["payload"], current_feed, market_monitor.utc_now()):
                     continue
                 offer_id = _id(offer["id"])
                 markup = InlineKeyboardMarkup([[
@@ -538,11 +575,13 @@ def _result_text(offer) -> str:
     return text
 
 
-def _manual_result_text(offer) -> str:
+def _manual_result_text(offer, now) -> str:
     status = _manual_effective_status(offer)
     no_claim = offer.get("decided_at") is not None and offer.get("preparing_at") is None
-    if status == "prepared":
-        heading = "✅ تم تجهيز نافذة الصفقة على اللابتوب مع TP وSL. راجعها واضغط Buy أو Sell بنفسك داخل MT5 إذا أردت التنفيذ. لم تُرسل صفقة من طلب التجهيز."
+    if _manual_entry_window_expired(offer, status, now):
+        heading = _manual_expired_text()
+    elif status == "prepared":
+        heading = "✅ تم تجهيز نافذة الصفقة على اللابتوب مع TP وSL فقط؛ لم تُرسل صفقة من طلب التجهيز. إذا كانت مهلة الدخول ما زالت مفتوحة، راجعها واضغط Buy أو Sell بنفسك داخل MT5. بعد 10 ثوانٍ من إغلاق M1 ألغِ النافذة وانتظر فرصة جديدة. القرار والتنفيذ يدويان؛ الأداء التاريخي لا يضمن هذه الصفقة."
     elif status == "failed":
         heading = "تعذّر تجهيز نافذة الصفقة على اللابتوب؛ لم يُطلب تنفيذ صفقة. راجع نافذة MT5 قبل إعادة المحاولة."
     elif status in ("expired", "cancelled") and no_claim:
@@ -571,7 +610,7 @@ async def send_results(service, bot):
                 or not _owner(device, offer["chat_id"], offer["user_id"])
             ):
                 continue
-            text = _manual_result_text(offer) if manual else _result_text(offer)
+            text = _manual_result_text(offer, market_monitor.utc_now()) if manual else _result_text(offer)
             await bot.send_message(offer["chat_id"], text, parse_mode=None)
             await store.mark_notified(service.pool, service.bot_id, offer["id"], market_monitor.utc_now())
         except Forbidden:

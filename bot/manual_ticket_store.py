@@ -202,9 +202,16 @@ async def decide(pool, bot_id, offer_id, chat_id, user_id, message_id, decision,
     return _offer(row)
 
 
-async def claim_offer(pool, bot_id, device_id, now):
+async def claim_offer(pool, bot_id, device_id, now, *, qualification_id=None, strategy_fingerprint=None, proposal_context=None):
     """Reserve one preparation; never reclaim an interrupted or final request."""
     bot_id, device_id, now = _identifier(bot_id, positive=True), _uuid(device_id), _utc(now)
+    from bot.strategy_evidence import hex_digest
+    if not hex_digest(qualification_id) or not hex_digest(strategy_fingerprint):
+        return None
+    required_context = {"direction", "bar_time", "confirmation_bar_time", "direction_bar_time", "broker_fingerprint", "policy_id", "cost_context", "execution"}
+    if type(proposal_context) is not dict or set(proposal_context) != required_context:
+        return None
+    context = _json_object(proposal_context)
     row = await pool.fetchrow(
         """
         WITH candidate AS (
@@ -213,6 +220,13 @@ async def claim_offer(pool, bot_id, device_id, now):
             JOIN market_subscriptions AS subscription
                 ON subscription.bot_id = offer.bot_id AND subscription.chat_id = offer.chat_id
             WHERE offer.bot_id = $1 AND offer.device_id = $2 AND offer.status = 'requested'
+                AND offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-v1'
+                AND offer.payload->>'qualification_id' = $6
+                AND offer.payload->>'strategy_fingerprint' = $7
+                AND offer.payload->>'strategy_version' = '1'
+                AND offer.payload->>'horizon_seconds' = '3600'
+                AND offer.payload->>'display_timeframe' = 'M1'
+                AND offer.payload @> $8::jsonb
                 AND offer.expires_at > $3 AND offer.decided_at <= $3
                 AND device.owner_chat_id = offer.chat_id AND device.owner_user_id = offer.user_id
                 AND offer.chat_id = offer.user_id
@@ -231,7 +245,7 @@ async def claim_offer(pool, bot_id, device_id, now):
         SELECT claimed.*, device.symbol, device.account_mode, device.volume FROM claimed
         JOIN mt5_devices AS device ON device.bot_id = claimed.bot_id AND device.device_id = claimed.device_id
         """,
-        bot_id, device_id, now, now - HEARTBEAT_TTL, uuid4(),
+        bot_id, device_id, now, now - HEARTBEAT_TTL, uuid4(), qualification_id, strategy_fingerprint, context,
     )
     return _offer(row)
 

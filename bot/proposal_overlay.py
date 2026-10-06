@@ -10,6 +10,7 @@ import math
 from uuid import UUID
 
 from bot.manual_ticket_store import MAX_OFFER_TTL, PREPARATION_TIMEOUT
+from bot import mtf_runtime
 
 VISIBLE_STATUSES = frozenset({"offered", "requested", "preparing", "prepared"})
 REFERENCE_RADIUS_R = Decimal("0.1")
@@ -119,6 +120,8 @@ def build_chart_overlay(offer, device, feed, now):
         ):
             return None
         payload = offer["payload"]
+        if not mtf_runtime.eligible_payload(payload, feed, now):
+            return None
         symbol = device["symbol"]
         if (
             payload.get("workflow") != "manual_ticket" or payload.get("state") != "signal"
@@ -128,7 +131,7 @@ def build_chart_overlay(offer, device, feed, now):
             or payload.get("source_identity") != f"mt5:{symbol}:{device_id}"
             or feed.get("timeframe") != "M15" or feed.get("source") != "MetaTrader 5"
             or _execution(payload["execution"]) != _execution(feed["execution"])
-            or not timedelta(seconds=-5) <= now - _utc(feed["quote"]["time"]) <= timedelta(seconds=30)
+            or not timedelta(seconds=-5) <= now - _utc(feed["quote"]["time"]) <= timedelta(seconds=10)
         ):
             return None
         zone = reference_zone(payload)
@@ -136,20 +139,22 @@ def build_chart_overlay(offer, device, feed, now):
             return None
         bar_time = _utc(payload["bar_time"])
         if (
-            int(bar_time.timestamp()) % 900 or bar_time.microsecond
-            or bar_time + timedelta(minutes=15) > created
-            or expiry > bar_time + timedelta(minutes=30)
+            int(bar_time.timestamp()) % 60 or bar_time.microsecond
+            or bar_time + timedelta(minutes=1) > created
+            or expiry > bar_time + timedelta(minutes=6)
         ):
             return None
-        trigger = next((bar for bar in feed["candles"] if _utc(bar["time"]) == bar_time), None)
-        if trigger is None or _positive(trigger["close"]) != _positive(payload["entry"]):
+        trigger = next((bar for bar in feed["timeframes"]["M1"] if _utc(bar["time"]) == bar_time), None)
+        if trigger is None:
             return None
+        expiry = min(expiry, bar_time + timedelta(seconds=70))
         return {
-            "version": 1, "workflow": "chart_overlay", "offer_id": str(UUID(str(offer["id"]))),
-            "status": status, "symbol": symbol, "timeframe": "M15", "direction": payload["direction"],
+            "version": 2, "workflow": "chart_overlay", "offer_id": str(UUID(str(offer["id"]))),
+            "status": status, "symbol": symbol, "timeframe": "M1", "direction": payload["direction"],
             "entry": payload["entry"], **zone, "stop": payload["stop"], "target": payload["target"],
             "price_digits": payload["price_digits"], "execution": dict(payload["execution"]),
             "bar_time": bar_time.isoformat(), "expires_at": expiry.isoformat(),
+            **{key: payload[key] for key in ("strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint", "qualification_id", "direction_bar_time", "confirmation_bar_time")},
         }
     except (KeyError, TypeError, ValueError, OverflowError, AttributeError, DecimalException):
         return None
