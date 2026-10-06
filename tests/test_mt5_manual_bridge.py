@@ -2,13 +2,16 @@
 
 from contextlib import redirect_stdout, redirect_stderr
 from copy import deepcopy
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
+import hashlib
 import io
 import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 from bridge import mt5_manual_bridge as manual
 from bridge import mt5_native_ticket as native
@@ -16,7 +19,20 @@ from bridge import mt5_trade_bridge as trade
 from tests import test_mt5_trade_bridge as fixtures
 
 
-NOW = fixtures.NOW
+NOW = fixtures.NOW + timedelta(days=1)  # Monday, within the complete 60-minute session.
+
+
+def qualified_draft():
+    """Synthetic qualification; no claim about actual empirical evidence."""
+    return native.Draft(
+        "XAUUSD", "BUY", Decimal("0.01"), Decimal("2490"), Decimal("2520"), 2,
+        NOW + timedelta(minutes=5), display_timeframe="M1",
+        strategy_id="mtf-ema-pullback-60m-v1", strategy_version=1,
+        policy_id="mtf-manual-demo-cost-risk-v1", horizon_seconds=3600,
+        strategy_fingerprint="a" * 64, qualification_id="b" * 64,
+        direction_bar_time=NOW - timedelta(minutes=15),
+        confirmation_bar_time=NOW - timedelta(minutes=5), bar_time=NOW - timedelta(minutes=1),
+    )
 
 
 class ManualBridgeTests(unittest.TestCase):
@@ -25,14 +41,42 @@ class ManualBridgeTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         old = self.fixture.settings
-        self.settings = manual.Settings(old.market, old.state_directory, old.account_mode, old.volume, True)
+        verified_market = replace(old.market, cost_model_verified=True,
+                                  commission_round_turn_per_lot=7.0, slippage_price=0.02)
+        self.settings = manual.Settings(verified_market, old.state_directory, old.account_mode, old.volume, True)
         self.mt5, self.ledger = self.fixture.mt5, self.fixture.ledger
+        self.mt5.mock_add_spec([*self.mt5._mock_methods, "order_calc_profit", "order_calc_margin",
+                               "copy_rates_from_pos", "TIMEFRAME_M15", "TIMEFRAME_M5", "TIMEFRAME_M1"])
+        self.mt5.TIMEFRAME_M15, self.mt5.TIMEFRAME_M5, self.mt5.TIMEFRAME_M1 = 15, 5, 1
+        self.mt5.order_calc_profit.side_effect = lambda side, symbol, volume, start, end: (end - start) * (1 if side == 0 else -1)
+        self.mt5.order_calc_margin.return_value = 25.0
+        self.fixture.account.equity, self.fixture.account.margin_free, self.fixture.account.currency = 10000.0, 9000.0, "USD"
+        self.fixture.tick.time = int(NOW.timestamp()) - 1
+        self.rates = {
+            frame: [{"time": int(NOW.timestamp()) - (64 - index) * frame * 60,
+                     "open": 2500.0, "high": 2501.0, "low": 2499.0, "close": 2500.0, "tick_volume": 120}
+                    for index in range(64)]
+            for frame in (15, 5, 1)
+        }
+        self.mt5.copy_rates_from_pos.side_effect = lambda symbol, frame, start, count: self.rates[frame]
         self.journal = manual.ManualJournal(self.ledger)
         self.preparation = deepcopy(self.fixture.offer)
         self.preparation["workflow"] = "manual_ticket"
+        self.preparation["expires_at"] = trade.iso_date(NOW + timedelta(minutes=5))
         self.preparation["payload"].update(
             execution=trade.execution_metadata(self.fixture.symbol), price_digits=2,
-            original_stop_distance=10.0,
+            original_stop_distance=10.0, state="signal", provisional=False,
+            strategy_id="mtf-ema-pullback-60m-v1", strategy_version=1,
+            policy_id="mtf-manual-demo-cost-risk-v1", horizon_seconds=3600,
+            strategy_fingerprint="a" * 64, qualification_id="b" * 64, display_timeframe="M1",
+            bar_time=trade.iso_date(NOW - timedelta(minutes=1)),
+            decision_time=trade.iso_date(NOW),
+            direction_bar_time=trade.iso_date(NOW - timedelta(minutes=15)),
+            confirmation_bar_time=trade.iso_date(NOW - timedelta(minutes=5)),
+            entry_zone_low=2499.0, entry_zone_high=2501.0, target2=2530.0,
+            broker_fingerprint=hashlib.sha256(("MT5|" + self.fixture.account.server + "|" + self.settings.market.symbol).encode()).hexdigest(),
+            cost_context={"commission_round_turn": 0.07, "slippage_price": 0.02,
+                          "loss_cash_per_price_unit": 1.0, "profit_cash_per_price_unit": 1.0},
         )
         # A manual helper must work while external algorithmic trading is off.
         self.fixture.terminal_info.trade_allowed = False
@@ -40,6 +84,8 @@ class ManualBridgeTests(unittest.TestCase):
         self.fixture.account.trade_expert = False
         self.mt5.order_send.side_effect = AssertionError("A draft must never send an order")
         self.mt5.order_check.side_effect = AssertionError("A draft must never call order_check")
+        self.feed = manual.market.build_payload(self.mt5, self.settings.market, NOW)
+        self.feed["execution"] = trade.execution_metadata(self.fixture.symbol)
 
     def draft(self, preparation=None):
         return manual.prepare_draft(self.mt5, self.settings, self.ledger, preparation or self.preparation, NOW)
@@ -51,8 +97,112 @@ class ManualBridgeTests(unittest.TestCase):
         self.assertEqual((draft.stop, draft.target, draft.volume), (Decimal("2490"), Decimal("2520"), Decimal("0.01")))
         self.assertEqual(self.ledger.device_id, identity)
         self.assertEqual(self.ledger.value("binding"), binding)
+        self.assertEqual(draft.display_timeframe, "M1")
+        self.assertEqual(draft.qualification_id, self.preparation["payload"]["qualification_id"])
+        self.assertEqual(draft.bar_time, NOW - timedelta(minutes=1))
         self.mt5.order_send.assert_not_called()
         self.mt5.order_check.assert_not_called()
+
+    def test_manual_entry_window_allows_ten_seconds_and_rejects_later_fresh_quotes(self):
+        for seconds in (10, 10.000001, 11):
+            clock = NOW + timedelta(seconds=seconds)
+            self.fixture.tick.time = int(clock.timestamp())
+            with self.subTest(seconds=seconds):
+                if seconds <= 10:
+                    draft = manual.prepare_draft(self.mt5, self.settings, self.ledger, self.preparation, clock)
+                    self.assertEqual((draft.stop, draft.target), (Decimal("2490"), Decimal("2520")))
+                else:
+                    with self.assertRaisesRegex(trade.GuardError, "10 seconds"):
+                        manual.prepare_draft(self.mt5, self.settings, self.ledger, self.preparation, clock)
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_original_manual_decision_must_be_causal_and_not_future(self):
+        for decision in (NOW - timedelta(microseconds=1), NOW + timedelta(seconds=1), None):
+            changed = deepcopy(self.preparation)
+            changed["payload"]["decision_time"] = trade.iso_date(decision) if decision is not None else None
+            with self.subTest(decision=decision), self.assertRaises(trade.GuardError):
+                manual.prepare_draft(self.mt5, self.settings, self.ledger, changed, NOW)
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_legacy_or_missing_qualification_blocks_without_native_preparation(self):
+        for field, value in (("strategy_id", trade.STRATEGY_ID), ("display_timeframe", "M15"),
+                             ("qualification_id", ""), ("strategy_fingerprint", "unknown"),
+                             ("confirmation_bar_time", trade.iso_date(NOW)), ("horizon_seconds", 900)):
+            preparation = deepcopy(self.preparation)
+            preparation["id"] = str(uuid4())
+            preparation["payload"][field] = value
+            adapter = Mock()
+            with self.subTest(field=field), redirect_stderr(io.StringIO()):
+                result = manual.prepare_ticket(self.mt5, self.settings, self.ledger, self.journal, adapter,
+                                               preparation, clock=lambda: NOW)
+                self.assertEqual(result, {"status": "failed"})
+                adapter.prepare.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_all_account_exposure_blocks_even_on_hedging_accounts_without_symbol_filter(self):
+        self.fixture.account.margin_mode = 2
+        for method in (self.mt5.positions_get, self.mt5.orders_get):
+            for result in ((object(),), None):
+                method.return_value = result
+                with self.subTest(method=method, result=result), self.assertRaises(trade.GuardError):
+                    self.draft()
+            method.return_value = ()
+        self.mt5.positions_get.reset_mock()
+        self.mt5.orders_get.reset_mock()
+        self.draft()
+        self.assertTrue(self.mt5.positions_get.call_args_list)
+        self.assertTrue(self.mt5.orders_get.call_args_list)
+        self.assertTrue(all(call.args == () and call.kwargs == {} for call in self.mt5.positions_get.call_args_list))
+        self.assertTrue(all(call.args == () and call.kwargs == {} for call in self.mt5.orders_get.call_args_list))
+        self.mt5.order_send.assert_not_called()
+
+    def test_unknown_costs_missing_cash_model_low_margin_or_over_one_percent_equity_blocks(self):
+        for configured in (replace(self.settings.market, cost_model_verified=False),
+                           replace(self.settings.market, commission_round_turn_per_lot=None),
+                           replace(self.settings.market, slippage_price=None)):
+            settings = replace(self.settings, market=configured)
+            with self.subTest(configured=configured), self.assertRaises(trade.GuardError):
+                manual.prepare_draft(self.mt5, settings, self.ledger, self.preparation, NOW)
+        for owner, name, changed in ((self.fixture.account, "equity", 1000.0),
+                                     (self.fixture.account, "margin_free", 49.0),
+                                     (self.fixture.account, "currency", None),
+                                     (self.mt5.order_calc_margin, "return_value", None)):
+            original = getattr(owner, name)
+            with self.subTest(name=name):
+                setattr(owner, name, changed)
+                with self.assertRaises((trade.GuardError, manual.market.MarketDataError)):
+                    self.draft()
+                setattr(owner, name, original)
+        profit_model = self.mt5.order_calc_profit.side_effect
+        self.mt5.order_calc_profit.side_effect = None
+        self.mt5.order_calc_profit.return_value = None
+        with self.assertRaises((trade.GuardError, manual.market.MarketDataError)):
+            self.draft()
+        self.mt5.order_calc_profit.side_effect = profit_model
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_exact_quote_boundaries_and_missing_or_future_reference_bars(self):
+        for age in (10, -5):
+            self.fixture.tick.time = int(NOW.timestamp()) - age
+            with self.subTest(age=age):
+                self.draft()
+        self.fixture.tick.time = int(NOW.timestamp()) - 1
+        for frame in (1, 5, 15):
+            original = deepcopy(self.rates[frame])
+            for failure in ("missing", "forming"):
+                self.rates[frame] = deepcopy(original)
+                if failure == "missing":
+                    self.rates[frame].pop()
+                else:
+                    self.rates[frame][-1]["time"] = int(NOW.timestamp())
+                with self.subTest(frame=frame, failure=failure), self.assertRaises((trade.GuardError, manual.market.MarketDataError)):
+                    self.draft()
+            self.rates[frame] = original
+        self.mt5.order_send.assert_not_called()
 
     def test_real_or_switched_account_and_changed_terminal_block_manual_preparation(self):
         for owner, name, changed in (
@@ -68,11 +218,12 @@ class ManualBridgeTests(unittest.TestCase):
                 setattr(owner, name, original)
         self.mt5.order_send.assert_not_called()
 
-    def test_price_grid_stale_quote_spread_drift_and_netting_protections_remain_enforced(self):
+    def test_price_grid_stale_quote_spread_drift_and_account_exposure_protections_remain_enforced(self):
         for owner, name, changed in (
-            (self.fixture.tick, "time", int(NOW.timestamp()) - 31),
+            (self.fixture.tick, "time", int(NOW.timestamp()) - 11),
             (self.fixture.tick, "time", int(NOW.timestamp()) + 6),
             (self.fixture.tick, "ask", 2502.0), (self.fixture.tick, "bid", 2500.2),
+            (self.fixture.tick, "bid", self.fixture.tick.ask),
             (self.fixture.symbol, "trade_stops_level", 2000),
             (self.fixture.symbol, "trade_tick_size", 0.3),
             (self.fixture.symbol, "volume_step", 0.03),
@@ -124,6 +275,52 @@ class ManualBridgeTests(unittest.TestCase):
         self.mt5.order_send.assert_not_called()
         self.mt5.order_check.assert_not_called()
 
+    def test_reopened_journal_with_new_claim_replays_result_without_reopening_native_ticket(self):
+        adapter = Mock()
+        adapter.prepare.return_value = {"status": "prepared"}
+        with redirect_stdout(io.StringIO()):
+            result = manual.prepare_ticket(self.mt5, self.settings, self.ledger, self.journal, adapter,
+                                           self.preparation, clock=lambda: NOW)
+        changed = deepcopy(self.preparation)
+        changed["claim_id"] = str(uuid4())
+        reopened = trade.Ledger(self.settings.state_directory)
+        try:
+            journal = manual.ManualJournal(reopened)
+            self.assertEqual(manual.prepare_ticket(self.mt5, self.settings, reopened, journal, adapter,
+                                                  changed, clock=lambda: NOW), result)
+            self.assertEqual(journal.pending()[0]["claim_id"], changed["claim_id"])
+        finally:
+            reopened.close()
+        adapter.prepare.assert_called_once()
+        self.mt5.order_send.assert_not_called()
+
+    def test_result_transport_failure_preserves_manual_outbox_until_acknowledged_retry(self):
+        self.journal.reserve(self.preparation)
+        self.journal.complete(self.preparation["id"], "prepared")
+        post = Mock(side_effect=manual.HTTPError("https://private.invalid", 503, "private detail", {}, None))
+        with self.assertRaises(manual.HTTPError):
+            manual.flush_results(self.settings, self.ledger, self.journal, post)
+        self.assertEqual(self.journal.pending()[0]["result"], {"status": "prepared"})
+        post.side_effect, post.return_value = None, {}
+        manual.flush_results(self.settings, self.ledger, self.journal, post)
+        self.assertEqual(self.journal.pending(), [])
+        self.assertEqual([call.args[1] for call in post.call_args_list], ["result", "result"])
+        self.mt5.order_send.assert_not_called()
+
+    def test_second_manual_process_cannot_initialize_sdk_or_replace_first_lock(self):
+        lock = trade.ProcessLock(self.settings.state_directory)
+        try:
+            post = Mock()
+            with redirect_stderr(io.StringIO()):
+                result = manual.run_bridge(self.mt5, self.settings, post=post, adapter_factory=Mock())
+            self.assertEqual(result, 1)
+            self.mt5.initialize.assert_not_called()
+            post.assert_not_called()
+            with self.assertRaises(trade.GuardError):
+                trade.ProcessLock(self.settings.state_directory)
+        finally:
+            lock.close()
+
     def test_interrupted_and_failed_preparation_is_durable_without_ui_retry(self):
         self.journal.reserve(self.preparation)
         adapter = Mock()
@@ -168,6 +365,27 @@ class ManualBridgeTests(unittest.TestCase):
         self.assertEqual(result, {"status": "failed"})
         self.mt5.order_send.assert_not_called()
 
+    def test_native_recheck_blocks_new_exposure_before_unlock_and_cancels_owned_ticket(self):
+        backend = FakeNativeBackend()
+        original = backend.set_edit
+
+        def appeared(ticket, field, value):
+            original(ticket, field, value)
+            self.mt5.positions_get.return_value = (object(),)
+
+        backend.set_edit = appeared
+        adapter = native.NativeTicketAdapter(backend, clock=lambda: NOW)
+        with redirect_stderr(io.StringIO()):
+            result = manual.prepare_ticket(self.mt5, self.settings, self.ledger, self.journal, adapter,
+                                           self.preparation, clock=lambda: NOW)
+        self.assertEqual(result, {"status": "failed"})
+        self.assertEqual(set(backend.values), {10333})
+        self.assertIn(("cancel", 55), backend.events)
+        self.assertIsNone(backend.ticket)
+        self.assertFalse(any(event[0] == "unlock" for event in backend.events))
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
     def test_transport_uses_only_manual_routes_for_poll_results_and_rejects_auto_route(self):
         response = Mock(status=200)
         response.read.return_value = b'{"preparation":null}'
@@ -196,7 +414,7 @@ class ManualBridgeTests(unittest.TestCase):
             return {}
 
         with patch.object(trade, "terminal_is_running", side_effect=[True, True, False]), patch.object(
-            manual.market, "build_payload", return_value={"symbol": self.settings.market.symbol}
+            manual.market, "build_payload", return_value=deepcopy(self.feed)
         ), redirect_stdout(io.StringIO()):
             result = manual.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
                                        sleep=Mock(), adapter_factory=lambda: adapter)
@@ -254,6 +472,54 @@ class ManualBridgeTests(unittest.TestCase):
         self.mt5.order_send.assert_not_called()
         self.mt5.order_check.assert_not_called()
 
+    def test_final_native_recheck_cancels_expired_m1_window_despite_fresh_quote(self):
+        current = {"time": NOW}
+        backend = FakeNativeBackend()
+        normal_check = backend.verify_absolute_stop_mode
+
+        def delayed_final_mode_check():
+            normal_check()
+            if backend.comment:
+                current["time"] = NOW + timedelta(seconds=11)
+                self.fixture.tick.time = int(current["time"].timestamp())
+
+        backend.verify_absolute_stop_mode = delayed_final_mode_check
+        clock = lambda: current["time"]
+        adapter = native.NativeTicketAdapter(backend, clock=clock)
+        with redirect_stderr(io.StringIO()):
+            result = manual.prepare_ticket(self.mt5, self.settings, self.ledger, self.journal,
+                                           adapter, self.preparation, clock=clock)
+        self.assertEqual(result, {"status": "failed"})
+        self.assertEqual(set(backend.values), {10333, 10334, 10336})
+        self.assertIsNone(backend.ticket)
+        self.assertFalse(any(event[0] == "unlock" for event in backend.events))
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_final_sdk_read_delay_cannot_unlock_after_entry_window(self):
+        current = {"time": NOW, "reads": 0}
+        backend = FakeNativeBackend()
+        original_prepare = manual.prepare_draft
+
+        def delayed_final_guard(*args):
+            draft = original_prepare(*args)
+            current["reads"] += 1
+            if current["reads"] == 5:
+                current["time"] = NOW + timedelta(seconds=11)
+            return draft
+
+        clock = lambda: current["time"]
+        adapter = native.NativeTicketAdapter(backend, clock=clock)
+        with patch.object(manual, "prepare_draft", side_effect=delayed_final_guard), redirect_stderr(io.StringIO()):
+            result = manual.prepare_ticket(self.mt5, self.settings, self.ledger, self.journal,
+                                           adapter, self.preparation, clock=clock)
+        self.assertEqual(current["reads"], 5)
+        self.assertEqual(result, {"status": "failed"})
+        self.assertIsNone(backend.ticket)
+        self.assertFalse(any(event[0] == "unlock" for event in backend.events))
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
     def loop_probe(self):
         self.fixture.terminal_info.data_path = str(self.fixture.base)
         adapter = Mock()
@@ -282,7 +548,7 @@ class ManualBridgeTests(unittest.TestCase):
 
         output, errors = io.StringIO(), io.StringIO()
         with patch.object(trade, "terminal_is_running", side_effect=running), patch.object(manual.time, "monotonic", side_effect=lambda: timer["seconds"]), patch.object(
-            manual.market, "build_payload", return_value={"symbol": self.settings.market.symbol}
+            manual.market, "build_payload", return_value=deepcopy(self.feed)
         ), redirect_stdout(output), redirect_stderr(errors):
             result = manual.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
                                        sleep=sleep, adapter_factory=lambda: adapter)
@@ -290,7 +556,7 @@ class ManualBridgeTests(unittest.TestCase):
         self.assertEqual(calls, [(1, "register"), (4, "market"), (4, "poll"), (4, "result")])
         self.assertEqual(errors.getvalue().count("MT5 feed unavailable (terminal_disconnected)."), 1)
         self.assertEqual(output.getvalue().count("Fresh MT5 feed ready."), 1)
-        self.assertEqual(sleeps, [10, 10, 10])
+        self.assertEqual(sleeps, [5, 5, 5])
         adapter.prepare.assert_called_once()
         self.mt5.order_send.assert_not_called()
         self.mt5.order_check.assert_not_called()
@@ -310,7 +576,7 @@ class ManualBridgeTests(unittest.TestCase):
                         attempts["feed"] += 1
                         if attempts["feed"] <= 2:
                             raise manual.market.MarketDataError("private SDK data detail")
-                    return {"symbol": self.settings.market.symbol}
+                    return deepcopy(self.feed)
 
                 def post(settings, route, payload):
                     calls.append((timer["seconds"], route))
@@ -327,14 +593,116 @@ class ManualBridgeTests(unittest.TestCase):
                     result = manual.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
                                                sleep=sleep, adapter_factory=lambda: adapter)
                 self.assertEqual(result, 0)
-                self.assertEqual([stamp for stamp, route in calls if route == "poll"], [20])
-                self.assertEqual([stamp for stamp, route in calls if route == "result"], [20])
-                self.assertEqual(attempts["feed"], 3)
+                self.assertEqual([stamp for stamp, route in calls if route == "poll"], [10])
+                self.assertEqual([stamp for stamp, route in calls if route == "result"], [10])
+                self.assertGreaterEqual(attempts["feed"], 3)  # Local preparation also refreshes its guarded snapshot.
                 self.assertEqual(errors.getvalue().count("MT5 feed unavailable ("), 1)
                 self.assertNotIn("private", errors.getvalue())
                 self.assertEqual(output.getvalue().count("Fresh MT5 feed ready."), 1)
                 adapter.prepare.assert_called_once()
                 self.assertEqual(self.journal.pending(), [])
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_transport_diagnostic_uses_only_fixed_status_codes_without_private_text(self):
+        expected = {
+            401: "bridge_authorization_rejected", 404: "manual_api_unavailable",
+            409: "older_snapshot", 422: "feed_version_or_data_rejected",
+            503: "service_not_ready", 403: "service_unavailable", 500: "service_unavailable",
+        }
+        for code, reason in expected.items():
+            with self.subTest(code=code):
+                body = Mock()
+                body.read.side_effect = AssertionError("An error body must remain unread")
+                error = manual.HTTPError("https://PRIVATE.invalid/PRIVATE_TOKEN", code, "PRIVATE_RESPONSE_TEXT",
+                                         {"Authorization": "PRIVATE_KEY"}, body)
+                self.assertEqual(manual.service_failure_reason(error), reason)
+                body.read.assert_not_called()
+        for error in (manual.URLError("PRIVATE_NETWORK_DETAIL"), TimeoutError("PRIVATE_URL_OR_KEY")):
+            self.assertEqual(manual.service_failure_reason(error), "connection_unavailable")
+        self.assertEqual(manual.service_failure_reason(RuntimeError("PRIVATE_DETAIL")), "service_unavailable")
+        malformed = manual.HTTPError("https://PRIVATE.invalid", 422, "PRIVATE_DETAIL", {}, None)
+        malformed.code = []
+        self.assertEqual(manual.service_failure_reason(malformed), "service_unavailable")
+
+    def test_http_feed_rejection_does_not_read_its_response_body_or_retry_elsewhere(self):
+        body = Mock()
+        body.read.side_effect = AssertionError("An HTTP error body must remain unread")
+        error = manual.HTTPError("https://PRIVATE.invalid/PRIVATE_TOKEN", 422, "PRIVATE_RESPONSE_TEXT", {}, body)
+        opener = Mock()
+        opener.open.side_effect = error
+        with patch.object(manual.request, "build_opener", return_value=opener), self.assertRaises(manual.HTTPError) as caught:
+            manual.api_post(self.settings, "market", self.feed)
+        self.assertIs(caught.exception, error)
+        opener.open.assert_called_once()
+        body.read.assert_not_called()
+
+    def test_persistent_transport_failures_log_once_and_never_claim_feed_readiness_or_prepare(self):
+        cases = (
+            (manual.HTTPError("https://PRIVATE.invalid", 401, "PRIVATE_DETAIL", {}, None), "bridge_authorization_rejected"),
+            (manual.HTTPError("https://PRIVATE.invalid", 404, "PRIVATE_DETAIL", {}, None), "manual_api_unavailable"),
+            (manual.HTTPError("https://PRIVATE.invalid", 409, "PRIVATE_DETAIL", {}, None), "older_snapshot"),
+            (manual.HTTPError("https://PRIVATE.invalid", 422, "PRIVATE_DETAIL", {}, None), "feed_version_or_data_rejected"),
+            (manual.HTTPError("https://PRIVATE.invalid", 503, "PRIVATE_DETAIL", {}, None), "service_not_ready"),
+            (manual.URLError("PRIVATE_NETWORK_DETAIL"), "connection_unavailable"),
+            (TimeoutError("PRIVATE_CONNECTION_DETAIL"), "connection_unavailable"),
+            (RuntimeError("PRIVATE_OTHER_DETAIL"), "service_unavailable"),
+        )
+        for error, reason in cases:
+            with self.subTest(reason=reason):
+                adapter, timer, sleep, sleeps = self.loop_probe()
+                calls = []
+
+                def post(settings, route, payload):
+                    calls.append(route)
+                    if route == "register":
+                        return {"paired": True}
+                    raise error
+
+                output, errors = io.StringIO(), io.StringIO()
+                with patch.object(trade, "terminal_is_running", side_effect=[True, True, True, True, False]), patch.object(
+                    manual.time, "monotonic", side_effect=lambda: timer["seconds"],
+                ), patch.object(manual.market, "build_payload", return_value=deepcopy(self.feed)), redirect_stdout(output), redirect_stderr(errors):
+                    result = manual.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
+                                               sleep=sleep, adapter_factory=lambda: adapter)
+                self.assertEqual(result, 0)
+                self.assertEqual(calls, ["register", "market", "market", "market"])
+                self.assertEqual(sleeps, [5, 5, 5])
+                self.assertEqual(errors.getvalue(), "MT5 feed unavailable (" + reason + ").\n")
+                self.assertNotIn("Fresh MT5 feed ready.", output.getvalue())
+                self.assertNotIn("PRIVATE", output.getvalue() + errors.getvalue())
+                adapter.prepare.assert_not_called()
+                self.assertEqual(self.journal.pending(), [])
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_http_service_not_ready_recovers_with_one_outage_and_one_fresh_feed_message(self):
+        adapter, timer, sleep, sleeps = self.loop_probe()
+        calls, attempts = [], {"feed": 0}
+
+        def post(settings, route, payload):
+            calls.append((timer["seconds"], route))
+            if route == "register":
+                return {"paired": True}
+            if route == "market":
+                attempts["feed"] += 1
+                if attempts["feed"] <= 2:
+                    raise manual.HTTPError("https://PRIVATE.invalid", 503, "PRIVATE_DETAIL", {}, None)
+                return {}
+            return {"preparation": None}
+
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(trade, "terminal_is_running", side_effect=[True, True, True, True, False]), patch.object(
+            manual.time, "monotonic", side_effect=lambda: timer["seconds"],
+        ), patch.object(manual.market, "build_payload", return_value=deepcopy(self.feed)), redirect_stdout(output), redirect_stderr(errors):
+            result = manual.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
+                                       sleep=sleep, adapter_factory=lambda: adapter)
+        self.assertEqual(result, 0)
+        self.assertEqual(errors.getvalue(), "MT5 feed unavailable (service_not_ready).\n")
+        self.assertEqual(output.getvalue().count("Fresh MT5 feed ready."), 1)
+        self.assertEqual([stamp for stamp, route in calls if route == "poll"], [10])
+        self.assertNotIn("PRIVATE", output.getvalue() + errors.getvalue())
+        adapter.prepare.assert_not_called()
         self.mt5.order_send.assert_not_called()
         self.mt5.order_check.assert_not_called()
 
@@ -445,7 +813,7 @@ class NativeTicketTests(unittest.TestCase):
     def setUp(self):
         self.backend = FakeNativeBackend()
         self.adapter = native.NativeTicketAdapter(self.backend, clock=lambda: NOW)
-        self.draft = native.Draft("XAUUSD", "BUY", Decimal("0.01"), Decimal("2490"), Decimal("2520"), 2, NOW + timedelta(minutes=5))
+        self.draft = qualified_draft()
 
     def test_native_preparation_writes_only_three_fields_and_direction_expiry_comment(self):
         check = Mock(side_effect=lambda: self.backend.events.append(("guard",)))
@@ -453,7 +821,8 @@ class NativeTicketTests(unittest.TestCase):
         self.assertEqual(result, {"status": "prepared"})
         edits = [event for event in self.backend.events if event[0] == "set_edit"]
         self.assertEqual(edits, [("set_edit", 10333, "0.01"), ("set_edit", 10334, "2490.00"), ("set_edit", 10336, "2520.00")])
-        self.assertEqual(self.backend.comment, "BUY exp 04/10 12:35Z")
+        self.assertIn(("chart", "XAUUSD", "M1"), self.backend.events)
+        self.assertEqual(self.backend.comment, "BUY exp 05/10 12:35Z")
         self.assertLessEqual(len(self.backend.comment), 31)
         self.assertGreaterEqual(check.call_count, 6)
         self.assertEqual(self.backend.events[-2:], [("guard",), ("unlock", 55)])
@@ -466,6 +835,18 @@ class NativeTicketTests(unittest.TestCase):
             self.adapter.prepare(self.draft, recheck_account=Mock())
         self.assertFalse(any(event[0] in ("open", "set_edit", "comment") for event in self.backend.events))
         self.assertFalse(any(event[0] == "cancel" for event in self.backend.events))
+
+    def test_legacy_m15_or_unqualified_drafts_reject_before_any_window_or_guard_action(self):
+        for changed in (replace(self.draft, display_timeframe="M15"),
+                        replace(self.draft, strategy_id=trade.STRATEGY_ID),
+                        replace(self.draft, qualification_id=""),
+                        replace(self.draft, bar_time=NOW),
+                        replace(self.draft, expires_at=NOW + timedelta(minutes=6))):
+            check = Mock()
+            with self.subTest(draft=changed), self.assertRaisesRegex(native.TicketError, "invalid_draft"):
+                self.adapter.prepare(changed, recheck_account=check)
+            self.assertEqual(self.backend.events, [])
+            check.assert_not_called()
 
     def test_points_or_unverified_settings_and_ticket_unit_changes_block_filling(self):
         for setting in ("mode", "units"):

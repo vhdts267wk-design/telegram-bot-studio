@@ -52,7 +52,8 @@ class ChartAPITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code, 200)
             dto = response.json()["proposal"]
             self.assertEqual((dto["offer_id"], dto["workflow"], dto["entry_zone_low"], dto["entry_zone_high"]),
-                             (str(OFFER), "chart_overlay", 1999, 2001))
+                             (str(OFFER), "chart_overlay", self.offer["payload"]["entry_zone_low"], self.offer["payload"]["entry_zone_high"]))
+            self.assertEqual((dto["version"], dto["timeframe"], dto["qualification_id"]), (2, "M1", self.pin))
             self.assertEqual(dto["stop"], self.offer["payload"]["stop"])
             self.assertEqual(dto["target"], self.offer["payload"]["target"])
             self.assertFalse({"claim_id", "device_id", "user_id", "chat_id", "account_mode"} & dto.keys())
@@ -72,13 +73,22 @@ class ChartAPITests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await self.post("manual/chart", body)).status_code, 422)
             readers["get_device"].assert_not_awaited()
 
-    async def test_automatic_disabled_and_conflicting_modes_have_no_chart_route_access(self):
+    async def test_automatic_only_or_disabled_modes_have_no_chart_route_access(self):
         stack, readers, _ = self.chart_mocks()
         with stack:
-            for automatic, manual in ((True, False), (False, False), (True, True)):
+            for automatic, manual in ((True, False), (False, False)):
                 self.service.trading_enabled, self.service.manual_tickets_enabled = automatic, manual
                 self.assertEqual((await self.chart()).status_code, 404)
             readers["get_device"].assert_not_awaited()
+
+    async def test_stale_automatic_flag_never_enables_execution_and_keeps_manual_chart(self):
+        stack, readers, writes = self.chart_mocks()
+        self.service.trading_enabled, self.service.manual_tickets_enabled = True, True
+        with stack:
+            self.assertIsNotNone((await self.chart()).json()["proposal"])
+            self.assertEqual((await self.post("poll", {"device_id": str(DEVICE)})).status_code, 404)
+            for mutation in writes:
+                mutation.assert_not_awaited()
 
     async def test_duplicate_json_fields_are_rejected_before_storage(self):
         stack, readers, _ = self.chart_mocks()
@@ -114,6 +124,8 @@ class ChartAPITests(unittest.IsolatedAsyncioTestCase):
             self.device["last_seen_at"] = later
             self.snapshot["updated_at"] = later
             self.snapshot["payload"]["quote"]["time"] = later.isoformat()
+            self.snapshot["payload"]["as_of"] = later.isoformat()
+            self.snapshot["payload"]["risk_context"]["as_of"] = later.isoformat()
             with patch.object(mt5_api, "now_utc", return_value=later):
                 self.assertEqual((await self.chart()).json(), {"proposal": None})
 
@@ -133,7 +145,7 @@ class ChartAPITests(unittest.IsolatedAsyncioTestCase):
             stack, readers, _ = self.chart_mocks()
             clock = {"now": NOW}
             async def slow_read(*args):
-                clock["now"] = NOW + timedelta(seconds=31)
+                clock["now"] = NOW + timedelta(seconds=11)
                 return {"risk": None, "subscription": True, "offer": self.offer}[slow_stage]
             with stack, patch.object(mt5_api, "now_utc", side_effect=lambda: clock["now"]):
                 if slow_stage == "risk":
@@ -146,17 +158,21 @@ class ChartAPITests(unittest.IsolatedAsyncioTestCase):
     async def test_snapshot_binding_receipt_freshness_and_quote_bounds(self):
         for condition in ("device", "owner", "old_receipt", "future_receipt", "old_quote", "future_quote", "old_heartbeat"):
             stack, readers, _ = self.chart_mocks()
+            clock = NOW
             if condition == "device":
                 self.snapshot["payload"]["device_id"] = str(OFFER)
             elif condition == "owner":
                 self.device["owner_chat_id"] = 12
             elif condition in {"old_receipt", "future_receipt"}:
                 self.snapshot["updated_at"] = NOW + timedelta(seconds=-181 if condition == "old_receipt" else 1)
-            elif condition in {"old_quote", "future_quote"}:
-                self.snapshot["payload"]["quote"]["time"] = (NOW + timedelta(seconds=-31 if condition == "old_quote" else 6)).isoformat()
+            elif condition == "old_quote":
+                # The quote originally followed the bar close, and then aged.
+                clock = NOW + timedelta(seconds=11)
+            elif condition == "future_quote":
+                self.snapshot["payload"]["quote"]["time"] = (NOW + timedelta(seconds=6)).isoformat()
             else:
                 self.device["last_seen_at"] = NOW - timedelta(seconds=181)
-            with stack, self.subTest(condition=condition):
+            with stack, self.subTest(condition=condition), patch.object(mt5_api, "now_utc", return_value=clock):
                 self.assertEqual((await self.chart()).json(), {"proposal": None})
                 readers["get_chart_offer"].assert_not_awaited()
 
@@ -183,7 +199,7 @@ class ChartAPITests(unittest.IsolatedAsyncioTestCase):
         with stack:
             self.snapshot["payload"]["execution"]["stops_level"] = 21
             self.assertEqual((await self.chart()).json(), {"proposal": None})
-            self.snapshot["payload"]["execution"]["stops_level"] = 20
+            self.snapshot["payload"]["execution"]["stops_level"] = self.offer["payload"]["execution"]["stops_level"]
             self.offer["payload"]["original_stop_distance"] = 9
             self.assertEqual((await self.chart()).json(), {"proposal": None})
 
@@ -193,5 +209,20 @@ class ChartAPITests(unittest.IsolatedAsyncioTestCase):
             readers["get_device"].return_value = None
             self.assertEqual((await self.chart()).json(), {"proposal": None})
             readers["get_chart_offer"].assert_not_awaited()
+            for mutation in writes:
+                mutation.assert_not_awaited()
+
+    async def test_missing_pin_unknown_costs_and_legacy_offer_cannot_display_or_claim(self):
+        stack, readers, writes = self.chart_mocks()
+        with stack:
+            with patch.dict(api_fixtures.os.environ, {"MT5_EVIDENCE_SHA256": ""}):
+                self.assertEqual((await self.chart()).json(), {"proposal": None})
+            readers["get_chart_offer"].assert_not_awaited()
+            self.snapshot["payload"]["risk_context"]["costs_verified"] = False
+            self.assertEqual((await self.chart()).json(), {"proposal": None})
+            readers["get_chart_offer"].assert_not_awaited()
+            self.snapshot["payload"]["risk_context"]["costs_verified"] = True
+            self.offer["payload"].update(strategy_id="ema9-21-atr14-v1", display_timeframe="M15")
+            self.assertEqual((await self.chart()).json(), {"proposal": None})
             for mutation in writes:
                 mutation.assert_not_awaited()

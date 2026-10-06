@@ -55,11 +55,11 @@ class HelperOverlayTests(unittest.TestCase):
         self.adapter.prepare.assert_not_called()
         return result
 
-    def test_chart_is_read_independently_each_cycle_and_feed_refreshes_every_twenty_seconds(self):
+    def test_chart_is_read_independently_each_cycle_and_manual_feed_refreshes_every_five_seconds(self):
         self.assertEqual(self.run_helper(), 0)
-        self.assertEqual([stamp for stamp, route, _ in self.sent if route == "market"], [0, 20])
-        self.assertEqual([stamp for stamp, route, _ in self.sent if route == "chart"], [0, 10, 20])
-        self.assertEqual([stamp for stamp, route, _ in self.sent if route == "poll"], [0, 10, 20])
+        self.assertEqual([stamp for stamp, route, _ in self.sent if route == "market"], [0, 5, 10])
+        self.assertEqual([stamp for stamp, route, _ in self.sent if route == "chart"], [0, 5, 10])
+        self.assertEqual([stamp for stamp, route, _ in self.sent if route == "poll"], [0, 5, 10])
         self.assertEqual(self.exporter.publish.call_count, 3)
         for call in self.exporter.publish.call_args_list:
             self.assertIsNone(call.args[0])

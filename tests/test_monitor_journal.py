@@ -432,10 +432,75 @@ class MonitorJournalTests(unittest.IsolatedAsyncioTestCase):
         self.now = OPENED + timedelta(minutes=15)
         self.cached["broker_feed"] = broker_snapshot(self.now, bid=2707.0)
         await switched.review_trades()
-        closed = self.rows[(CHAT_ID, SIGNAL_ID)]["payload"]
-        self.assertEqual(closed["status"], "inconclusive")
-        self.assertIsNone(closed["last_observation_price"])
-        self.assertIsNone(closed["gross_r"])
+        self.assertEqual(self.rows[(CHAT_ID, SIGNAL_ID)]["payload"], original)
+        self.list_open.assert_not_awaited()
+        self.update_trade.assert_not_awaited()
+
+    async def test_mt5_legacy_journal_is_never_advanced_delivered_or_used_for_pause(self):
+        self.add_complete_stop_history()
+        for row in self.rows.values():
+            row["payload"]["source_identity"] = "mt5:XAUUSD"
+        self.add_trade("mt5:XAUUSD", "legacy-open")
+        original = copy.deepcopy(self.rows)
+        self.service.source = "mt5"
+        self.now = OPENED + timedelta(minutes=30)
+        self.cached["broker_feed"] = broker_snapshot(self.now, bid=2696.0)
+        bot = SimpleNamespace(send_message=AsyncMock())
+        await self.service.review_trades()
+        self.assertTrue(await self.service.send_reviews(bot))
+        self.assertIsNone(await self.service.risk_pause(CHAT_ID))
+        self.assertEqual(self.rows, original)
+        for store in (self.cache_read, self.list_open, self.update_trade, self.list_reviews, self.recent, self.mark_sent):
+            store.assert_not_awaited()
+        bot.send_message.assert_not_awaited()
+
+    async def test_requested_mt5_reviews_are_historical_read_only_archive(self):
+        self.add_trade("mt5:XAUUSD")
+        original = copy.deepcopy(self.rows)
+        self.service.source = "mt5"
+        self.service.review_trades = AsyncMock(side_effect=AssertionError("Archive must not advance records"))
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(id=CHAT_ID, type="private"))
+        context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
+        await monitor.reviews_command(update, context)
+        self.service.review_trades.assert_not_awaited()
+        self.recent.assert_awaited_once_with(self.pool, BOT_ID, CHAT_ID, limit=3)
+        self.update_trade.assert_not_awaited()
+        self.mark_sent.assert_not_awaited()
+        self.assertEqual(self.rows, original)
+        header, stored = [call.args[0] for call in message.reply_text.await_args_list]
+        for marker in ("أرشيف", "عرض عند الطلب", "لا تُحدّث", "60 دقيقة", "ولا تُستخدم كأدلة", "/signals"):
+            self.assertIn(marker, header)
+        self.assertIn("سجل تاريخي كما حُفظ", stored)
+        self.assertIn("لا توجد متابعة حالية", stored)
+        self.assertIn("الحالة المحفوظة: مفتوح", stored)
+        self.assertNotIn("المتابعة مستمرة", stored)
+        self.assertIn("15 دقيقة", stored)
+        self.assertEqual(self.service.active_users, set())
+
+    async def test_empty_mt5_archive_does_not_promote_new_legacy_tracking(self):
+        self.service.source = "mt5"
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(id=CHAT_ID, type="private"))
+        context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
+        await monitor.reviews_command(update, context)
+        text = "\n".join(call.args[0] for call in message.reply_text.await_args_list)
+        self.assertIn("لا توجد سجلات ورقية قديمة", text)
+        self.assertNotIn("/watch", text)
+        self.list_open.assert_not_awaited()
+
+    async def test_requested_reference_review_still_advances_live_paper_record(self):
+        self.add_trade()
+        self.now = OPENED + timedelta(minutes=1)
+        self.feed([observation(1, 2707.0)])
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(id=CHAT_ID, type="private"))
+        context = SimpleNamespace(bot_data={monitor.SERVICE_KEY: self.service})
+        await monitor.reviews_command(update, context)
+        self.update_trade.assert_awaited_once()
+        self.assertEqual(self.rows[(CHAT_ID, SIGNAL_ID)]["payload"]["status"], "target_observed")
+        message.reply_text.assert_awaited_once()
+        self.assertNotIn("أرشيف", message.reply_text.await_args.args[0])
 
     async def test_restart_reads_stored_trade_observations_and_deduplication(self):
         bot = SimpleNamespace(send_message=AsyncMock())

@@ -1,6 +1,7 @@
 """Persistence safety contracts for manual preparation; no MT5/order calls."""
 
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
@@ -17,6 +18,16 @@ DEVICE = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 OFFER = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 CLAIM = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 BOT, OWNER = 9901, 4401
+QUALIFICATION, FINGERPRINT = "b" * 64, "a" * 64
+CONTEXT = {
+    "direction": "BUY", "bar_time": (NOW - timedelta(minutes=1)).isoformat(),
+    "confirmation_bar_time": (NOW - timedelta(minutes=5)).isoformat(),
+    "direction_bar_time": (NOW - timedelta(minutes=15)).isoformat(),
+    "broker_fingerprint": "c" * 64, "policy_id": "mtf-manual-demo-cost-risk-v1",
+    "cost_context": {"commission_round_turn": 0.07, "slippage_price": 0.02,
+                     "loss_cash_per_price_unit": 1.0, "profit_cash_per_price_unit": 1.0},
+    "execution": {"tick_size": 0.01, "point": 0.01, "digits": 2, "stops_level": 10},
+}
 
 
 def compact(value):
@@ -141,12 +152,23 @@ class ManualTicketStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_claim_requires_requested_owner_fresh_device_and_single_active_preparation(self):
         self.pool.fetchrow.return_value = row(status="preparing", claim_id=CLAIM, preparing_at=NOW)
-        result = await store.claim_offer(self.pool, BOT, DEVICE, NOW)
+        result = await store.claim_offer(self.pool, BOT, DEVICE, NOW,
+                                         qualification_id=QUALIFICATION, strategy_fingerprint=FINGERPRINT,
+                                         proposal_context=CONTEXT)
         self.assertEqual(result["status"], "preparing")
         self.assertEqual(result["claim_id"], CLAIM)
         query, *args = self.pool.fetchrow.await_args.args
         query = compact(query)
         self.assertEqual(args[:4], [BOT, DEVICE, NOW, NOW - timedelta(seconds=180)])
+        self.assertEqual(args[-3:-1], [QUALIFICATION, FINGERPRINT])
+        self.assertEqual(json.loads(args[-1]), CONTEXT)
+        candidate, update = query.split("), claimed AS (", 1)
+        for predicate in ("offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-v1'",
+                          "offer.payload->>'qualification_id' = $6", "offer.payload->>'strategy_fingerprint' = $7",
+                          "offer.payload->>'strategy_version' = '1'", "offer.payload->>'horizon_seconds' = '3600'",
+                          "offer.payload->>'display_timeframe' = 'M1'", "offer.payload @> $8::jsonb"):
+            self.assertIn(predicate, candidate)
+        self.assertIn("UPDATE mt5_manual_ticket_offers", update)
         self.assertIn("offer.status = 'requested'", query)
         self.assertIn("offer.expires_at > $3 AND offer.decided_at <= $3", query)
         self.assertIn("device.last_seen_at >= $4 AND device.last_seen_at <= $3 AND subscription.active", query)
@@ -159,7 +181,50 @@ class ManualTicketStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_empty_queue_does_not_manufacture_request(self):
         self.pool.fetchrow.return_value = None
-        self.assertIsNone(await store.claim_offer(self.pool, BOT, DEVICE, NOW))
+        self.assertIsNone(await store.claim_offer(self.pool, BOT, DEVICE, NOW,
+                                                 qualification_id=QUALIFICATION, strategy_fingerprint=FINGERPRINT,
+                                                 proposal_context=CONTEXT))
+        self.pool.fetchrow.assert_awaited_once()
+
+    async def test_absent_or_malformed_operator_pin_cannot_claim_even_when_legacy_queue_exists(self):
+        self.pool.fetchrow.return_value = row(status="requested", payload={"strategy_id": "ema9-21-atr14-v1"})
+        for qualification, fingerprint in ((None, None), (None, FINGERPRINT), (QUALIFICATION, None),
+                                            ("", FINGERPRINT), (True, FINGERPRINT), ("B" * 64, FINGERPRINT),
+                                            (QUALIFICATION, "a" * 63), (QUALIFICATION, "not-a-digest")):
+            with self.subTest(qualification=qualification, fingerprint=fingerprint):
+                self.assertIsNone(await store.claim_offer(self.pool, BOT, DEVICE, NOW,
+                                                         qualification_id=qualification, strategy_fingerprint=fingerprint,
+                                                         proposal_context=CONTEXT))
+        self.pool.fetchrow.assert_not_awaited()
+        self.pool.fetchval.assert_not_awaited()
+
+    async def test_pinned_claim_filters_legacy_and_other_certificate_rows_before_mutation(self):
+        # No candidate matched the requested operator pin. The filtering is
+        # inside the locked SQL candidate, never a claim-then-reject repair.
+        self.pool.fetchrow.return_value = None
+        self.assertIsNone(await store.claim_offer(self.pool, BOT, DEVICE, NOW,
+                                                 qualification_id=QUALIFICATION, strategy_fingerprint=FINGERPRINT,
+                                                 proposal_context=CONTEXT))
+        candidate = compact(self.pool.fetchrow.await_args.args[0]).split("), claimed AS (", 1)[0]
+        self.assertIn("offer.payload->>'qualification_id' = $6", candidate)
+        self.assertIn("offer.payload->>'strategy_fingerprint' = $7", candidate)
+        self.assertIn("offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-v1'", candidate)
+        self.assertIn("offer.payload @> $8::jsonb", candidate)
+        self.assertEqual(json.loads(self.pool.fetchrow.await_args.args[-1]), CONTEXT)
+        self.assertIn("FOR UPDATE OF offer, device SKIP LOCKED", candidate)
+
+    async def test_missing_current_bar_broker_or_cost_context_cannot_claim_an_old_request(self):
+        invalid = [None, {}, {**CONTEXT, "claim_id": str(CLAIM)}]
+        for key in CONTEXT:
+            changed = deepcopy(CONTEXT)
+            del changed[key]
+            invalid.append(changed)
+        for context in invalid:
+            with self.subTest(context=context):
+                self.assertIsNone(await store.claim_offer(self.pool, BOT, DEVICE, NOW,
+                                                         qualification_id=QUALIFICATION, strategy_fingerprint=FINGERPRINT,
+                                                         proposal_context=context))
+        self.pool.fetchrow.assert_not_awaited()
 
     async def test_only_prepared_or_failed_results_can_be_written(self):
         for result in ({"status": "filled"}, {"status": "unknown"}, {"status": []},

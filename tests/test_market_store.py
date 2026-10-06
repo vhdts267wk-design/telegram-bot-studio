@@ -75,6 +75,27 @@ class MarketStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("bot_id = $1 AND chat_id = $2 AND active", compact(query))
         self.assertIn("lease_id = NULL, leased_until = NULL", compact(query))
 
+    async def test_mtf_watch_and_delivery_schedule_one_minute_without_renewing_active_lease(self):
+        interval = market_store.MTF_DELIVERY_INTERVAL
+        await market_store.enable_subscription(self.pool, 999, 101, NOW, interval=interval)
+        query, _, _, due = self.pool.execute.await_args.args
+        self.assertEqual(due, NOW + timedelta(minutes=1))
+        self.assertIn("THEN subscription.next_due ELSE EXCLUDED.next_due", compact(query))
+        await market_store.mark_delivered(self.pool, 999, 101, LEASE, NOW, interval=interval)
+        query, _, _, _, _, due = self.pool.fetchval.await_args.args
+        self.assertEqual(due, NOW + timedelta(minutes=1))
+        self.assertIn("lease_id = $3 AND leased_until > $4", compact(query))
+
+    async def test_unsupported_delivery_interval_never_accesses_database(self):
+        for interval in (None, True, 60, timedelta(0), timedelta(seconds=5), timedelta(days=1)):
+            with self.subTest(interval=interval):
+                with self.assertRaises(ValueError):
+                    await market_store.enable_subscription(self.pool, 999, 101, NOW, interval=interval)
+                with self.assertRaises(ValueError):
+                    await market_store.mark_delivered(self.pool, 999, 101, LEASE, NOW, interval=interval)
+        self.pool.execute.assert_not_awaited()
+        self.pool.fetchval.assert_not_awaited()
+
     async def test_due_claim_is_one_atomic_statement_with_bounded_expiring_leases(self):
         row = {"bot_id": 999, "chat_id": 101, "lease_id": LEASE, "active": True}
         self.pool.fetch.return_value = [row]

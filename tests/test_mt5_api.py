@@ -1,4 +1,6 @@
-from datetime import datetime, timedelta, timezone
+"""Legacy execution stays closed; manual registration remains private."""
+
+from contextlib import ExitStack
 import json
 import os
 from types import SimpleNamespace
@@ -12,8 +14,9 @@ import httpx
 from bot import mt5_api, market_monitor as monitor
 from bot.config import Settings
 from bot.panel.app import create_app
+from tests import test_multi_timeframe as candle_fixtures
 
-NOW = datetime(2026, 10, 4, 10, tzinfo=timezone.utc)
+NOW = candle_fixtures.MultiTimeframeTests.now
 DEVICE = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 OFFER = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 CLAIM = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
@@ -21,27 +24,23 @@ KEY = "local-demo-test-bridge-key-1234567890"
 
 
 def feed():
-    return {"device_id": str(DEVICE), "symbol": "XAUUSD", "timeframe": "M15", "source": "MetaTrader 5",
-            "execution": {"tick_size": 0.01, "point": 0.01, "digits": 2, "stops_level": 20},
-            "quote": {"bid": 2000, "ask": 2000.1, "time": NOW.isoformat()},
-            "candles": [{"time": (NOW-timedelta(minutes=15*i)).isoformat(),
-                         "open": 2000, "high": 2001, "low": 1999, "close": 2000, "tick_volume": 20}
-                        for i in range(4, 0, -1)]}
+    value = candle_fixtures.MultiTimeframeTests().feed(now=NOW)
+    value["device_id"] = str(DEVICE)
+    return value
 
 
 class DemoAPITests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.service = SimpleNamespace(pool=object(), bot_id=991, trading_enabled=True, source="mt5",
+        self.service = SimpleNamespace(pool=object(), bot_id=991, trading_enabled=True,
+                                       manual_tickets_enabled=False, source="mt5",
                                        risk_pause=AsyncMock(return_value=None))
         self.app = FastAPI()
         mt5_api.install_routes(self.app, SimpleNamespace(bot_data={"market_service": self.service}),
                               SimpleNamespace(market_bridge_key=KEY))
         self.device = {"device_id": DEVICE, "owner_user_id": 11, "owner_chat_id": 11,
                        "symbol": "XAUUSD", "account_mode": "demo", "volume": 0.01}
-        self.clock = patch.object(mt5_api, "now_utc", return_value=NOW)
-        self.env = patch.dict(os.environ, {"MARKET_GOLD_SYMBOL": "XAUUSD"}, clear=True)
-        self.clock.start(); self.env.start()
-        self.addCleanup(self.clock.stop); self.addCleanup(self.env.stop)
+        self.enterContext(patch.object(mt5_api, "now_utc", return_value=NOW))
+        self.enterContext(patch.dict(os.environ, {"MARKET_GOLD_SYMBOL": "XAUUSD", "MT5_MANUAL_BRIDGE_KEY": KEY}, clear=True))
 
     async def post(self, route, payload, key=KEY):
         headers = {"Authorization": "Bearer " + key} if key else {}
@@ -50,16 +49,41 @@ class DemoAPITests(unittest.IsolatedAsyncioTestCase):
 
     def registration(self):
         return {"device_id": str(DEVICE), "symbol": "XAUUSD", "account_mode": "demo",
-                "volume": 0.01, "pair_code_hash": "a"*64}
+                "volume": 0.01, "pair_code_hash": "a" * 64}
 
-    async def test_unauthorized_and_disabled_requests_do_not_touch_store(self):
+    def manual_mode(self):
+        self.service.trading_enabled, self.service.manual_tickets_enabled = False, True
+
+    async def test_automatic_only_service_cannot_register_claim_or_acknowledge_any_execution(self):
+        with ExitStack() as stack:
+            storage = []
+            for module, names in ((mt5_api.trade_store, ("register_device", "get_device", "heartbeat", "expire_offers", "claim_offer", "complete_offer")),
+                                  (mt5_api.market_store, ("get_cache",)),
+                                  (mt5_api.manual_ticket_store, ("claim_offer", "complete_offer"))):
+                for name in names:
+                    storage.append(stack.enter_context(patch.object(module, name, new_callable=AsyncMock)))
+            for enabled in (True, False):
+                self.service.trading_enabled = enabled
+                for route, body in (("register", self.registration()), ("poll", {"device_id": str(DEVICE)}),
+                                    ("result", {"device_id": str(DEVICE), "offer_id": str(OFFER), "claim_id": str(CLAIM),
+                                                "result": {"status": "filled", "code": 10009, "order_ticket": 123}}),
+                                    ("manual/poll", {"device_id": str(DEVICE)}), ("manual/result", {})):
+                    with self.subTest(enabled=enabled, route=route):
+                        self.assertEqual((await self.post(route, body)).status_code, 404)
+            for function in storage:
+                function.assert_not_awaited()
+
+    async def test_unauthorized_and_disabled_manual_registration_does_not_touch_store(self):
+        self.manual_mode()
         with patch.object(mt5_api.trade_store, "register_device", new_callable=AsyncMock) as register:
-            self.assertEqual((await self.post("register", self.registration(), key="incorrect")).status_code, 401)
-            self.service.trading_enabled = False
+            for key in (None, "incorrect"):
+                self.assertEqual((await self.post("register", self.registration(), key=key)).status_code, 401)
+            self.service.manual_tickets_enabled = False
             self.assertEqual((await self.post("register", self.registration())).status_code, 404)
             register.assert_not_awaited()
 
-    async def test_live_account_different_volume_and_unknown_symbol_cannot_register(self):
+    async def test_live_account_different_volume_unknown_symbol_or_invalid_device_cannot_register(self):
+        self.manual_mode()
         with patch.object(mt5_api.trade_store, "register_device", new_callable=AsyncMock) as register:
             for name, value in (("account_mode", "real"), ("volume", 0.02), ("volume", True),
                                 ("symbol", "XAUUSD.other"), ("device_id", "invalid")):
@@ -68,88 +92,27 @@ class DemoAPITests(unittest.IsolatedAsyncioTestCase):
             register.assert_not_awaited()
 
     async def test_registration_does_not_disclose_pairing_hash_or_private_rows(self):
-        with patch.object(mt5_api.trade_store, "register_device", new_callable=AsyncMock, return_value=self.device) as register:
+        self.manual_mode()
+        private = {**self.device, "pair_code_hash": "a" * 64, "account_password": "private-test-only"}
+        with patch.object(mt5_api.trade_store, "register_device", new_callable=AsyncMock, return_value=private) as register:
             response = await self.post("register", self.registration())
             self.assertEqual(response.json(), {"ok": True, "paired": True})
             self.assertEqual(register.await_args.args[2], DEVICE)
-            self.assertNotIn("a"*64, response.text)
+            self.assertNotIn("a" * 64, response.text)
+            self.assertNotIn("private-test-only", response.text)
 
-    async def test_poll_claims_only_current_device_and_fresh_provider_quotes(self):
-        snapshot = {"payload": feed(), "updated_at": NOW}
-        offer = {"id": OFFER, "claim_id": CLAIM, "payload": {"direction": "BUY"}, "expires_at": NOW+timedelta(minutes=5)}
-        with patch.object(mt5_api.trade_store, "get_device", new_callable=AsyncMock, return_value=self.device), \
-             patch.object(mt5_api.trade_store, "heartbeat", new_callable=AsyncMock), \
-             patch.object(mt5_api.trade_store, "expire_offers", new_callable=AsyncMock), \
-             patch.object(mt5_api.market_store, "get_cache", new_callable=AsyncMock, return_value=snapshot), \
-             patch.object(mt5_api.trade_store, "claim_offer", new_callable=AsyncMock, return_value=offer) as claim:
-            response = await self.post("poll", {"device_id": str(DEVICE)})
-            self.assertEqual(response.json()["trade"]["claim_id"], str(CLAIM))
-            claim.assert_awaited_once()
-            claim.reset_mock()
-            for field, value in (("time", (NOW-timedelta(seconds=31)).isoformat()),
-                                 ("time", (NOW+timedelta(seconds=6)).isoformat())):
-                snapshot["payload"]["quote"][field] = value
-                self.assertEqual((await self.post("poll", {"device_id": str(DEVICE)})).json(), {"trade": None})
-            snapshot["payload"] = feed(); snapshot["payload"]["device_id"] = str(OFFER)
-            self.assertEqual((await self.post("poll", {"device_id": str(DEVICE)})).json(), {"trade": None})
-            claim.assert_not_awaited()
-
-    async def test_poll_quote_clock_skew_is_bounded_and_receipt_remains_strict(self):
-        snapshot = {"payload": feed(), "updated_at": NOW}
-        with patch.object(mt5_api.trade_store, "get_device", new_callable=AsyncMock, return_value=self.device), \
-             patch.object(mt5_api.trade_store, "heartbeat", new_callable=AsyncMock), \
-             patch.object(mt5_api.trade_store, "expire_offers", new_callable=AsyncMock), \
-             patch.object(mt5_api.market_store, "get_cache", new_callable=AsyncMock, return_value=snapshot), \
-             patch.object(mt5_api.trade_store, "claim_offer", new_callable=AsyncMock, return_value=None) as claim:
-            for seconds, allowed in ((5, True), (6, False), (-30, True), (-31, False)):
-                with self.subTest(seconds=seconds):
-                    claim.reset_mock()
-                    snapshot["payload"]["quote"]["time"] = (NOW+timedelta(seconds=seconds)).isoformat()
-                    response = await self.post("poll", {"device_id": str(DEVICE)})
-                    self.assertEqual(response.json(), {"trade": None})
-                    self.assertEqual(claim.await_count, int(allowed))
-            claim.reset_mock()
-            snapshot["payload"] = feed()
-            snapshot["updated_at"] = NOW+timedelta(seconds=1)
-            self.assertEqual((await self.post("poll", {"device_id": str(DEVICE)})).json(), {"trade": None})
-            claim.assert_not_awaited()
-
-    async def test_paused_or_missing_broker_metadata_cannot_claim_accepted_request(self):
-        snapshot = {"payload": feed(), "updated_at": NOW}
-        with patch.object(mt5_api.trade_store, "get_device", new_callable=AsyncMock, return_value=self.device), \
-             patch.object(mt5_api.trade_store, "heartbeat", new_callable=AsyncMock), \
-             patch.object(mt5_api.trade_store, "expire_offers", new_callable=AsyncMock), \
-             patch.object(mt5_api.market_store, "get_cache", new_callable=AsyncMock, return_value=snapshot), \
-             patch.object(mt5_api.trade_store, "claim_offer", new_callable=AsyncMock) as claim:
-            self.service.risk_pause.return_value = "paused"
-            self.assertEqual((await self.post("poll", {"device_id": str(DEVICE)})).json(), {"trade": None})
-            self.service.risk_pause.return_value = None
-            del snapshot["payload"]["execution"]
-            self.assertEqual((await self.post("poll", {"device_id": str(DEVICE)})).json(), {"trade": None})
-            claim.assert_not_awaited()
-
-    async def test_partial_or_unproven_results_cannot_be_claimed_as_filled(self):
+    async def test_execution_result_remains_closed_even_with_complete_proof_and_manual_mode(self):
         with patch.object(mt5_api.trade_store, "complete_offer", new_callable=AsyncMock) as complete:
-            for outcome in ({"status": "filled", "code": 10010, "order_ticket": 123},
-                            {"status": "filled", "code": 10009},
-                            {"status": "filled", "code": 10009, "order_ticket": True},
-                            {"status": "filled", "code": 10009, "order_ticket": 123, "account_password": "private"}):
-                response = await self.post("result", {"device_id": str(DEVICE), "offer_id": str(OFFER),
-                                                       "claim_id": str(CLAIM), "result": outcome})
-                self.assertEqual(response.status_code, 422)
-                self.assertNotIn("private", response.text)
+            for manual in (False, True):
+                self.service.manual_tickets_enabled = manual
+                for outcome in ({"status": "filled", "code": 10009, "order_ticket": 123, "executed_at": NOW.isoformat()},
+                                {"status": "filled", "code": 10010, "order_ticket": 123},
+                                {"status": "filled", "account_password": "private"}):
+                    response = await self.post("result", {"device_id": str(DEVICE), "offer_id": str(OFFER),
+                                                           "claim_id": str(CLAIM), "result": outcome})
+                    self.assertEqual(response.status_code, 404)
+                    self.assertNotIn("private", response.text)
             complete.assert_not_awaited()
-
-    async def test_full_execution_ack_is_scoped_to_device_offer_and_single_claim(self):
-        outcome = {"status": "filled", "code": 10009, "order_ticket": 123, "executed_at": NOW.isoformat()}
-        with patch.object(mt5_api.trade_store, "complete_offer", new_callable=AsyncMock, return_value={"status": "filled"}) as complete:
-            response = await self.post("result", {"device_id": str(DEVICE), "offer_id": str(OFFER),
-                                                   "claim_id": str(CLAIM), "result": outcome})
-            self.assertEqual(response.json(), {"ok": True})
-            self.assertEqual(complete.await_args.args[2:5], (DEVICE, OFFER, CLAIM))
-            complete.return_value = None
-            self.assertEqual((await self.post("result", {"device_id": str(DEVICE), "offer_id": str(OFFER),
-                                                        "claim_id": str(CLAIM), "result": outcome})).status_code, 409)
 
 
 class BridgeConfigurationTests(unittest.TestCase):
@@ -165,11 +128,11 @@ class BridgeConfigurationTests(unittest.TestCase):
         self.assertNotIn("/login", routes)
         self.assertNotIn("/", routes)
 
-    def test_device_identity_keeps_frozen_strategy_levels_scoped_to_terminal(self):
+    def test_device_identity_keeps_strategy_levels_scoped_to_terminal(self):
         payload = feed()
         clean = monitor.validate_feed(payload, NOW)
         self.assertEqual(clean["device_id"], str(DEVICE))
-        self.assertEqual(monitor._mt5_identity(clean), "mt5:XAUUSD:"+str(DEVICE))
+        self.assertEqual(monitor._mt5_identity(clean), "mt5:XAUUSD:" + str(DEVICE))
         del payload["device_id"]
         self.assertEqual(monitor._mt5_identity(monitor.validate_feed(payload, NOW)), "mt5:XAUUSD")
 

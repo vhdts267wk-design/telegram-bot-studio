@@ -1,14 +1,18 @@
 """Frozen chart prices and eligibility, with no terminal or network calls."""
 
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from decimal import Decimal
 import unittest
+import os
+from unittest.mock import patch
 from uuid import UUID
 
-from bot import proposal_overlay
+from bot import mtf_runtime, proposal_overlay
+from tests import test_mtf_runtime as evidence_fixtures
+from tests import test_multi_timeframe as candle_fixtures
 
-NOW = datetime(2026, 10, 5, 16, tzinfo=timezone.utc)
+NOW = candle_fixtures.MultiTimeframeTests.now
 DEVICE = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 OFFER = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 CLAIM = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
@@ -19,26 +23,23 @@ def device():
             "symbol": "XAUUSD", "account_mode": "demo", "volume": 0.01, "last_seen_at": NOW}
 
 
-def feed():
-    return {"device_id": str(DEVICE), "symbol": "XAUUSD", "timeframe": "M15", "source": "MetaTrader 5",
-            "execution": {"tick_size": 0.01, "point": 0.01, "digits": 2, "stops_level": 20},
-            "quote": {"bid": 2000, "ask": 2000.1, "time": NOW.isoformat()},
-            "candles": [{"time": (NOW - timedelta(minutes=15 * i)).isoformat(),
-                         "open": 2000, "high": 2001, "low": 1999, "close": 2000, "tick_volume": 20}
-                        for i in range(4, 0, -1)]}
+def feed(*, sell=False):
+    value = candle_fixtures.MultiTimeframeTests().feed(now=NOW, sell=sell)
+    value["device_id"] = str(DEVICE)
+    return value
 
 
-def offer(status="offered"):
+def offer(status="offered", *, sell=False):
+    # The real loader, pin and strategy gate establish synthetic authorization.
+    # The synthetic outcomes do not claim measured trading performance.
+    candidate = mtf_runtime.evaluate_feed(feed(sell=sell), NOW)
+    payload = {**candidate, "workflow": "manual_ticket", "source_identity": f"mt5:XAUUSD:{DEVICE}"}
     value = {
         "id": OFFER, "bot_id": 991, "device_id": DEVICE, "chat_id": 11, "user_id": 11,
         "message_id": 77, "status": status, "created_at": NOW, "published_at": NOW,
         "updated_at": NOW, "expires_at": NOW + timedelta(minutes=5),
         "decided_at": None, "preparing_at": None, "completed_at": None, "claim_id": None, "result": None,
-        "payload": {"workflow": "manual_ticket", "state": "signal", "symbol": "XAUUSD", "account_mode": "demo",
-                    "volume": 0.01, "direction": "BUY", "entry": 2000, "stop": 1990, "target": 2020,
-                    "price_digits": 2, "original_stop_distance": 10, "max_drift_r": 0.1,
-                    "execution": deepcopy(feed()["execution"]), "source_identity": f"mt5:XAUUSD:{DEVICE}",
-                    "bar_time": (NOW - timedelta(minutes=15)).isoformat()},
+        "payload": payload,
     }
     if status in {"requested", "preparing", "prepared"}:
         value["decided_at"] = NOW
@@ -50,18 +51,22 @@ def offer(status="offered"):
 
 
 class ProposalOverlayTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(evidence_fixtures.pinned_synthetic_evidence(feed(), NOW))
+
     def test_buy_and_sell_keep_original_protections_and_only_public_fields(self):
-        for direction, stop, target in (("BUY", 1990, 2020), ("SELL", 2010, 1980)):
-            original = offer()
-            original["payload"].update(direction=direction, stop=stop, target=target)
+        for sell in (False, True):
+            original = offer(sell=sell)
             frozen = deepcopy(original)
-            dto = proposal_overlay.build_chart_overlay(original, device(), feed(), NOW)
+            dto = proposal_overlay.build_chart_overlay(original, device(), feed(sell=sell), NOW)
+            payload = original["payload"]
             self.assertEqual(dto, {
-                "version": 1, "workflow": "chart_overlay", "offer_id": str(OFFER), "status": "offered",
-                "symbol": "XAUUSD", "timeframe": "M15", "direction": direction, "entry": 2000,
-                "entry_zone_low": 1999.0, "entry_zone_high": 2001.0, "stop": stop, "target": target,
-                "price_digits": 2, "execution": feed()["execution"],
-                "bar_time": (NOW - timedelta(minutes=15)).isoformat(), "expires_at": (NOW + timedelta(minutes=5)).isoformat(),
+                "version": 2, "workflow": "chart_overlay", "offer_id": str(OFFER), "status": "offered",
+                "symbol": "XAUUSD", "timeframe": "M1", "direction": payload["direction"],
+                **{key: payload[key] for key in ("entry", "entry_zone_low", "entry_zone_high", "stop", "target", "price_digits", "execution", "bar_time",
+                                               "strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint", "qualification_id",
+                                               "direction_bar_time", "confirmation_bar_time")},
+                "expires_at": (NOW + timedelta(seconds=10)).isoformat(),
             })
             self.assertEqual(original, frozen)
             self.assertFalse({"claim_id", "device_id", "chat_id", "user_id", "account_mode", "volume"} & dto.keys())
@@ -75,6 +80,18 @@ class ProposalOverlayTests(unittest.TestCase):
         for value in result.values():
             self.assertEqual(Decimal(str(value)) % Decimal("0.025"), 0)
         self.assertLess(Decimal(str(result["entry_zone_high"])) - Decimal("2000.025"), Decimal("0.3025"))
+
+    def test_chart_deadline_never_renews_from_fresh_quotes_or_long_queue_expiry(self):
+        original = offer()
+        later = NOW + timedelta(seconds=4)
+        updated = feed()
+        updated["as_of"] = later.isoformat()
+        updated["quote"]["time"] = later.isoformat()
+        updated["risk_context"]["as_of"] = later.isoformat()
+        with patch.object(mtf_runtime, "_clock", return_value=later):
+            dto = proposal_overlay.build_chart_overlay(original, device(), updated, later)
+        self.assertEqual(dto["expires_at"], (NOW + timedelta(seconds=10)).isoformat())
+        self.assertEqual(original["expires_at"], NOW + timedelta(minutes=5))
 
     def test_all_four_lifecycle_states_are_visible_without_authorizing_a_claim(self):
         for status in ("offered", "requested", "preparing", "prepared"):
@@ -95,13 +112,15 @@ class ProposalOverlayTests(unittest.TestCase):
                 candidate = offer(status); candidate["expires_at"] = expiry
                 self.assertIsNone(proposal_overlay.build_chart_overlay(candidate, device(), feed(), NOW))
 
-    def test_preparing_timeout_and_prepared_result_are_checked_again(self):
+    def test_stale_m1_timing_overrides_longer_preparing_timeout_and_prepared_result_is_checked(self):
         candidate = offer("preparing")
         later = NOW + timedelta(seconds=120)
         current, source = device(), feed()
         current["last_seen_at"] = later
         source["quote"]["time"] = later.isoformat()
-        self.assertIsNotNone(proposal_overlay.build_chart_overlay(candidate, current, source, later))
+        # A preparation may not use stale M1 timing merely because the
+        # separate interruption timeout has not elapsed yet.
+        self.assertIsNone(proposal_overlay.build_chart_overlay(candidate, current, source, later))
         self.assertIsNone(proposal_overlay.build_chart_overlay(candidate, current, source, later + timedelta(microseconds=1)))
         for result in (None, {"status": "failed"}, {"status": "prepared", "order_ticket": 123}):
             candidate = offer("prepared"); candidate["result"] = result
@@ -123,11 +142,11 @@ class ProposalOverlayTests(unittest.TestCase):
             target[name] = value
             with self.subTest(where=where, name=name):
                 self.assertIsNone(proposal_overlay.build_chart_overlay(row, current, source, NOW))
-        source = feed(); source["candles"][-1]["close"] = 2000.01
+        source = feed(); source["timeframes"]["M1"].pop()
         self.assertIsNone(proposal_overlay.build_chart_overlay(offer(), device(), source, NOW))
 
     def test_current_broker_metadata_must_match_immutable_payload(self):
-        for name, value in (("tick_size", 0.05), ("point", 0.001), ("digits", 3), ("stops_level", 21)):
+        for name, value in (("tick_size", 0.05), ("point", 0.01), ("digits", 2), ("stops_level", 21)):
             source = feed(); source["execution"][name] = value
             self.assertIsNone(proposal_overlay.build_chart_overlay(offer(), device(), source, NOW))
 
@@ -143,7 +162,7 @@ class ProposalOverlayTests(unittest.TestCase):
 
     def test_reference_zone_cannot_touch_or_cross_protective_prices(self):
         payload = offer()["payload"]
-        payload["target"] = 2000.5
+        payload["target"] = payload["entry_zone_high"]
         with self.assertRaises(ValueError):
             proposal_overlay.reference_zone(payload)
         payload = offer()["payload"]
@@ -151,15 +170,32 @@ class ProposalOverlayTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             proposal_overlay.reference_zone(payload)
 
-    def test_zone_uses_frozen_entry_even_after_price_leaves_the_band(self):
-        source = feed(); source["quote"].update(bid=2010, ask=2010.1)
-        dto = proposal_overlay.build_chart_overlay(offer(), device(), source, NOW)
-        self.assertEqual((dto["entry"], dto["entry_zone_low"], dto["entry_zone_high"]), (2000, 1999, 2001))
+    def test_allowed_price_drift_keeps_frozen_levels_and_excess_drift_clears(self):
+        original = offer()
+        frozen = deepcopy(original)
+        source = feed(); source["quote"].update(bid=2000.011, ask=2000.013)
+        dto = proposal_overlay.build_chart_overlay(original, device(), source, NOW)
+        self.assertEqual((dto["entry"], dto["stop"], dto["target"]),
+                         tuple(original["payload"][key] for key in ("entry", "stop", "target")))
+        self.assertEqual(original, frozen)
+        source["quote"].update(bid=2010, ask=2010.1)
+        self.assertIsNone(proposal_overlay.build_chart_overlay(original, device(), source, NOW))
 
     def test_quote_skew_and_device_freshness_have_independent_bounds(self):
-        for delta, allowed in ((-5, True), (-6, False), (30, True), (31, False)):
+        for delta, allowed in ((-5, True), (-6, False), (10, True), (11, False)):
             source = feed(); source["quote"]["time"] = (NOW - timedelta(seconds=delta)).isoformat()
             self.assertEqual(proposal_overlay.build_chart_overlay(offer(), device(), source, NOW) is not None, allowed)
         for delta, allowed in ((0, True), (180, True), (181, False), (-1, False)):
             current = device(); current["last_seen_at"] = NOW - timedelta(seconds=delta)
             self.assertEqual(proposal_overlay.build_chart_overlay(offer(), current, feed(), NOW) is not None, allowed)
+
+    def test_legacy_or_unpinned_payload_never_displays_despite_fresh_chart_prices(self):
+        original = offer()
+        for field, value in (("strategy_id", "ema9-21-atr14-v1"), ("display_timeframe", "M15"),
+                             ("qualification_id", "b" * 64), ("provisional", True)):
+            changed = deepcopy(original)
+            changed["payload"][field] = value
+            with self.subTest(field=field):
+                self.assertIsNone(proposal_overlay.build_chart_overlay(changed, device(), feed(), NOW))
+        with patch.dict(os.environ, {"MT5_EVIDENCE_SHA256": ""}):
+            self.assertIsNone(proposal_overlay.build_chart_overlay(original, device(), feed(), NOW))
