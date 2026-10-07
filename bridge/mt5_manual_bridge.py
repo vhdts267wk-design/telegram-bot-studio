@@ -134,17 +134,24 @@ def prepare_draft(mt5, settings, ledger, preparation, now):
     try:
         current = market.build_payload(mt5, settings.market, now)
         risk = current["risk_context"]
-        if risk["costs_verified"] is not True or risk["open_positions"] or risk["pending_orders"]:
-            raise trade.GuardError("Verified costs and an unexposed account are required.")
-        costs = {key: float(risk[key]) for key in ("commission_round_turn", "slippage_price", "loss_cash_per_price_unit", "profit_cash_per_price_unit")}
-        if payload.get("cost_context") != costs or payload.get("broker_fingerprint") != risk["broker_fingerprint"]:
-            raise trade.GuardError("The qualified broker or cost model changed.")
+        if risk["open_positions"] or risk["pending_orders"]:
+            raise trade.GuardError("An unexposed account is required.")
+        if payload.get("broker_fingerprint") != risk["broker_fingerprint"]:
+            raise trade.GuardError("The proposal broker model changed.")
+        if payload.get("signal_mode") == "experimental_demo":
+            costs = experimental_cost_context(payload, risk, metadata, ask - bid)
+        else:
+            if risk["costs_verified"] is not True:
+                raise trade.GuardError("Verified costs and an unexposed account are required.")
+            costs = {key: float(risk[key]) for key in ("commission_round_turn", "slippage_price", "loss_cash_per_price_unit", "profit_cash_per_price_unit")}
+            if payload.get("cost_context") != costs:
+                raise trade.GuardError("The qualified broker or cost model changed.")
         for key, frame, seconds in (("bar_time", "M1", 60), ("confirmation_bar_time", "M5", 300), ("direction_bar_time", "M15", 900)):
             reference = trade.utc_date(payload[key])
             if not any(trade.utc_date(row["time"]) == reference for row in current["timeframes"][frame]):
                 raise trade.GuardError("The completed timeframe reference is unavailable.")
-        slippage = Decimal(str(risk["slippage_price"]))
-        commission = Decimal(str(risk["commission_round_turn"]))
+        slippage = Decimal(str(costs["slippage_price"]))
+        commission = Decimal(str(costs["commission_round_turn"]))
         loss = (abs(price - stop) + 2 * slippage) * Decimal(str(risk["loss_cash_per_price_unit"])) + commission
         gain = (abs(target - price) - 2 * slippage) * Decimal(str(risk["profit_cash_per_price_unit"])) - commission
         if loss <= 0 or loss > Decimal(str(risk["equity"])) * Decimal("0.01") or gain / loss < Decimal("1.5") or risk["free_margin"] < 2 * risk["margin_required"]:
@@ -153,36 +160,99 @@ def prepare_draft(mt5, settings, ledger, preparation, now):
         raise trade.GuardError("Current three-timeframe risk data is unavailable.") from None
     return native.Draft(
         settings.market.symbol, direction, settings.volume, stop, target, digits, expires,
-        **{key: payload[key] for key in ("display_timeframe", "strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint", "qualification_id")},
+        **{key: payload[key] for key in ("display_timeframe", "strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint")},
+        qualification_id=payload.get("qualification_id", ""),
+        signal_mode=payload.get("signal_mode", "qualified"), provisional=payload["provisional"],
+        entry_window_seconds=payload.get("entry_window_seconds", 10),
+        cost_assumptions=payload.get("cost_assumptions"),
         direction_bar_time=trade.utc_date(payload["direction_bar_time"]),
         confirmation_bar_time=trade.utc_date(payload["confirmation_bar_time"]),
         bar_time=trade.utc_date(payload["bar_time"]),
     )
 
 
+def experimental_cost_context(payload, risk, execution, current_spread):
+    """Recheck Demo estimates; missing live costs never replace them with zero."""
+    try:
+        assumptions = chart.validate_cost_assumptions(payload.get("cost_assumptions"))
+    except chart.OverlayError:
+        raise trade.GuardError("Invalid experimental cost assumptions.") from None
+    context = payload.get("cost_context")
+    keys = {"commission_round_turn", "slippage_price", "loss_cash_per_price_unit", "profit_cash_per_price_unit"}
+    if type(context) is not dict or set(context) != keys:
+        raise trade.GuardError("The experimental cash-cost model is incomplete.")
+    parsed = {key: trade.positive_decimal(context[key]) for key in keys}
+    tick = trade.positive_decimal(execution["tick_size"])
+    loss_unit = trade.positive_decimal(risk["loss_cash_per_price_unit"])
+    profit_unit = trade.positive_decimal(risk["profit_cash_per_price_unit"])
+    commission_floor = loss_unit * max(assumptions["spread_price"], 10 * tick)
+    if (assumptions["tick_size"] != tick
+        or parsed["loss_cash_per_price_unit"] != loss_unit or parsed["profit_cash_per_price_unit"] != profit_unit
+        or parsed["commission_round_turn"] != assumptions["commission_round_turn"]
+        or parsed["slippage_price"] != assumptions["slippage_price"]
+        or assumptions["commission_round_turn"] < commission_floor):
+        raise trade.GuardError("The experimental broker or cost assumptions changed.")
+    def reported(key):
+        amount = risk.get(key)
+        if amount is None:
+            if risk.get("costs_verified") is not False:
+                raise trade.GuardError("The current verified cost model is incomplete.")
+            return Decimal(0)
+        if type(amount) in (int, float) and amount == 0:
+            return Decimal(0)
+        return trade.positive_decimal(amount)
+    commission = max(parsed["commission_round_turn"], reported("commission_round_turn"), loss_unit * max(current_spread, 10 * tick))
+    slippage = max(parsed["slippage_price"], reported("slippage_price"), current_spread / 2, 2 * tick)
+    return {**context, "commission_round_turn": commission, "slippage_price": slippage}
+
+
 def validate_manual_offer(offer, settings, now):
-    """Qualified M1 requests never reuse the legacy automatic M15 validator."""
+    """Allow complete, distinct Demo profiles without automatic execution."""
     if type(offer) is not dict or type(offer.get("payload")) is not dict:
         raise trade.GuardError("Invalid manual proposal.")
     trade.uuid_text(offer.get("id"))
     trade.uuid_text(offer.get("claim_id"))
     payload = offer["payload"]
+    experimental = payload.get("signal_mode") == "experimental_demo"
+    profile_valid = (
+        payload.get("provisional") is True
+        and payload.get("strategy_id") == "mtf-ema-pullback-60m-demo-v2"
+        and type(payload.get("strategy_version")) is int and payload["strategy_version"] == 2
+        and payload.get("policy_id") == "mtf-manual-demo-estimated-cost-risk-v2"
+        and type(payload.get("entry_window_seconds")) is int and payload["entry_window_seconds"] == 30
+        and payload.get("qualification_id", "") == ""
+        and "evidence_metrics" not in payload
+    ) if experimental else (
+        payload.get("provisional") is False
+        and payload.get("strategy_id") == "mtf-ema-pullback-60m-v1"
+        and type(payload.get("strategy_version")) is int and payload["strategy_version"] == 1
+        and payload.get("policy_id") == "mtf-manual-demo-cost-risk-v1"
+        and payload.get("signal_mode", "qualified") == "qualified"
+        and type(payload.get("entry_window_seconds", 10)) is int and payload.get("entry_window_seconds", 10) == 10
+        and "cost_assumptions" not in payload
+        and type(payload.get("qualification_id")) is str and re.fullmatch(r"[0-9a-f]{64}", payload["qualification_id"]) is not None
+    )
     if (
-        payload.get("symbol") != settings.market.symbol or payload.get("account_mode") != "demo"
+        not profile_valid or not settings.enable_manual_tickets or settings.account_mode != "demo" or settings.volume != trade.DEMO_VOLUME
+        or payload.get("symbol") != settings.market.symbol or payload.get("account_mode") != "demo"
         or trade.positive_decimal(payload.get("volume")) != settings.volume
-        or payload.get("direction") not in ("BUY", "SELL") or payload.get("provisional") is True
-        or payload.get("strategy_id") != "mtf-ema-pullback-60m-v1"
-        or type(payload.get("strategy_version")) is not int or payload["strategy_version"] != 1
-        or payload.get("policy_id") != "mtf-manual-demo-cost-risk-v1"
+        or payload.get("direction") not in ("BUY", "SELL")
         or payload.get("display_timeframe") != "M1"
         or type(payload.get("horizon_seconds")) is not int or payload["horizon_seconds"] != 3600
-        or any(type(payload.get(key)) is not str or re.fullmatch(r"[0-9a-f]{64}", payload[key]) is None for key in ("strategy_fingerprint", "qualification_id", "broker_fingerprint"))
+        or any(type(payload.get(key)) is not str or re.fullmatch(r"[0-9a-f]{64}", payload[key]) is None for key in ("strategy_fingerprint", "broker_fingerprint"))
     ):
-        raise trade.GuardError("A qualified three-timeframe manual Demo proposal is required.")
+        raise trade.GuardError("A complete three-timeframe manual Demo signal profile is required.")
+    if experimental:
+        try:
+            chart.validate_cost_assumptions(payload.get("cost_assumptions"))
+        except chart.OverlayError:
+            raise trade.GuardError("Invalid experimental cost assumptions.") from None
     expires, bar = trade.utc_date(offer.get("expires_at")), trade.utc_date(payload.get("bar_time"))
     decision = trade.utc_date(payload.get("decision_time"))
-    if not bar + timedelta(minutes=1) <= decision <= now < expires <= min(now + timedelta(minutes=5), bar + timedelta(minutes=6)) or now - (bar + timedelta(minutes=1)) > timedelta(seconds=10):
-        raise trade.GuardError("The manual M1 entry window of 10 seconds or its deadline expired.")
+    window = 30 if experimental else 10
+    deadline = bar + timedelta(seconds=60 + window) if experimental else bar + timedelta(minutes=6)
+    if not bar + timedelta(minutes=1) <= decision <= now < expires <= min(now + timedelta(minutes=5), deadline) or now - (bar + timedelta(minutes=1)) > timedelta(seconds=window):
+        raise trade.GuardError("The manual M1 entry window of " + str(window) + " seconds or its deadline expired.")
     for key, seconds in (("bar_time", 60), ("confirmation_bar_time", 300), ("direction_bar_time", 900)):
         stamp = trade.utc_date(payload[key])
         if stamp.microsecond or stamp.timestamp() % seconds or not timedelta(0) <= bar + timedelta(minutes=1) - (stamp + timedelta(seconds=seconds)) < timedelta(seconds=seconds):
@@ -436,11 +506,14 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
                     reply = post(settings, "poll", {"device_id": ledger.device_id})
                     preparation = reply.get("preparation")
                     if preparation is not None:
-                        last_mtf_state = "qualified_preparation"
+                        last_mtf_state = "experimental_preparation" if preparation.get("payload", {}).get("signal_mode") == "experimental_demo" else "qualified_preparation"
                         prepare_ticket(mt5, settings, ledger, journal, adapter, preparation, clock=clock)
                         flush_results(settings, ledger, journal, post)
                     else:
-                        state = "unverified_costs" if latest_feed.get("risk_context", {}).get("costs_verified") is not True else "waiting_qualified_signal"
+                        if reply.get("signal_mode") == "experimental_demo":
+                            state = "waiting_experimental_signal"
+                        else:
+                            state = "unverified_costs" if latest_feed.get("risk_context", {}).get("costs_verified") is not True else "waiting_qualified_signal"
                         if state != last_mtf_state:
                             print("MTF status: " + state, flush=True)
                             last_mtf_state = state

@@ -202,15 +202,26 @@ async def decide(pool, bot_id, offer_id, chat_id, user_id, message_id, decision,
     return _offer(row)
 
 
-async def claim_offer(pool, bot_id, device_id, now, *, qualification_id=None, strategy_fingerprint=None, proposal_context=None):
+async def claim_offer(pool, bot_id, device_id, now, *, qualification_id=None, strategy_fingerprint=None, proposal_context=None, signal_mode=None):
     """Reserve one preparation; never reclaim an interrupted or final request."""
     bot_id, device_id, now = _identifier(bot_id, positive=True), _uuid(device_id), _utc(now)
     from bot.strategy_evidence import hex_digest
-    if not hex_digest(qualification_id) or not hex_digest(strategy_fingerprint):
+    from bot import mtf_runtime
+    experimental = signal_mode == "experimental_demo"
+    if signal_mode not in (None, "qualified", "experimental_demo"):
+        return None
+    if experimental:
+        if mtf_runtime.signal_mode() != "experimental_demo" or qualification_id not in (None, ""):
+            return None
+    elif not hex_digest(qualification_id):
+        return None
+    if not hex_digest(strategy_fingerprint):
         return None
     required_context = {"direction", "bar_time", "confirmation_bar_time", "direction_bar_time", "broker_fingerprint", "policy_id", "cost_context", "execution"}
     if type(proposal_context) is not dict or set(proposal_context) != required_context:
         return None
+    if experimental:
+        return await _claim_experimental_offer(pool, bot_id, device_id, now, strategy_fingerprint, proposal_context)
     context = _json_object(proposal_context)
     row = await pool.fetchrow(
         """
@@ -246,6 +257,65 @@ async def claim_offer(pool, bot_id, device_id, now, *, qualification_id=None, st
         JOIN mt5_devices AS device ON device.bot_id = claimed.bot_id AND device.device_id = claimed.device_id
         """,
         bot_id, device_id, now, now - HEARTBEAT_TTL, uuid4(), qualification_id, strategy_fingerprint, context,
+    )
+    return _offer(row)
+
+
+async def _claim_experimental_offer(pool, bot_id, device_id, now, fingerprint, proposal_context):
+    """Claim only the server-selected experimental profile, under the same lock."""
+    from bot import multi_timeframe
+    if proposal_context.get("policy_id") != multi_timeframe.EXPERIMENTAL_POLICY_ID:
+        return None
+    costs = proposal_context.get("cost_context")
+    if type(costs) is not dict or not {"loss_cash_per_price_unit", "profit_cash_per_price_unit"} <= set(costs):
+        return None
+    context = dict(proposal_context)
+    context["cost_context"] = {key: costs[key] for key in ("loss_cash_per_price_unit", "profit_cash_per_price_unit")}
+    row = await pool.fetchrow(
+        """
+        WITH candidate AS (
+            SELECT offer.id FROM mt5_manual_ticket_offers AS offer
+            JOIN mt5_devices AS device ON device.bot_id = offer.bot_id AND device.device_id = offer.device_id
+            JOIN market_subscriptions AS subscription
+                ON subscription.bot_id = offer.bot_id AND subscription.chat_id = offer.chat_id
+            WHERE offer.bot_id = $1 AND offer.device_id = $2 AND offer.status = 'requested'
+                AND offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-demo-v2'
+                AND offer.payload->>'strategy_version' = '2'
+                AND offer.payload->>'policy_id' = 'mtf-manual-demo-estimated-cost-risk-v2'
+                AND offer.payload->>'signal_mode' = 'experimental_demo'
+                AND offer.payload->'provisional' = 'true'::jsonb
+                AND offer.payload->>'entry_window_seconds' = '30'
+                AND COALESCE(offer.payload->>'qualification_id', '') = ''
+                AND NOT (offer.payload ? 'evidence_metrics')
+                AND offer.payload->>'strategy_fingerprint' = $6
+                AND offer.payload->>'horizon_seconds' = '3600'
+                AND offer.payload->>'display_timeframe' = 'M1'
+                AND offer.payload->>'workflow' = 'manual_ticket'
+                AND offer.payload->>'account_mode' = 'demo' AND offer.payload->>'volume' = '0.01'
+                AND device.account_mode = 'demo' AND device.volume = 0.01
+                AND offer.payload @> $7::jsonb
+                AND offer.expires_at > $3 AND offer.decided_at <= $3
+                AND offer.expires_at <= (offer.payload->>'bar_time')::timestamptz + INTERVAL '90 seconds'
+                AND (offer.payload->>'bar_time')::timestamptz + INTERVAL '60 seconds' <= $3
+                AND (offer.payload->>'bar_time')::timestamptz + INTERVAL '90 seconds' >= $3
+                AND device.owner_chat_id = offer.chat_id AND device.owner_user_id = offer.user_id
+                AND offer.chat_id = offer.user_id
+                AND device.last_seen_at >= $4 AND device.last_seen_at <= $3 AND subscription.active
+                AND NOT EXISTS (
+                    SELECT 1 FROM mt5_manual_ticket_offers AS active
+                    WHERE active.bot_id = $1 AND active.device_id = $2 AND active.status = 'preparing'
+                )
+            ORDER BY offer.decided_at, offer.id LIMIT 1 FOR UPDATE OF offer, device SKIP LOCKED
+        ), claimed AS (
+            UPDATE mt5_manual_ticket_offers AS offer SET status = 'preparing', claim_id = $5,
+                preparing_at = $3, updated_at = $3
+            FROM candidate WHERE offer.id = candidate.id AND offer.bot_id = $1 AND offer.status = 'requested'
+            RETURNING offer.*
+        )
+        SELECT claimed.*, device.symbol, device.account_mode, device.volume FROM claimed
+        JOIN mt5_devices AS device ON device.bot_id = claimed.bot_id AND device.device_id = claimed.device_id
+        """,
+        bot_id, device_id, now, now - HEARTBEAT_TTL, uuid4(), fingerprint, _json_object(context),
     )
     return _offer(row)
 

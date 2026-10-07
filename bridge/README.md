@@ -1,13 +1,16 @@
 # Windows MT5 bridges
 
-Two manually started helpers connect to the selected MetaTrader 5 desktop terminal:
+The manually started helpers connect to the selected MetaTrader 5 desktop terminal:
 
 | Helper | Purpose | Orders |
 | --- | --- | --- |
 | `mt5_market_bridge.py` | Upload gold quotes and completed M15 candles | Read-only; never places, changes or closes orders |
+| `mt5_manual_bridge.py` | Upload M15/M5/M1 and prepare a native ticket for human review | Paired Demo 0.01 only; never submits an order |
 | `start_mt5_bridge.ps1` / `mt5_trade_bridge.py` | Upload market data and process owner-approved Telegram requests | Demo account only, exactly 0.01 lot per accepted offer |
 
 The bot defaults to paper signals and `MT5_TRADING_ENABLED=false`. The Demo helper needs explicit enablement on the server and a local confirmation. This release does not support Real accounts or other lot sizes. Keep the SDK on Windows; Railway never connects directly to MT5 or sends an order.
+
+For the current manual-ticket workflow, use [MANUAL-TICKETS.md](MANUAL-TICKETS.md). The default `MT5_SIGNAL_MODE=qualified` requires verified costs and reviewed performance evidence. Explicit `MT5_SIGNAL_MODE=experimental_demo` instead emits provisional Demo signals with labelled `spread_tick_floor_v1` cost assumptions and a **30-second window after the M1 close**; it does not certify performance or enable automatic execution. The local manual helper retains all quote, identity, grid, exposure, 1% cash-risk, reward/risk and margin checks and recomputes risk with at least the frozen estimates. Use display indicator **2.10** to see labelled experimental levels. The SDK remains read-only in this workflow; the user reviews the native ticket and presses Buy/Sell themselves. The legacy order helper described below is a separate workflow.
 
 ## Shared requirements
 

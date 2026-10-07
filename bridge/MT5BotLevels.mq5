@@ -1,5 +1,5 @@
 #property copyright "MT5 Bot"
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 0
@@ -7,7 +7,7 @@
 #property description "Displays the current bot proposal. Manual trading only."
 
 // Headerless ASCII row, exactly 18 semicolon-delimited fields:
-// 0 version, 1 state, 2 symbol, 3 timeframe, 4 direction,
+// 0 version, 1 state (active/experimental/waiting), 2 symbol, 3 timeframe, 4 direction,
 // 5 entry, 6 zone_low, 7 zone_high, 8 stop, 9 target, 10 digits,
 // 11 observed_utc, 12 valid_until_utc, 13 bar_utc, 14 broker_offset_minutes,
 // 15 terminal_key, 16 binding_nonce_hex, 17 binding_sha256_hex.
@@ -19,6 +19,7 @@
 struct Proposal
   {
    bool     active;
+   bool     experimental;
    string   direction;
    double   entry;
    double   zone_low;
@@ -168,7 +169,7 @@ bool ReadProposal(Proposal &p,string &message)
    string fields[];
    string row=CharArrayToString(bytes,0,(int)size,CP_UTF8);
    if(StringSplit(row,';',fields)!=OVERLAY_FIELD_COUNT
-      || fields[0]!="2" || (fields[1]!="active" && fields[1]!="waiting")
+      || fields[0]!="2" || (fields[1]!="active" && fields[1]!="experimental" && fields[1]!="waiting")
       || fields[2]!="XAUUSD" || fields[3]!="M1")
      {
       message="Waiting: invalid proposal format";
@@ -198,7 +199,8 @@ bool ReadProposal(Proposal &p,string &message)
       message="Waiting: proposal expired or feed offline";
       return(false);
      }
-   p.active=(fields[1]=="active");
+   p.experimental=(fields[1]=="experimental");
+   p.active=(fields[1]=="active" || p.experimental);
    p.direction=fields[4];
    p.digits=(int)digits;
    p.observed=(datetime)observed;
@@ -207,7 +209,7 @@ bool ReadProposal(Proposal &p,string &message)
    p.offset_minutes=(int)offset;
    if(!p.active)
      {
-      message="No qualified opportunity: evidence or market conditions not met";
+      message="No current proposal: waiting for market and risk conditions";
       if(p.direction!="NONE" || p.entry!=0.0 || p.zone_low!=0.0 || p.zone_high!=0.0
          || p.stop!=0.0 || p.target!=0.0 || bar!=0)
          message="Waiting: invalid empty proposal";
@@ -227,6 +229,7 @@ bool ReadProposal(Proposal &p,string &message)
                 || (p.direction=="SELL" && p.target<p.zone_low && p.zone_high<p.stop);
    datetime chart_bar=(datetime)(bar+offset*60);
    if(!ordered || bar<=0 || bar%60!=0 || bar+60>observed || observed-bar>135
+      || (p.experimental && (observed>bar+90 || valid_until>bar+90))
       || iBarShift(_Symbol,PERIOD_M1,chart_bar,true)<1)
      {
       message="Waiting: invalid direction or chart time";
@@ -337,9 +340,9 @@ bool DrawProposal(const Proposal &p)
           && SetPriceText("entry_text","Entry "+entry,label_time,p.entry,clrGold)
           && SetPriceText("stop_text","SL "+stop,label_time,p.stop,clrTomato)
           && SetPriceText("target_text","TP "+target,label_time,p.target,clrLimeGreen)
-          && SetLabel("status","MT5 Bot | "+p.direction+" proposal | "+IntegerToString(seconds)+"s",22,direction_color,12)
+          && SetLabel("status","MT5 Bot | "+(p.experimental ? "Demo experimental | " : "")+p.direction+" proposal | "+IntegerToString(seconds)+"s",22,direction_color,12)
           && SetLabel("summary","Entry zone: "+DoubleToString(p.zone_low,p.digits)+" - "+DoubleToString(p.zone_high,p.digits),43,clrGold)
-          && SetLabel("details","Reference levels | Review before manual trade",63,clrSilver));
+          && SetLabel("details",(p.experimental ? "Estimated costs | No certified win rate | " : "")+"Reference levels | Review before manual trade",63,clrSilver));
   }
 
 void UpdateOverlay()

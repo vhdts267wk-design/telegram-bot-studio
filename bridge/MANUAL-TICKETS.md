@@ -4,7 +4,17 @@
 
 Keep the intended Windows MT5 **Demo** terminal open, connected, and showing the exact broker gold symbol's **M1** chart. M15 determines direction, M5 confirms a pullback/recovery, and a completed M1 close determines timing. This workflow retains the **0.01 lot** limit and paired device/account identity. Algorithmic trading and external Python trading can remain disabled: the SDK is used only for prices, broker settings, and account checks.
 
-## Qualification before any proposal
+## Explicit Demo experimental profile
+
+The server defaults to `MT5_SIGNAL_MODE=qualified`. An operator can explicitly choose `MT5_SIGNAL_MODE=experimental_demo` for provisional Demo signals with estimated costs. This profile does not certify a win rate or mark broker costs as verified. It is limited to the same paired **Demo account and 0.01 lot**, with the same M15 direction, M5 confirmation, M1 trigger, price grid, fresh quote, account exposure, cash risk, reward/risk, margin and spread/drift checks. It never enables automatic order execution.
+
+Experimental payloads use the complete distinct profile `strategy_id=mtf-ema-pullback-60m-demo-v2`, `strategy_version=2`, `policy_id=mtf-manual-demo-estimated-cost-risk-v2`, `signal_mode=experimental_demo`, `provisional=true`, and `entry_window_seconds=30`. They omit `qualification_id` and empirical evidence metrics. A partial profile, a certified hash attached to this profile, or an unknown mode is rejected. Default qualified payloads keep their original IDs, verified costs, qualification hash and ten-second action window.
+
+The estimate method is `spread_tick_floor_v1`. For exactly 0.01 lot, round-trip commission in account currency is at least the larger of reported commission and `loss_cash_per_price_unit × max(spread, 10 × tick_size)`; per-side price slippage is at least the larger of reported slippage, half the spread and two ticks. Missing costs can use these floors only when the source explicitly marks costs unverified. Every experimental proposal includes the values and method in `cost_assumptions` with `verified=false`. The local helper recalculates cash risk with the larger of the frozen proposal estimates, current reported costs and current spread/tick floors. Missing live costs cannot erase the saved estimates. These are assumptions for Demo experimentation, not measured trading costs.
+
+Experimental alerts, chart levels and ticket preparation expire **30 seconds after the triggering M1 close**. Quotes still expire after ten seconds; the wider entry window does not admit stale quotes. Review the `Demo EXP` ticket comment and current direction/volume/SL/TP yourself. A prepared native window remains open after expiry; cancel it if the signal is no longer valid.
+
+## Default qualified profile
 
 The current strategy is `mtf-ema-pullback-60m-v1`. Each stream uses at most 64 actual completed bars and requires at least 22 contiguous bars after its latest gap. Gaps are never filled and forming candles are never used. M15/M5 references must already be closed at the M1 decision. Entry is the fresh executable Ask/Bid rounded adversely to the tick grid; SL uses a recent M5 swing plus a 0.2 ATR buffer. TP1 is 2R and supplementary TP2 is 3R. Published prices remain fixed.
 
@@ -35,11 +45,11 @@ bridge/.venv/Scripts/python.exe bridge/mt5_manual_bridge.py `
   --enable-manual-tickets
 ```
 
-Use the existing paired private Telegram chat to request preparation. Preparation is refused after **10 seconds from the triggering M1 close**. When the native window appears, verify its symbol, volume, Stop Loss, Take Profit, current price, and the suggested direction in its comment. Its comment also gives the proposal's expiry in UTC. **Only you click the native Buy/Sell button, while the signal remains valid.** If the deadline passes before your click, cancel the draft and wait for a fresh qualified signal. Cancelling the window places no order. A successfully prepared window does not expire or cancel itself.
+Use the existing paired private Telegram chat to request preparation. Preparation is refused after **10 seconds from the triggering M1 close in qualified mode, or 30 seconds in explicit experimental Demo mode**. When the native window appears, verify its symbol, volume, Stop Loss, Take Profit, current price, and the suggested direction in its comment. Its comment also gives the proposal's expiry in UTC and marks experimental drafts `Demo EXP`. **Only you click the native Buy/Sell button, while the signal remains valid.** If the deadline passes before your click, cancel the draft and wait for a fresh signal. Cancelling the window places no order. A successfully prepared window does not expire or cancel itself.
 
 An existing native order window is never overwritten. Close or cancel it yourself before requesting another proposal. Already attempted proposal IDs are not replayed, even after cancellation or a helper restart. Request a new proposal rather than deleting the journal.
 
-Before populating fields, the adapter verifies the selected terminal process, executable path, local Demo account, active symbol/M1 chart, qualified strategy and three completed-bar references, native controls, and **absolute-price** SL/TP mode. Unsupported layouts and unverified price/points mode fail closed. It disables its own verified Order window during preparation, writes only Volume, Stop Loss, Take Profit, and the bounded direction/expiry comment, then reads them back. It enables the completed window only after the final expiry, account, quote, spread, and protection checks pass. It never sends Enter or clicks native trading buttons.
+Before populating fields, the adapter verifies the selected terminal process, executable path, local Demo account, active symbol/M1 chart, complete signal profile and three completed-bar references, native controls, and **absolute-price** SL/TP mode. Unsupported layouts and unverified price/points mode fail closed. It disables its own verified Order window during preparation, writes only Volume, Stop Loss, Take Profit, and the bounded direction/expiry comment, then reads them back. It enables the completed window only after the final expiry, account, quote, spread, and protection checks pass. It never sends Enter or clicks native trading buttons.
 
 If preparation fails after the lock, the adapter cancels only that exact owned ticket, after verifying the same terminal, account binding, and single order window. It never closes an independently opened or replacement window. If account/window ownership changes, or MT5 refuses cancellation, the owned draft stays blocked and the helper reports failure; resolve that window in MT5 before requesting a fresh proposal.
 
@@ -54,10 +64,12 @@ Press Ctrl+C to stop the foreground helper. It installs no background service or
 Compile `bridge/MT5BotLevels.mq5` in MetaEditor and copy the resulting
 `MT5BotLevels.ex5` into `MQL5/Indicators/MT5Bot` under this terminal's **File >
 Open Data Folder**. Refresh MT5's Navigator and attach **MT5BotLevels** to
-the intended **XAUUSD M1** chart. Use indicator **version 2**; old M15/CSV-v1
+the intended **XAUUSD M1** chart. Use indicator **version 2.10**; old M15/CSV-v1
 snapshots are rejected. It is a display-only custom indicator and needs
 no DLLs, WebRequest permissions or algorithmic-trading setting. Keep the
 paired manual helper running.
+
+CSV version 2 remains exactly 18 fields. Its state is `active` for a qualified proposal, `experimental` for an explicit experimental Demo proposal, or `waiting`. Version 2.10 displays **Demo experimental**, **Estimated costs**, and **No certified win rate** on experimental levels, and overwrites those labels when the mode changes. Older version 2.00 indicators reject the experimental state and show no experimental levels until updated.
 
 Each latest valid published proposal appears automatically, before a ticket
 preparation request: shaded Entry Zone, gold reference Entry, green TP and red
@@ -70,7 +82,7 @@ existing spread-plus-drift guard and never guarantees a fill at Entry.
 The separate manual-key-authenticated `POST /api/mt5/manual/chart` accepts
 only the paired `device_id`. It neither claims nor changes a proposal, and
 does not refresh the device heartbeat. It selects the latest published
-owner-bound proposal before checking status, subscription, empirical qualification, risk pause, Demo
+owner-bound proposal before checking status, subscription, the selected signal profile (empirical qualification in default qualified mode), risk pause, Demo
 0.01 binding, receipt/quote freshness, broker metadata and explicit expiry.
 A newer rejected or expired proposal cannot expose an older one again.
 

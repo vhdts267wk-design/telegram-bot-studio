@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import datetime, timedelta
+import os
 import unittest
 from unittest.mock import patch
 
@@ -202,6 +203,111 @@ class MtfPresentationTests(unittest.TestCase):
                 result = deepcopy(original)
                 del result[key]
                 self.assert_no_trade(presentation.format_proposal(result))
+
+
+class ExperimentalMtfPresentationTests(unittest.TestCase):
+    def setUp(self):
+        self.feed, _, self.now = fixtures.synthetic_case()
+        self.feed["risk_context"]["costs_verified"] = False
+        mode = patch.dict(os.environ, {"MT5_SIGNAL_MODE": "experimental_demo"})
+        mode.start()
+        self.addCleanup(mode.stop)
+        clock = patch.object(mtf_runtime, "_clock", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def proposal(self, feed=None):
+        result = mtf_runtime.evaluate_feed(self.feed if feed is None else feed, self.now)
+        self.assertEqual(result["state"], "signal", result)
+        return result
+
+    def assert_no_trade(self, text):
+        self.assertNotRegex(text, r"(?i)\b(?:BUY|SELL)\b")
+        for marker in ("الدخول المقترح:", "منطقة الدخول:", "SL:", "TP1:", "TP2:"):
+            self.assertNotIn(marker, text)
+
+    def test_experimental_proposal_discloses_unproven_performance_cost_values_and_manual_window(self):
+        result = self.proposal()
+        original = deepcopy(result)
+        text = presentation.format_proposal(result, manual_ticket_enabled=True)
+        for marker in ("إشارة Demo تجريبية — الأداء غير مثبت", "شراء BUY", "Demo فقط", "الحجم 0.01",
+                       "حتى 1% من حقوق الحساب (Equity)", "افتراضات تقديرية غير موثّقة", "عملة الحساب", "لكل جهة",
+                       "ارتداد M5 مؤكّد خلال آخر 3 شموع قبل شمعة التأكيد", "نافذة الدخول 30 ثانية من إغلاق M1",
+                       "الإلغاء: مرور 30 ثانية بعد إغلاق M1", "التجهيز خلال 30 ثانية",
+                       "Buy أو Sell بنفسك", "الوقف والهدف ثابتين"):
+            self.assertIn(marker, text)
+        for key in ("commission_round_turn", "slippage_price"):
+            self.assertIn(f"{result['cost_assumptions'][key]:.8g}", text)
+        for marker in ("إشارة مؤهلة", "اختبار خارج العينة", "95%", "النسبة الملاحظة", "تقدير تاريخي"):
+            self.assertNotIn(marker, text)
+        self.assertEqual(result, original)
+
+    def test_sell_and_automatic_flag_keep_explicit_demo_human_action(self):
+        feed = candle_fixtures.MultiTimeframeTests().feed(sell=True)
+        feed["risk_context"]["costs_verified"] = False
+        text = presentation.format_proposal(self.proposal(feed), execution_enabled=True, manual_ticket_enabled=True)
+        self.assertIn("بيع SELL", text)
+        self.assertIn("الأداء غير مثبت", text)
+        self.assertIn("موافقتك اليدوية لكل صفقة", text)
+        self.assertIn("بنفسك", text)
+        self.assertNotIn("تنفيذ تلقائي", text)
+
+    def test_experimental_analysis_reference_does_not_claim_evidence_qualification(self):
+        result = self.proposal()
+        full = presentation.format_analysis(self.feed, result, self.now)
+        self.assertEqual(full.count("شراء BUY"), 1)
+        reference = presentation.format_analysis(self.feed, result, self.now, include_proposal=False)
+        for marker in ("إشارة Demo تجريبية", "الأداء غير مثبت", "التكاليف تقديرية", "/signals"):
+            self.assertIn(marker, reference)
+        self.assert_no_trade(reference)
+        self.assertNotIn("بوابة الأدلة", reference)
+
+    def test_expired_experimental_entry_window_keeps30second_explanation(self):
+        result = self.proposal()
+        clock = self.now + timedelta(seconds=31)
+        feed = deepcopy(self.feed)
+        feed["as_of"] = feed["risk_context"]["as_of"] = feed["quote"]["time"] = clock.isoformat()
+        with patch.object(mtf_runtime, "_clock", return_value=clock):
+            for text in (presentation.format_proposal(result), presentation.format_analysis(feed, result, clock)):
+                self.assert_no_trade(text)
+                self.assertIn("30 ثانية فقط بعد إغلاق شمعة M1", text)
+                self.assertIn("انتظر إشارة جديدة", text)
+                self.assertIn("الأداء غير مثبت", text)
+                self.assertNotIn("10 ثوانٍ فقط بعد إغلاق شمعة M1", text)
+
+    def test_experimental_waiting_and_stale_data_remain_identified(self):
+        waiting = {"state": "no_signal", "reason": "m5_pullback_not_confirmed", "signal_mode": "experimental_demo",
+                   "provisional": True, "entry_window_seconds": 30}
+        text = presentation.status_text(waiting)
+        self.assertIn("لا توجد إشارة Demo تجريبية مستوفية الشروط", text)
+        self.assertIn("الأداء غير مثبت", text)
+        self.assertIn("افتراضات تقديرية غير موثّقة", text)
+        self.assert_no_trade(text)
+        result = self.proposal()
+        clock = self.now + timedelta(seconds=11)
+        text = presentation.format_analysis(self.feed, result, clock)
+        self.assertIn("الأداء غير مثبت", text)
+        self.assertIn("بيانات MT5 غير حديثة", text)
+        self.assert_no_trade(text)
+
+    def test_corrupt_estimated_cost_metadata_suppresses_trade_and_any_evidence_claims(self):
+        original = self.proposal()
+        for change in ("missing", "nonfinite", "certification"):
+            with self.subTest(change=change):
+                result = deepcopy(original)
+                if change == "missing":
+                    del result["cost_assumptions"]
+                elif change == "nonfinite":
+                    result["cost_assumptions"]["commission_round_turn"] = float("nan")
+                else:
+                    result["qualification_id"] = "f" * 64
+                    result["evidence_metrics"] = [{"scenario": "fabricated", "wins": 200, "trades": 200,
+                                                   "win_rate": 1.0, "lower_95": .99}]
+                text = presentation.format_proposal(result)
+                self.assert_no_trade(text)
+                self.assertIn("الأداء غير مثبت", text)
+                self.assertNotIn("اختبار خارج العينة", text)
+                self.assertNotIn("95%", text)
 
 
 if __name__ == "__main__": unittest.main()

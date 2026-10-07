@@ -1,10 +1,11 @@
 """Causal M15 direction, M5 recovery and M1 timing candidates for manual Demo.
 
-Candidates do not authorize alerts, orders or ticket preparation. Only the
-separate operator-pinned empirical evidence gate can qualify their display.
-The same bounded rolling windows and immutable policy are used offline/live.
+Candidates do not authorize orders or ticket preparation. Qualified signals
+require operator-pinned empirical evidence. An explicitly selected experimental
+Demo profile retains risk guards and labels its costs and outcomes unverified.
 """
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, DecimalException, ROUND_CEILING, ROUND_FLOOR
 from functools import lru_cache
@@ -21,6 +22,10 @@ from bot import paper_signals
 STRATEGY_ID = "mtf-ema-pullback-60m-v1"
 STRATEGY_VERSION = 1
 POLICY_ID = "mtf-manual-demo-cost-risk-v1"
+EXPERIMENTAL_STRATEGY_ID = "mtf-ema-pullback-60m-demo-v2"
+EXPERIMENTAL_STRATEGY_VERSION = 2
+EXPERIMENTAL_POLICY_ID = "mtf-manual-demo-estimated-cost-risk-v2"
+EXPERIMENTAL_SIGNAL_MODE = "experimental_demo"
 HORIZON_SECONDS = 3600
 LOOKBACK_BARS = 64
 MIN_CONTIGUOUS_BARS = 22
@@ -54,6 +59,10 @@ POLICY = MappingProxyType({
     "success_target": "target", "evidence_min_nonoverlapping_oos_trades": 200,
     "evidence_lower_95_wilson_bound": "0.70",
 })
+EXPERIMENTAL_POLICY = MappingProxyType({
+    **POLICY, "max_entry_delay_seconds": 30, "m5_pullback_preceding_bars": 3,
+    "cost_policy": "estimated_spread_tick_floor_v1", "empirical_qualification": False,
+})
 
 
 class _Invalid(ValueError):
@@ -79,13 +88,15 @@ def _decimal(value, *, zero=False, cash=False):
     return result
 
 
-@lru_cache(maxsize=1)
-def _fingerprint():
+@lru_cache(maxsize=2)
+def _fingerprint(experimental_demo=False):
     # No dataset, API key, account identity or mutable runtime setting enters
     # the fingerprint. Runtime must separately match the evaluated cost model.
     components = {
-        "strategy_id": STRATEGY_ID, "strategy_version": STRATEGY_VERSION,
-        "policy_id": POLICY_ID, "policy": dict(POLICY),
+        "strategy_id": EXPERIMENTAL_STRATEGY_ID if experimental_demo else STRATEGY_ID,
+        "strategy_version": EXPERIMENTAL_STRATEGY_VERSION if experimental_demo else STRATEGY_VERSION,
+        "policy_id": EXPERIMENTAL_POLICY_ID if experimental_demo else POLICY_ID,
+        "policy": dict(EXPERIMENTAL_POLICY if experimental_demo else POLICY),
         "implementation_sha256": hashlib.sha256(Path(__file__).read_bytes().replace(b"\r\n", b"\n")).hexdigest(),
         "indicator_dependency_sha256": hashlib.sha256(Path(paper_signals.__file__).read_bytes().replace(b"\r\n", b"\n")).hexdigest(),
     }
@@ -93,10 +104,11 @@ def _fingerprint():
     return hashlib.sha256(encoded).hexdigest()
 
 
-def strategy_identity():
+def strategy_identity(*, experimental_demo=False):
     """Return a detached exact identity for the operator-pinned evidence gate."""
-    return {"strategy_id": STRATEGY_ID, "policy_id": POLICY_ID,
-            "horizon_seconds": HORIZON_SECONDS, "fingerprint": _fingerprint()}
+    return {"strategy_id": EXPERIMENTAL_STRATEGY_ID if experimental_demo else STRATEGY_ID,
+            "policy_id": EXPERIMENTAL_POLICY_ID if experimental_demo else POLICY_ID,
+            "horizon_seconds": HORIZON_SECONDS, "fingerprint": _fingerprint(experimental_demo)}
 
 
 def qualification_allowed(evidence, *, now=None):
@@ -108,14 +120,58 @@ def qualification_allowed(evidence, *, now=None):
         return False
 
 
-def _result(state, reason, *, counts=None, **values):
+def _result(state, reason, *, counts=None, experimental_demo=False, **values):
     return {
-        "state": state, "reason": reason, "strategy_id": STRATEGY_ID,
-        "strategy_version": STRATEGY_VERSION, "policy_id": POLICY_ID,
-        "strategy_fingerprint": _fingerprint(), "horizon_seconds": HORIZON_SECONDS,
+        "state": state, "reason": reason,
+        "strategy_id": EXPERIMENTAL_STRATEGY_ID if experimental_demo else STRATEGY_ID,
+        "strategy_version": EXPERIMENTAL_STRATEGY_VERSION if experimental_demo else STRATEGY_VERSION,
+        "policy_id": EXPERIMENTAL_POLICY_ID if experimental_demo else POLICY_ID,
+        "strategy_fingerprint": _fingerprint(experimental_demo), "horizon_seconds": HORIZON_SECONDS,
         "required_bars": MIN_CONTIGUOUS_BARS, "candle_counts": counts or {},
+        **({"signal_mode": EXPERIMENTAL_SIGNAL_MODE, "entry_window_seconds": 30,
+            "provisional": True} if experimental_demo else {}),
         **values,
     }
+
+
+def prepare_analysis_feed(feed, *, experimental_demo=False):
+    """Copy the input and derive explicit, unverified Demo cost estimates."""
+    prepared = deepcopy(feed)
+    if not experimental_demo:
+        return prepared
+    if type(prepared) is not dict or type(prepared.get("risk_context")) is not dict:
+        raise _Invalid("missing_risk_context")
+    risk = prepared["risk_context"]
+    # Retain malformed/missing risk fields for the normal strict validator.
+    if set(risk) != RISK_FIELDS:
+        raise _Invalid("missing_risk_context")
+    if type(risk["costs_verified"]) is not bool:
+        raise _Invalid("unverified_costs")
+    tick, _, _, _ = _execution(prepared["execution"])
+    bid, ask = (_decimal(prepared["quote"][key]) for key in ("bid", "ask"))
+    spread = ask - bid
+    if spread <= 0:
+        raise _Invalid("excessive_or_unknown_spread")
+    loss_unit = _decimal(risk["loss_cash_per_price_unit"], cash=True)
+    def reported_cost(key):
+        value = risk[key]
+        # The live bridge represents an explicitly unknown cost as None.
+        # Only an unverified context may replace that absence with a floor.
+        if value is None and risk["costs_verified"] is False:
+            return Decimal(0)
+        return _decimal(value, zero=True, cash=True)
+
+    commission = reported_cost("commission_round_turn")
+    slippage = reported_cost("slippage_price")
+    def conservative_number(value):
+        number = float(value)
+        # A binary conversion must never round an explicit cost floor down.
+        return math.nextafter(number, math.inf) if Decimal(str(number)) < value else number
+
+    risk["commission_round_turn"] = conservative_number(max(commission, loss_unit * max(spread, 10 * tick)))
+    risk["slippage_price"] = conservative_number(max(slippage, spread / 2, 2 * tick))
+    risk["costs_verified"] = False
+    return prepared
 
 
 def _bars(values, timeframe, now):
@@ -206,7 +262,7 @@ def _price_number(value):
     return number
 
 
-def analyze_multi_timeframe(feed, now=None, *, research_only=False):
+def analyze_multi_timeframe(feed, now=None, *, research_only=False, experimental_demo=False):
     """Return a deterministic candidate or an explicit waiting/block reason.
 
     All references are closed at the M1 decision time. Entry is the current
@@ -217,83 +273,104 @@ def analyze_multi_timeframe(feed, now=None, *, research_only=False):
     """
     if type(research_only) is not bool:
         return {**_result("invalid", "invalid_research_mode"), "provisional": True}
-    result = _analyze_multi_timeframe(feed, now, research_only=research_only)
-    return {**result, "provisional": research_only}
+    if type(experimental_demo) is not bool or (research_only and experimental_demo):
+        return {**_result("invalid", "invalid_signal_profile"), "provisional": True}
+    try:
+        prepared = prepare_analysis_feed(feed, experimental_demo=experimental_demo) if experimental_demo else feed
+    except _Invalid as error:
+        return _result("blocked", error.reason, experimental_demo=experimental_demo)
+    except (KeyError, TypeError, ValueError, OverflowError, AttributeError, DecimalException):
+        return _result("invalid", "invalid_market_or_risk_data", experimental_demo=experimental_demo)
+    result = _analyze_multi_timeframe(prepared, now, research_only=research_only,
+                                    experimental_demo=experimental_demo)
+    if experimental_demo:
+        risk = prepared["risk_context"]
+        result["cost_assumptions"] = {
+            "verified": False, "method": "spread_tick_floor_v1",
+            "commission_round_turn": risk["commission_round_turn"],
+            "slippage_price": risk["slippage_price"],
+            "spread_price": float(Decimal(str(prepared["quote"]["ask"])) - Decimal(str(prepared["quote"]["bid"]))),
+            "tick_size": prepared["execution"]["tick_size"],
+        }
+    return {**result, "provisional": research_only or experimental_demo}
 
 
-def _analyze_multi_timeframe(feed, now=None, *, research_only=False):
+def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimental_demo=False):
     counts = {}
+    def result(state, reason, **values):
+        return _result(state, reason, experimental_demo=experimental_demo, **values)
+
     try:
         clock = _utc(datetime.now(timezone.utc) if now is None else now)
         if type(feed) is not dict or feed.get("source") != "MetaTrader 5" or type(feed.get("schema_version")) is not int or feed["schema_version"] != 2:
-            return _result("invalid", "unsupported_feed", counts=counts)
+            return result("invalid", "unsupported_feed", counts=counts)
         symbol = feed.get("symbol")
         if type(symbol) is not str or re.fullmatch(r"(?:XAUUSD|GOLD)[A-Za-z0-9._#-]{0,24}", symbol, re.I) is None:
-            return _result("invalid", "invalid_symbol", counts=counts)
+            return result("invalid", "invalid_symbol", counts=counts)
         if not timedelta(0) <= clock - _utc(feed["as_of"]) <= timedelta(seconds=30):
-            return _result("stale", "stale_snapshot", counts=counts)
+            return result("stale", "stale_snapshot", counts=counts)
         quote = feed["quote"]
         if type(quote) is not dict or set(quote) != {"bid", "ask", "time"}:
-            return _result("invalid", "invalid_quote", counts=counts)
+            return result("invalid", "invalid_quote", counts=counts)
         bid, ask = _decimal(quote["bid"]), _decimal(quote["ask"])
         if bid > ask:
-            return _result("invalid", "crossed_quote", counts=counts)
+            return result("invalid", "crossed_quote", counts=counts)
         if not timedelta(seconds=-5) <= clock - _utc(quote["time"]) <= timedelta(seconds=10):
-            return _result("stale", "stale_quote", counts=counts)
+            return result("stale", "stale_quote", counts=counts)
         tick, point, digits, stops = _execution(feed["execution"])
         streams = feed.get("timeframes")
         if type(streams) is not dict or set(streams) != set(TIMEFRAME_SECONDS):
-            return _result("warmup", "missing_timeframes", counts=counts)
+            return result("warmup", "missing_timeframes", counts=counts)
         if any(type(streams[key]) is not list for key in TIMEFRAME_SECONDS):
-            return _result("invalid", "invalid_timeframes", counts=counts)
+            return result("invalid", "invalid_timeframes", counts=counts)
         counts = {key: len(streams[key]) for key in TIMEFRAME_SECONDS}
         if any(count > LOOKBACK_BARS for count in counts.values()):
-            return _result("invalid", "excess_history", counts=counts)
+            return result("invalid", "excess_history", counts=counts)
         supplied = {key: _bars(streams[key], key, clock) for key in TIMEFRAME_SECONDS}
         bars = {key: _contiguous_suffix(values, key) for key, values in supplied.items()}
         contiguous_counts = {key: len(values) for key, values in bars.items()}
         if any(count < MIN_CONTIGUOUS_BARS for count in contiguous_counts.values()):
-            return _result("warmup", "insufficient_contiguous_history", counts=counts,
+            return result("warmup", "insufficient_contiguous_history", counts=counts,
                            contiguous_counts=contiguous_counts)
         trigger_close = bars["M1"][-1]["time"] + timedelta(seconds=60)
         if not timedelta(0) <= clock - trigger_close <= timedelta(seconds=75):
-            return _result("stale", "stale_m1_timing", counts=counts)
+            return result("stale", "stale_m1_timing", counts=counts)
         for key in ("M15", "M5"):
             end = bars[key][-1]["time"] + timedelta(seconds=TIMEFRAME_SECONDS[key])
             if end > trigger_close:
-                return _result("invalid", "lookahead_" + key, counts=counts)
+                return result("invalid", "lookahead_" + key, counts=counts)
             if trigger_close - end >= timedelta(seconds=TIMEFRAME_SECONDS[key]):
-                return _result("stale", "stale_" + key, counts=counts)
+                return result("stale", "stale_" + key, counts=counts)
         # Every supplied bar ends by the snapshot capture, never a later receipt.
         captured = _utc(feed["as_of"])
         if any(values[-1]["time"] + timedelta(seconds=TIMEFRAME_SECONDS[key]) > captured for key, values in bars.items()):
-            return _result("invalid", "snapshot_precedes_bar_close", counts=counts)
+            return result("invalid", "snapshot_precedes_bar_close", counts=counts)
         try:
-            risk = _risk(feed.get("risk_context"), clock, research_only=research_only)
+            risk = _risk(feed.get("risk_context"), clock, research_only=research_only or experimental_demo)
         except _Invalid as error:
-            return _result("blocked", error.reason, counts=counts)
+            return result("blocked", error.reason, counts=counts)
         if risk["open_positions"] or risk["pending_orders"]:
-            return _result("blocked", "existing_exposure", counts=counts)
+            return result("blocked", "existing_exposure", counts=counts)
         if risk["free_margin"] < Decimal("2") * risk["margin_required"]:
-            return _result("blocked", "insufficient_free_margin", counts=counts)
+            return result("blocked", "insufficient_free_margin", counts=counts)
         session_start = clock.replace(hour=6, minute=0, second=0, microsecond=0)
         session_end = clock.replace(hour=19, minute=0, second=0, microsecond=0)
-        if clock.weekday() >= 5 or clock < session_start or clock + timedelta(seconds=HORIZON_SECONDS + 10) > session_end:
-            return _result("blocked", "outside_full_horizon_session", counts=counts)
+        if clock.weekday() >= 5 or clock < session_start or clock + timedelta(seconds=HORIZON_SECONDS + (30 if experimental_demo else 10)) > session_end:
+            return result("blocked", "outside_full_horizon_session", counts=counts)
         indicators = {key: _indicators(values) for key, values in bars.items()}
         if any(not math.isfinite(item["atr"]) or item["atr"] <= 0 for item in indicators.values()):
-            return _result("no_signal", "flat_atr", counts=counts)
+            return result("no_signal", "flat_atr", counts=counts)
         if any(item["latest_true_range"] > 3 * item["atr"] for item in indicators.values()):
-            return _result("blocked", "extreme_true_range", counts=counts)
+            return result("blocked", "extreme_true_range", counts=counts)
         trend = indicators["M15"]
         separation = trend["fast"] - trend["slow"]
         slope = trend["fast"] - trend["previous_fast"]
         if abs(separation) < 0.05 * trend["atr"] or separation == 0 or slope == 0:
-            return _result("no_signal", "flat_m15_trend", counts=counts)
+            return result("no_signal", "flat_m15_trend", counts=counts)
         buy = separation > 0 and slope > 0 and bars["M15"][-1]["close"] > trend["fast"]
         sell = separation < 0 and slope < 0 and bars["M15"][-1]["close"] < trend["fast"]
         if not (buy or sell):
-            return _result("no_signal", "conflicting_m15_trend", counts=counts)
+            return result("no_signal", "conflicting_m15_trend", counts=counts)
         direction = "BUY" if buy else "SELL"
         sign = 1 if buy else -1
         confirmation = indicators["M5"]
@@ -303,9 +380,20 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False):
             previous5["low"] <= confirmation["previous_fast"] and previous5["close"] >= confirmation["previous_slow"]
             if buy else previous5["high"] >= confirmation["previous_fast"] and previous5["close"] <= confirmation["previous_slow"]
         )
+        if experimental_demo:
+            closes5 = [bar["close"] for bar in bars["M5"]]
+            fast5, slow5 = paper_signals._ema(closes5, 9), paper_signals._ema(closes5, 21)
+            pulled_back = any(
+                fast5[index] is not None and slow5[index] is not None and (
+                    bar["low"] <= fast5[index] and bar["close"] >= slow5[index]
+                    if buy else bar["high"] >= fast5[index] and bar["close"] <= slow5[index]
+                )
+                for index in range(max(0, len(bars["M5"]) - 4), len(bars["M5"]) - 1)
+                for bar in (bars["M5"][index],)
+            )
         recovered = sign * (current5["close"] - confirmation["fast"]) > 0 and sign * (current5["close"] - previous5["close"]) > 0 and sign * (current5["close"] - current5["open"]) > 0
         if not aligned5 or not pulled_back or not recovered:
-            return _result("no_signal", "m5_pullback_not_confirmed", counts=counts)
+            return result("no_signal", "m5_pullback_not_confirmed", counts=counts)
         timing = indicators["M1"]
         previous1, current1 = bars["M1"][-2:]
         if (
@@ -313,20 +401,20 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False):
             or sign * (current1["close"] - current1["open"]) <= 0
             or (current1["close"] <= previous1["high"] if buy else current1["close"] >= previous1["low"])
         ):
-            return _result("no_signal", "m1_breakout_not_confirmed", counts=counts)
+            return result("no_signal", "m1_breakout_not_confirmed", counts=counts)
         volume_reference = median(bar["tick_volume"] for bar in bars["M1"][-21:-1])
         if volume_reference <= 0 or current1["tick_volume"] < 0.5 * volume_reference:
-            return _result("blocked", "low_tick_activity", counts=counts)
+            return result("blocked", "low_tick_activity", counts=counts)
         entry = _grid(ask if buy else bid, tick, up=buy)
         swing = min(bar["low"] for bar in bars["M5"][-5:]) if buy else max(bar["high"] for bar in bars["M5"][-5:])
         buffer = Decimal(str(confirmation["atr"])) * Decimal("0.2")
         stop = _grid(Decimal(str(swing)) - sign * buffer, tick, up=not buy)
         risk_distance = sign * (entry - stop)
         if risk_distance <= 0 or stop <= 0:
-            return _result("no_signal", "invalid_swing_protection", counts=counts)
+            return result("no_signal", "invalid_swing_protection", counts=counts)
         spread = ask - bid
         if spread <= 0 or spread > min(risk_distance * Decimal("0.1"), Decimal(str(timing["atr"])) * Decimal("0.15")):
-            return _result("blocked", "excessive_or_unknown_spread", counts=counts)
+            return result("blocked", "excessive_or_unknown_spread", counts=counts)
         target = _grid(entry + sign * Decimal("2") * risk_distance, tick, up=buy)
         target2 = _grid(entry + sign * Decimal("3") * risk_distance, tick, up=buy)
         distance = point * stops
@@ -334,25 +422,25 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False):
             not (stop < bid <= ask < target if buy else target < bid <= ask < stop)
             or (bid - stop < distance or target - bid < distance if buy else stop - ask < distance or ask - target < distance)
         ):
-            return _result("blocked", "broker_protection_distance", counts=counts)
+            return result("blocked", "broker_protection_distance", counts=counts)
         # Spread is represented by executable-side entry and checked above.
         # Do not subtract it again from bid/ask fills in the offline verifier.
         cost_cash = risk["commission_round_turn"] + Decimal("2") * risk["slippage_price"] * risk["loss_cash_per_price_unit"]
         stop_cash = risk_distance * risk["loss_cash_per_price_unit"] + cost_cash
         reward_cash = abs(target - entry) * risk["profit_cash_per_price_unit"] - cost_cash
         if stop_cash > risk["equity"] * Decimal("0.01"):
-            return _result("blocked", "equity_risk_limit", counts=counts)
+            return result("blocked", "equity_risk_limit", counts=counts)
         effective_rr = reward_cash / stop_cash
         if reward_cash <= 0 or effective_rr < Decimal("1.5"):
-            return _result("blocked", "insufficient_reward_after_costs", counts=counts)
+            return result("blocked", "insufficient_reward_after_costs", counts=counts)
         low = _grid(entry - risk_distance * Decimal("0.1"), tick, up=True)
         high = _grid(entry + risk_distance * Decimal("0.1"), tick, up=False)
         if low >= high or not min(stop, target) < low <= entry <= high < max(stop, target):
-            return _result("no_signal", "collapsed_entry_zone", counts=counts)
+            return result("no_signal", "collapsed_entry_zone", counts=counts)
         prices = {"entry": _price_number(entry), "stop": _price_number(stop), "target": _price_number(target),
                   "target2": _price_number(target2), "entry_zone_low": _price_number(low),
                   "entry_zone_high": _price_number(high), "original_stop_distance": _price_number(risk_distance)}
-        return _result(
+        return result(
             "signal", "closed_three_timeframe_alignment", counts=counts,
             symbol=symbol, direction=direction, display_timeframe="M1", **prices,
             contiguous_counts=contiguous_counts,
@@ -369,10 +457,11 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False):
             estimated_risk_fraction=round(float(stop_cash / risk["equity"]), 8), spread_price=float(spread),
             cost_context={key: float(risk[key]) for key in ("commission_round_turn", "slippage_price", "loss_cash_per_price_unit", "profit_cash_per_price_unit")},
             indicators={key: {name: round(number, 8) for name, number in values.items()} for key, values in indicators.items()},
-            explanation="Closed M15 direction, M5 pullback/recovery and M1 directional breakout agree. Candidate awaits empirical qualification and human review.",
+            explanation=("Experimental Demo candidate with estimated costs; no empirical success claim. Human execution only."
+                         if experimental_demo else "Closed M15 direction, M5 pullback/recovery and M1 directional breakout agree. Candidate awaits empirical qualification and human review."),
             invalidation="Reject if closed direction/confirmation reverses, quote/spread/risk guards fail or the proposal expires. Keep published SL/TP fixed.",
         )
     except _Invalid as error:
-        return _result("invalid", error.reason, counts=counts)
+        return result("invalid", error.reason, counts=counts)
     except (KeyError, TypeError, ValueError, OverflowError, AttributeError, DecimalException):
-        return _result("invalid", "invalid_market_or_risk_data", counts=counts)
+        return result("invalid", "invalid_market_or_risk_data", counts=counts)

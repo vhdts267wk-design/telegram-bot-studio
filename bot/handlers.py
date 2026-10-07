@@ -19,7 +19,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot import commands, db, market_monitor
+from bot import commands, db, market_monitor, mtf_runtime
 from bot.logging_utils import configure_logging
 
 
@@ -139,6 +139,21 @@ MTF_ANALYSIS_GUIDANCE = (
     "تقييم النجاح: TP1 قبل SL خلال 60 دقيقة من الدخول الفعلي وبعد التكاليف؛ لا ضمان للصفقة المقبلة."
 )
 
+EXPERIMENTAL_MTF_ANALYSIS_GUIDANCE = (
+    "وضع إشارات Demo التجريبية مفعّل — الأداء غير مثبت؛ التكاليف افتراضات تقديرية غير موثّقة.\n"
+    "بقرأ شموع XAUUSD المكتملة: M15 للاتجاه، M5 لتأكيد الارتداد، وM1 لتوقيت الدخول. "
+    "EMA9/21 وATR14 يحتاجان 22 شمعة متصلة بعد آخر فجوة في كل إطار؛ لا نستخدم الشمعة الجارية.\n"
+    "الارتداد على M5 ممكن خلال آخر 3 شموع قبل شمعة التأكيد؛ يبقى إغلاق التأكيد وكسر M1 مطلوبين. "
+    "الإشارة تحتاج أسعاراً حديثة واجتياز فلاتر السبريد والنشاط والمخاطر، وDemo فقط بحجم 0.01. "
+    "المخاطرة المقدّرة بعد التكاليف حتى 1% من حقوق الحساب (Equity)، ولا صفقات أو أوامر معلّقة.\n"
+    "تُذكر قيم العمولة والانزلاق المقدّرة مع كل إشارة؛ هذه الافتراضات لا تثبت تكاليف الوسيط أو نسبة نجاح. "
+    "الوضع المؤهل بأدلة خارج العينة يبقى منفصلاً؛ لا نعتبر هذه الإشارة مؤهلة إحصائياً.\n"
+    "المتابعة تفحص الفرص كل 5 ثوانٍ والحالة كل دقيقة دون تكرار الحالة نفسها. "
+    "صلاحية الاقتراح والتجهيز 30 ثانية من إغلاق M1؛ يعاد فحص السعر والسبريد والمخاطر قبل التجهيز. "
+    "إذا انتهت المهلة ألغِ النافذة وانتظر إشارة جديدة. "
+    "معيار تقييم التجربة: TP1 قبل SL خلال 60 دقيقة من الدخول الفعلي وبعد التكاليف؛ لا ضمان للصفقة المقبلة."
+)
+
 DYNAMIC_CALLBACK_PREFIX = "command:"
 
 
@@ -187,9 +202,22 @@ def _uses_mt5(context) -> bool:
     return os.environ.get("MARKET_SOURCE", "reference").strip().lower() == "mt5"
 
 
+def _uses_experimental_mt5(context) -> bool:
+    return _uses_mt5(context) and mtf_runtime.signal_mode() == "experimental_demo"
+
+
+def _help_text(context) -> str:
+    if _uses_experimental_mt5(context):
+        return HELP_TEXT.replace(
+            "/signals - الاقتراح المؤهل بأدلة خارج العينة أو سبب الانتظار",
+            "/signals - إشارة Demo تجريبية بأداء غير مثبت وتكاليف تقديرية، أو سبب الانتظار",
+        )
+    return HELP_TEXT
+
+
 def _analysis_guidance(context) -> str:
     if _uses_mt5(context):
-        return MTF_ANALYSIS_GUIDANCE
+        return EXPERIMENTAL_MTF_ANALYSIS_GUIDANCE if _uses_experimental_mt5(context) else MTF_ANALYSIS_GUIDANCE
     return (
         "المصدر المرجعي يوفّر أسعار الذهب وملاحظات ورقية، وليس سعر تنفيذ من وسيطك. "
         "استخدم /market للتقرير و/signals للحالة الورقية. شرح الصورة التعليمي منفصل عن اقتراحات MT5 المؤهلة."
@@ -227,8 +255,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(
         f"{greeting}, {name}!\n\n"
         + _analysis_guidance(context) + "\n\n"
-        "اضغط «تحليل الشارت» للتحليل الحالي، أو «اقتراح صفقة» للحالة والاقتراح المؤهل. "
-        "«متابعة الشارت» بتفعّل المتابعة؛ الأخبار بطلب /news فقط.\n\n"
+        + ("اضغط «تحليل الشارت» للتحليل الحالي، أو «اقتراح صفقة» للحالة وإشارة Demo التجريبية. " if _uses_experimental_mt5(context) else "اضغط «تحليل الشارت» للتحليل الحالي، أو «اقتراح صفقة» للحالة والاقتراح المؤهل. ")
+        + "«متابعة الشارت» بتفعّل المتابعة؛ الأخبار بطلب /news فقط.\n\n"
         + _mt5_workflow_guidance(context)
         + " ما في صفقة مضمونة، وما بنفرض صفقة إذا الشروط مش متحققة.",
         reply_markup=_main_menu_keyboard(),
@@ -244,12 +272,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await message.reply_text(
-        HELP_TEXT
+        _help_text(context)
         + _dynamic_commands_text()
         + "\n\n"
         + _analysis_guidance(context) + "\n\n"
         + _mt5_workflow_guidance(context) + "\n\n"
-        + ("صور MT5 تُحوّل إلى /market ببياناته المباشرة وشروطه؛ الصورة لا تثبت فرصة مؤهلة." if _uses_mt5(context) else GOLD_PHOTO_GUIDANCE),
+        + ("صور MT5 تُحوّل إلى /market ببياناته المباشرة وشروطه؛ الصورة لا تثبت شروط الإشارة التجريبية." if _uses_experimental_mt5(context) else "صور MT5 تُحوّل إلى /market ببياناته المباشرة وشروطه؛ الصورة لا تثبت فرصة مؤهلة." if _uses_mt5(context) else GOLD_PHOTO_GUIDANCE),
         reply_markup=_dynamic_commands_keyboard(),
     )
 
@@ -596,7 +624,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def set_bot_commands(application: Application) -> None:
     """Publish the built-in commands plus any panel-managed ones to Telegram."""
-    menu = list(BOT_COMMANDS) + list(commands.menu_commands())
+    builtins = list(BOT_COMMANDS)
+    if _uses_experimental_mt5(application):
+        builtins = [(name, "إشارة Demo تجريبية بأداء غير مثبت أو سبب الانتظار" if name == "signals" else description)
+                    for name, description in builtins]
+    menu = builtins + list(commands.menu_commands())
     await application.bot.set_my_commands(menu)
 
 

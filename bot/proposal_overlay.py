@@ -147,14 +147,20 @@ def build_chart_overlay(offer, device, feed, now):
         trigger = next((bar for bar in feed["timeframes"]["M1"] if _utc(bar["time"]) == bar_time), None)
         if trigger is None:
             return None
-        expiry = min(expiry, bar_time + timedelta(seconds=70))
-        return {
+        expiry = min(expiry, bar_time + timedelta(seconds=60 + mtf_runtime.entry_window_seconds(payload)))
+        dto = {
             "version": 2, "workflow": "chart_overlay", "offer_id": str(UUID(str(offer["id"]))),
             "status": status, "symbol": symbol, "timeframe": "M1", "direction": payload["direction"],
             "entry": payload["entry"], **zone, "stop": payload["stop"], "target": payload["target"],
             "price_digits": payload["price_digits"], "execution": dict(payload["execution"]),
             "bar_time": bar_time.isoformat(), "expires_at": expiry.isoformat(),
-            **{key: payload[key] for key in ("strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint", "qualification_id", "direction_bar_time", "confirmation_bar_time")},
+            **{key: payload[key] for key in ("strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint", "direction_bar_time", "confirmation_bar_time")},
         }
+        if mtf_runtime.is_experimental_result(payload):
+            dto.update(signal_mode="experimental_demo", provisional=True, entry_window_seconds=30,
+                       cost_assumptions=dict(payload["cost_assumptions"]))
+        else:
+            dto["qualification_id"] = payload["qualification_id"]
+        return dto
     except (KeyError, TypeError, ValueError, OverflowError, AttributeError, DecimalException):
         return None
