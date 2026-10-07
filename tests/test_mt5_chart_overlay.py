@@ -35,10 +35,43 @@ def proposal():
     }
 
 
+def experimental_proposal():
+    value = proposal()
+    value.pop("qualification_id")
+    value.update(strategy_id="mtf-ema-pullback-60m-demo-v2", strategy_version=2,
+                 policy_id="mtf-manual-demo-estimated-cost-risk-v2", signal_mode="experimental_demo",
+                 provisional=True, entry_window_seconds=30, expires_at=(NOW + timedelta(seconds=30)).isoformat(),
+                 cost_assumptions={"verified": False, "method": "spread_tick_floor_v1", "commission_round_turn": 0.2,
+                                   "slippage_price": 0.1, "spread_price": 0.2, "tick_size": 0.01})
+    return value
+
+
 class ValidationTests(unittest.TestCase):
     def validate(self, value=None, *, execution=None, quote=None, now=NOW):
         return chart.validate_proposal(value if value is not None else proposal(), symbol="XAUUSD",
                                        execution=execution or EXECUTION, quote=quote or QUOTE, observed_at=now)
+
+    def test_experimental_profile_requires_distinct_ids_explicit_estimates_and_window(self):
+        value = experimental_proposal()
+        later = NOW + timedelta(seconds=20)
+        self.assertTrue(self.validate(value, quote=dict(QUOTE, time=later.isoformat()), now=later).experimental)
+        self.assertFalse(self.validate().experimental)
+        for field, changed in (("strategy_id", "mtf-ema-pullback-60m-v1"), ("provisional", False),
+                               ("strategy_version", 1), ("entry_window_seconds", 10),
+                               ("qualification_id", "b" * 64), ("cost_assumptions", None),
+                               ("expires_at", (NOW + timedelta(seconds=31)).isoformat())):
+            invalid = experimental_proposal()
+            invalid[field] = changed
+            with self.subTest(field=field), self.assertRaises(chart.OverlayError):
+                self.validate(invalid)
+        for field, changed in (("verified", True), ("method", "verified"), ("slippage_price", 0), ("tick_size", 0.02)):
+            invalid = experimental_proposal()
+            invalid["cost_assumptions"][field] = changed
+            with self.subTest(field=field), self.assertRaises(chart.OverlayError):
+                self.validate(invalid)
+        late = NOW + timedelta(seconds=31)
+        with self.assertRaises(chart.OverlayError):
+            self.validate(value, quote=dict(QUOTE, time=late.isoformat()), now=late)
 
     def test_buy_sell_and_all_active_states_preserve_reference_levels(self):
         for status in chart.STATES:
@@ -171,6 +204,18 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn(proposal()["offer_id"], raw.decode("ascii"))
         self.assertNotIn(str(self.account.login), raw.decode("ascii"))
         self.assertNotIn(self.account.server.encode("utf-8"), raw)
+
+    def test_experimental_row_keeps_eighteen_fields_and_is_explicitly_marked(self):
+        value = experimental_proposal()
+        fields = self.publish(value).decode("ascii").split(";")
+        self.assertEqual(len(fields), 18)
+        self.assertEqual(fields[:5], ["2", "experimental", "XAUUSD", "M1", "BUY"])
+        self.assertEqual(fields[5:10], ["2500.00", "2499.00", "2501.00", "2490.00", "2520.00"])
+        late = NOW + timedelta(seconds=25)
+        fields = self.publish(value, quote=dict(QUOTE, time=late.isoformat()), now=late).decode("ascii").split(";")
+        self.assertEqual(int(fields[12]), int(NOW.timestamp()) + 30)
+        self.exporter.clear(late)
+        self.assertEqual(self.exporter.path.read_text(encoding="ascii").split(";")[1], "waiting")
 
     def test_nonce_hash_uses_exact_utf8_account_binding_without_final_newline(self):
         fields = self.publish().decode("ascii").split(";")

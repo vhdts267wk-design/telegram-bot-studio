@@ -28,6 +28,14 @@ class IndicatorContractTests(unittest.TestCase):
         self.assertIn("EventSetTimer(1)", self.source)
         self.assertIn("EventKillTimer()", self.source)
 
+    def test_experimental_state_is_distinct_and_labels_never_claim_certified_performance(self):
+        self.assertIn('fields[1]!="experimental"', self.source)
+        self.assertIn('p.experimental=(fields[1]=="experimental")', self.source)
+        self.assertIn('Demo experimental | ', self.source)
+        self.assertIn('Estimated costs | No certified win rate | ', self.source)
+        self.assertIn('p.experimental && (observed>bar+90 || valid_until>bar+90)', self.source)
+        self.assertIn('ObjectSetString(0,name,OBJPROP_TEXT,text)', self.source)
+
     def test_every_delete_is_limited_to_owned_objects(self):
         self.assertEqual(self.source.count("ObjectsDeleteAll("), 1)
         self.assertIn("ObjectsDeleteAll(0,g_prefix,0,-1)", self.source)

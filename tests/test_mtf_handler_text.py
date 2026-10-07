@@ -89,6 +89,71 @@ class MtfHandlerTextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("شرح الصورة التعليمي منفصل", text)
 
 
+class ExperimentalMtfHandlerTextTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        MtfHandlerTextTests.setUp(self)
+        handlers.os.environ["MT5_SIGNAL_MODE"] = "experimental_demo"
+
+    async def test_start_help_about_explain_actual_experimental_profile_and_manual_workflow(self):
+        for command in (handlers.start, handlers.help_command, handlers.about):
+            for manual in (True, False):
+                with self.subTest(command=command.__name__, manual=manual):
+                    self.service.manual_tickets_enabled = manual
+                    self.message.reply_text.reset_mock()
+                    await command(self.update, self.context)
+                    text = self.message.reply_text.await_args.args[0]
+                    for phrase in ("Demo", "الأداء غير مثبت", "التكاليف افتراضات تقديرية غير موثّقة",
+                                   "M15", "M5", "M1", "3 شموع قبل شمعة التأكيد", "30 ثانية",
+                                   "60 دقيقة", "كل 5 ثوانٍ", "كل دقيقة", "1% من حقوق الحساب (Equity)"):
+                        self.assertIn(phrase, text)
+                    for phrase in ("200", "70%", "Wilson", "10 ثوانٍ من إغلاق M1", "غياب الأدلة"):
+                        self.assertNotIn(phrase, text)
+                    if manual:
+                        self.assertIn("جهّز على اللابتوب", text)
+                        self.assertIn("Buy أو Sell بنفسك", text)
+                    else:
+                        self.assertIn("تجهيز نافذة MT5 غير مفعّل", text)
+                        self.assertIn("لا ترسل أوامر تداول تلقائية", text)
+                    self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+                    if command is handlers.help_command:
+                        self.assertIn("/signals - إشارة Demo تجريبية بأداء غير مثبت وتكاليف تقديرية", text)
+
+    async def test_telegram_command_description_matches_experimental_or_qualified_mode(self):
+        bot = SimpleNamespace(set_my_commands=AsyncMock())
+        application = SimpleNamespace(bot_data=self.context.bot_data, bot=bot)
+        await handlers.set_bot_commands(application)
+        menu = dict(bot.set_my_commands.await_args.args[0])
+        self.assertIn("Demo تجريبية", menu["signals"])
+        self.assertIn("أداء غير مثبت", menu["signals"])
+        self.assertNotIn("مؤهل", menu["signals"])
+        handlers.os.environ["MT5_SIGNAL_MODE"] = "qualified"
+        await handlers.set_bot_commands(application)
+        menu = dict(bot.set_my_commands.await_args.args[0])
+        self.assertEqual(menu["signals"], dict(handlers.BOT_COMMANDS)["signals"])
+
+    async def test_watch_welcome_keeps_subscription_behavior_and_describes30second_demo_mode(self):
+        self.service.pool, self.service.bot_id = object(), 991
+        with patch.object(market_monitor.market_store, "enable_subscription", new_callable=AsyncMock) as enable:
+            await market_monitor.watch_command(self.update, self.context)
+        enable.assert_awaited_once()
+        self.assertEqual(enable.await_args.kwargs, {"interval": market_monitor.market_store.MTF_DELIVERY_INTERVAL})
+        text = self.message.reply_text.await_args.args[0]
+        for phrase in ("Demo التجريبية", "الأداء غير مثبت", "غير موثّقة", "3 شموع قبل شمعة التأكيد",
+                       "30 ثانية", "0.01", "1% من حقوق الحساب (Equity)", "Buy أو Sell بنفسك"):
+            self.assertIn(phrase, text)
+        self.assertNotIn("200", text)
+        self.assertNotIn("70%", text)
+        self.assertNotIn("اقتراح المؤهل", text)
+
+    async def test_reference_service_ignores_mt5_experimental_setting(self):
+        self.service.source = "reference"
+        self.service.manual_tickets_enabled = False
+        await handlers.about(self.update, self.context)
+        text = self.message.reply_text.await_args.args[0]
+        self.assertIn("المصدر المرجعي", text)
+        self.assertNotIn("إشارات Demo التجريبية", text)
+
+
 class MtfMediaAdmissionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.enterContext(patch.dict(handlers.os.environ, {

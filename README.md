@@ -111,8 +111,8 @@ zone is entry ±0.1R, rounded inward. Published entry, SL and TP remain fixed;
 the live spread-plus-price-drift guard still applies and a displayed entry is
 not a guaranteed fill.
 
-**No BUY/SELL alert, chart proposal or native preparation is available until
-the empirical gate passes.** A server-local artifact, pinned separately by its
+The default `MT5_SIGNAL_MODE=qualified` publishes no BUY/SELL alert, chart proposal
+or native preparation until the empirical gate passes. A server-local artifact, pinned separately by its
 SHA256, must match the exact strategy/policy/implementation, broker and verified
 cost model. It must contain at least **200 independent, nonoverlapping
 out-of-sample trades** per required cost scenario and a **lower endpoint of the
@@ -124,6 +124,28 @@ qualification. Nonoverlap alone does not establish independence. A historical
 confidence bound is neither a probability for the next trade nor a guarantee.
 Feed-provided reports, AI confidence and provisional research cannot qualify.
 
+An explicit `MT5_SIGNAL_MODE=experimental_demo` opt-in enables a separate Demo
+research profile, `mtf-ema-pullback-60m-demo-v2`. Its messages and chart labels
+say that performance is unproven and costs are estimates; it carries no
+qualification ID or certified win-rate claim. The M5 pullback may occur in any
+of the three preceding completed candles, followed by the latest completed
+recovery candle. The M1 entry deadline is 30 seconds after close, with a fresh
+quote and full spread, price-drift, cash-risk, margin and exposure checks again
+on delivery and native preparation. Demo 0.01 lot and manual Buy/Sell remain
+mandatory. The historical qualified profile retains its ten-second deadline
+and original pullback rule.
+
+Experimental costs are explicit conservative modeling assumptions, not measured
+broker fees: round-trip commission for 0.01 lot is at least the loss cash per
+price unit times `max(current spread, 10 * tick size)` in account currency;
+per-side slippage is at least `max(current spread / 2, 2 * tick size)` in price
+units. Higher reported commission or slippage is retained. Each signal discloses
+the numerical estimates, and these same costs enter its risk and reward checks.
+Fresh preparation rechecks the greater of frozen estimates and current floors;
+no feed is marked cost-verified and no existing evidence artifact is reused.
+Collect a new untouched evaluation period after costs before judging this
+profile's performance. More signals do not establish better results.
+
 Success means TP1 is reached before SL with positive modeled net cash within
 **60 minutes from actual entry in the tick replay**, rather than from the signal
 candle or message. A timeout is a nonwin. Entry must be the next executable
@@ -132,18 +154,19 @@ purged across dataset splits. TP2 does not count as the success target. Candle
 OHLC can give provisional first-barrier bounds, but cannot resolve intrabar
 ordering or prove fills and therefore cannot produce a qualified artifact.
 
-The default has **unverified costs and no pinned evidence artifact**, so MT5
-proposals remain blocked. Unknown costs are not treated as zero. The live
+The default has **unverified costs and no pinned evidence artifact**, so qualified
+MT5 proposals remain blocked. Unknown costs are not treated as zero. The live
 filters require a quote at most ten seconds old and cache/snapshot/risk data at
 most 30 seconds old. Every actionable alert, chart proposal and native ticket
-preparation must remain within **ten seconds of the triggering M1 candle's
-close**. Technical observations may use that closed bar for up to 75 seconds,
+preparation must remain within the profile's deadline: **ten seconds for qualified,
+30 seconds for experimental Demo, from the triggering M1 candle's close**.
+Technical observations may use that closed bar for up to 75 seconds,
 but that observation window never extends trade validity. Quote clock skew is
 bounded to five seconds; forming bars have no grace.
 They also require Demo 0.01 lot, no open positions or pending orders, estimated
 loss including costs ≤1% equity, free margin ≥2 times required margin, effective
 reward/risk ≥1.5, and spread ≤min(0.1R, 0.15 M1 ATR). The weekday UTC 06–19
-window must accommodate the 60-minute horizon plus ten seconds of entry delay.
+window must accommodate the 60-minute horizon plus the profile's entry delay.
 Broker holidays/session closures still require the broker's actual availability
 checks. Tick activity must be at least half the preceding 20-bar median; it is
 a price-update proxy, not verified traded volume or market depth.

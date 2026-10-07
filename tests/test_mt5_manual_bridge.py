@@ -35,6 +35,18 @@ def qualified_draft():
     )
 
 
+def estimated_costs():
+    return {"verified": False, "method": "spread_tick_floor_v1", "commission_round_turn": 0.2,
+            "slippage_price": 0.1, "spread_price": 0.2, "tick_size": 0.01}
+
+
+def experimental_draft():
+    return replace(qualified_draft(), strategy_id="mtf-ema-pullback-60m-demo-v2", strategy_version=2,
+                   policy_id="mtf-manual-demo-estimated-cost-risk-v2", signal_mode="experimental_demo",
+                   provisional=True, entry_window_seconds=30, qualification_id="", cost_assumptions=estimated_costs(),
+                   expires_at=NOW + timedelta(seconds=30))
+
+
 class ManualBridgeTests(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.TradeBridgeTests(methodName="test_demo_buy_preflight_attached_stops_and_one_execution")
@@ -89,6 +101,99 @@ class ManualBridgeTests(unittest.TestCase):
 
     def draft(self, preparation=None):
         return manual.prepare_draft(self.mt5, self.settings, self.ledger, preparation or self.preparation, NOW)
+
+    def experimental_preparation(self):
+        preparation = deepcopy(self.preparation)
+        preparation["expires_at"] = trade.iso_date(NOW + timedelta(seconds=30))
+        payload = preparation["payload"]
+        payload.update(strategy_id="mtf-ema-pullback-60m-demo-v2", strategy_version=2,
+                       policy_id="mtf-manual-demo-estimated-cost-risk-v2", signal_mode="experimental_demo",
+                       provisional=True, entry_window_seconds=30, cost_assumptions=estimated_costs())
+        payload.pop("qualification_id")
+        payload["cost_context"].update(commission_round_turn=0.2, slippage_price=0.1)
+        return preparation
+
+    def test_explicit_experimental_demo_retains_protection_without_certified_costs_or_hash(self):
+        preparation = self.experimental_preparation()
+        settings = replace(self.settings, market=replace(self.settings.market, cost_model_verified=False,
+                           commission_round_turn_per_lot=None, slippage_price=None))
+        for seconds in (0, 11, 29):
+            now = NOW + timedelta(seconds=seconds)
+            self.fixture.tick.time = int(now.timestamp())
+            with self.subTest(seconds=seconds):
+                draft = manual.prepare_draft(self.mt5, settings, self.ledger, preparation, now)
+                self.assertEqual((draft.stop, draft.target, draft.volume), (Decimal("2490"), Decimal("2520"), Decimal("0.01")))
+                self.assertEqual((draft.signal_mode, draft.provisional, draft.entry_window_seconds, draft.qualification_id),
+                                 ("experimental_demo", True, 30, ""))
+                self.assertEqual(draft.cost_assumptions["verified"], False)
+                native.require_qualified(draft, now)
+        for seconds in (30, 31):
+            now = NOW + timedelta(seconds=seconds)
+            self.fixture.tick.time = int(now.timestamp())
+            with self.subTest(seconds=seconds), self.assertRaises(trade.GuardError):
+                manual.prepare_draft(self.mt5, settings, self.ledger, preparation, now)
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_partial_experimental_profiles_fake_certification_and_understated_costs_reject(self):
+        for key, changed in (("signal_mode", "qualified"), ("provisional", False), ("strategy_id", "mtf-ema-pullback-60m-v1"),
+                             ("strategy_version", 1), ("entry_window_seconds", 10), ("entry_window_seconds", True),
+                             ("qualification_id", "b" * 64), ("evidence_metrics", {}), ("account_mode", "real")):
+            preparation = self.experimental_preparation()
+            preparation["payload"][key] = changed
+            with self.subTest(key=key), self.assertRaises(trade.GuardError):
+                self.draft(preparation)
+        for key, changed in (("verified", True), ("method", "certified"), ("slippage_price", 0.01),
+                             ("commission_round_turn", 0.0), ("tick_size", 0.02), ("spread_price", None)):
+            preparation = self.experimental_preparation()
+            preparation["payload"]["cost_assumptions"][key] = changed
+            with self.subTest(key=key), self.assertRaises(trade.GuardError):
+                self.draft(preparation)
+        preparation = self.experimental_preparation()
+        preparation["payload"]["cost_context"]["loss_cash_per_price_unit"] = 0.5
+        with self.assertRaises(trade.GuardError):
+            self.draft(preparation)
+        self.mt5.order_send.assert_not_called()
+
+    def test_experimental_risk_uses_estimates_and_any_higher_current_costs(self):
+        preparation = self.experimental_preparation()
+        # Unverified reported costs may be absent but frozen estimates still
+        # participate in cash risk and reward. Never substitute zero costs.
+        settings = replace(self.settings, market=replace(self.settings.market, cost_model_verified=False,
+                           commission_round_turn_per_lot=None, slippage_price=None))
+        preparation["payload"]["cost_assumptions"]["commission_round_turn"] = 10.0
+        preparation["payload"]["cost_context"]["commission_round_turn"] = 10.0
+        with self.assertRaisesRegex(trade.GuardError, "cash risk"):
+            manual.prepare_draft(self.mt5, settings, self.ledger, preparation, NOW)
+        preparation = self.experimental_preparation()
+        settings = replace(self.settings, market=replace(self.settings.market, cost_model_verified=False,
+                           commission_round_turn_per_lot=1000.0))
+        with self.assertRaisesRegex(trade.GuardError, "cash risk"):
+            manual.prepare_draft(self.mt5, settings, self.ledger, preparation, NOW)
+        self.mt5.positions_get.return_value = (object(),)
+        with self.assertRaises(trade.GuardError):
+            self.draft(preparation)
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_server_experimental_mode_reports_market_wait_without_claiming_costs_are_verified(self):
+        self.fixture.terminal_info.data_path = str(self.fixture.base)
+        feed = deepcopy(self.feed)
+        feed["risk_context"]["costs_verified"] = False
+        adapter = Mock()
+        def post(settings, route, payload):
+            return {"paired": True} if route == "register" else {"preparation": None, "signal_mode": "experimental_demo"}
+        output = io.StringIO()
+        with patch.object(trade, "terminal_is_running", side_effect=[True, True, False]), patch.object(
+            manual.market, "build_payload", return_value=feed
+        ), redirect_stdout(output):
+            result = manual.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
+                                       sleep=Mock(), adapter_factory=lambda: adapter)
+        self.assertEqual(result, 0)
+        self.assertIn("MTF status: waiting_experimental_signal", output.getvalue())
+        self.assertNotIn("MTF status: unverified_costs", output.getvalue())
+        adapter.prepare.assert_not_called()
+        self.mt5.order_send.assert_not_called()
 
     def test_manual_draft_preserves_binding_identity_and_protection_with_algo_disabled(self):
         identity, binding = self.ledger.device_id, self.ledger.value("binding")
@@ -814,6 +919,29 @@ class NativeTicketTests(unittest.TestCase):
         self.backend = FakeNativeBackend()
         self.adapter = native.NativeTicketAdapter(self.backend, clock=lambda: NOW)
         self.draft = qualified_draft()
+
+    def test_experimental_native_draft_is_labelled_and_only_prepares_manual_fields(self):
+        draft = experimental_draft()
+        result = self.adapter.prepare(draft, recheck_account=Mock())
+        self.assertEqual(result, {"status": "prepared"})
+        self.assertEqual(set(self.backend.values), {10333, 10334, 10336})
+        self.assertTrue(self.backend.comment.startswith("Demo EXP BUY"))
+        self.assertLessEqual(len(self.backend.comment), 31)
+        self.assertEqual(draft.qualification_id, "")
+
+    def test_incomplete_experimental_native_draft_rejects_before_any_window_actions(self):
+        for changed in (replace(experimental_draft(), qualification_id="b" * 64),
+                        replace(experimental_draft(), provisional=False),
+                        replace(experimental_draft(), entry_window_seconds=10),
+                        replace(experimental_draft(), strategy_id="mtf-ema-pullback-60m-v1"),
+                        replace(experimental_draft(), cost_assumptions=None)):
+            check = Mock()
+            with self.subTest(draft=changed), self.assertRaises(native.TicketError):
+                self.adapter.prepare(changed, recheck_account=check)
+            self.assertEqual(self.backend.events, [])
+            check.assert_not_called()
+        with self.assertRaises(native.TicketError):
+            native.require_qualified(experimental_draft(), NOW + timedelta(seconds=31))
 
     def test_native_preparation_writes_only_three_fields_and_direction_expiry_comment(self):
         check = Mock(side_effect=lambda: self.backend.events.append(("guard",)))

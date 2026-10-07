@@ -18,6 +18,11 @@ import re
 import sys
 import time
 
+try:
+    from bridge import mt5_chart_overlay as chart
+except ModuleNotFoundError:
+    import mt5_chart_overlay as chart
+
 
 class TicketError(RuntimeError):
     def __init__(self, reason: str):
@@ -49,6 +54,10 @@ class Draft:
     direction_bar_time: datetime | None = None
     confirmation_bar_time: datetime | None = None
     bar_time: datetime | None = None
+    signal_mode: str = "qualified"
+    provisional: bool = False
+    entry_window_seconds: int = 10
+    cost_assumptions: dict | None = None
 
     def __post_init__(self):
         if (
@@ -67,7 +76,8 @@ class Draft:
 
     @property
     def comment(self):
-        return f"{self.direction} exp {self.expires_at.astimezone(timezone.utc):%d/%m %H:%M}Z"
+        prefix = "Demo EXP " if self.signal_mode == "experimental_demo" else ""
+        return f"{prefix}{self.direction} exp {self.expires_at.astimezone(timezone.utc):%d/%m %H:%M}Z"
 
 
 def require_unexpired(draft, now):
@@ -76,16 +86,25 @@ def require_unexpired(draft, now):
 
 
 def require_qualified(draft, now):
-    """Reject legacy or unqualified drafts before any native window action."""
+    """Require one complete Demo profile before any native window action."""
+    experimental = draft.signal_mode == "experimental_demo"
     if (
-        draft.display_timeframe != "M1" or draft.strategy_id != "mtf-ema-pullback-60m-v1"
-        or type(draft.strategy_version) is not int or draft.strategy_version != 1
-        or draft.policy_id != "mtf-manual-demo-cost-risk-v1"
+        draft.display_timeframe != "M1" or draft.strategy_id != ("mtf-ema-pullback-60m-demo-v2" if experimental else "mtf-ema-pullback-60m-v1")
+        or type(draft.strategy_version) is not int or draft.strategy_version != (2 if experimental else 1)
+        or draft.policy_id != ("mtf-manual-demo-estimated-cost-risk-v2" if experimental else "mtf-manual-demo-cost-risk-v1")
         or type(draft.horizon_seconds) is not int or draft.horizon_seconds != 3600
         or type(draft.strategy_fingerprint) is not str or re.fullmatch(r"[0-9a-f]{64}", draft.strategy_fingerprint) is None
-        or type(draft.qualification_id) is not str or re.fullmatch(r"[0-9a-f]{64}", draft.qualification_id) is None
+        or type(draft.entry_window_seconds) is not int or draft.entry_window_seconds != (30 if experimental else 10)
+        or (experimental and (draft.provisional is not True or draft.qualification_id != ""))
+        or (not experimental and (draft.signal_mode != "qualified" or draft.provisional is not False or draft.cost_assumptions is not None
+            or type(draft.qualification_id) is not str or re.fullmatch(r"[0-9a-f]{64}", draft.qualification_id) is None))
     ):
         raise TicketError("invalid_draft")
+    if experimental:
+        try:
+            chart.validate_cost_assumptions(draft.cost_assumptions)
+        except chart.OverlayError:
+            raise TicketError("invalid_draft") from None
     bars = (draft.direction_bar_time, draft.confirmation_bar_time, draft.bar_time)
     if any(not isinstance(bar, datetime) or bar.utcoffset() is None or bar.microsecond for bar in bars):
         raise TicketError("invalid_draft")
@@ -96,6 +115,7 @@ def require_qualified(draft, now):
         or direction != int((trigger + 60) // 900) * 900 - 900
         or confirmation != int((trigger + 60) // 300) * 300 - 300
         or draft.expires_at.timestamp() > trigger + 360
+        or (experimental and (now.timestamp() > trigger + 90 or draft.expires_at.timestamp() > trigger + 90))
     ):
         raise TicketError("invalid_draft")
 

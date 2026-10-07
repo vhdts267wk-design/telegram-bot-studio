@@ -241,6 +241,12 @@ def install_routes(app, application, settings):
         except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
             return JSONResponse({"detail": "Invalid device or market data"}, status_code=422)
 
+    def manual_poll_response(preparation=None):
+        response = {"preparation": preparation}
+        if mtf_runtime.signal_mode() == "experimental_demo":
+            response.update(signal_mode="experimental_demo", entry_window_seconds=30, provisional=True)
+        return response
+
     async def manual_poll(request: Request):
         service, payload, error = await read_request(request, "manual_ticket")
         if error is not None:
@@ -257,23 +263,30 @@ def install_routes(app, application, settings):
             await manual_ticket_store.expire_offers(service.pool, service.bot_id, now)
             current = await fresh_manual_device(service, device_id, include_feed=True)
             if current is None or await service.risk_pause(current[0]["owner_chat_id"]) is not None:
-                return {"preparation": None}
+                return manual_poll_response()
             owner = (current[0]["owner_chat_id"], current[0]["owner_user_id"])
             # Re-read after asynchronous risk/storage work. A heartbeat cannot
             # substitute for a fresh feed or refresh the frozen offer expiry.
             current = await fresh_manual_device(service, device_id, include_feed=True)
             if current is None or (current[0]["owner_chat_id"], current[0]["owner_user_id"]) != owner:
-                return {"preparation": None}
+                return manual_poll_response()
             _, now, feed = current
             qualified = mtf_runtime.evaluate_feed(feed, now)
             if not mtf_runtime.eligible_result(qualified, now):
-                return {"preparation": None}
+                return manual_poll_response()
             proposal_context = {key: qualified[key] for key in ("direction", "bar_time", "confirmation_bar_time", "direction_bar_time", "broker_fingerprint", "policy_id", "cost_context", "execution")}
-            offer = await manual_ticket_store.claim_offer(service.pool, service.bot_id, device_id, now, qualification_id=qualified["qualification_id"], strategy_fingerprint=qualified["strategy_fingerprint"], proposal_context=proposal_context)
+            claim_options = {"qualification_id": qualified.get("qualification_id"),
+                             "strategy_fingerprint": qualified["strategy_fingerprint"],
+                             "proposal_context": proposal_context}
+            if mtf_runtime.is_experimental_result(qualified):
+                claim_options["signal_mode"] = "experimental_demo"
+                proposal_context["cost_context"] = {key: qualified["cost_context"][key]
+                                                     for key in ("loss_cash_per_price_unit", "profit_cash_per_price_unit")}
+            offer = await manual_ticket_store.claim_offer(service.pool, service.bot_id, device_id, now, **claim_options)
         except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
             return JSONResponse({"detail": "Invalid device or market data"}, status_code=422)
         if offer is None:
-            return {"preparation": None}
+            return manual_poll_response()
         try:
             current = await fresh_manual_device(service, device_id, include_feed=True)
             if (
@@ -281,13 +294,21 @@ def install_routes(app, application, settings):
                 or (offer["chat_id"], offer["user_id"]) != owner
                 or not mtf_runtime.eligible_payload(offer["payload"], current[2], current[1])
             ):
-                return {"preparation": None}
+                return manual_poll_response()
         except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
-            return {"preparation": None}
-        return {"preparation": {
+            return manual_poll_response()
+        try:
+            expires_at = offer["expires_at"]
+            if mtf_runtime.is_experimental_result(offer["payload"]):
+                from bot.multi_timeframe import _utc
+                closed = _utc(offer["payload"]["bar_time"]) + timedelta(minutes=1)
+                expires_at = min(_utc(expires_at), closed + timedelta(seconds=30))
+        except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
+            return manual_poll_response()
+        return manual_poll_response({
             "id": str(offer["id"]), "claim_id": str(offer["claim_id"]), "workflow": "manual_ticket",
-            "payload": offer["payload"], "expires_at": offer["expires_at"].isoformat(),
-        }}
+            "payload": offer["payload"], "expires_at": expires_at.isoformat(),
+        })
 
     async def manual_result(request: Request):
         service, payload, error = await read_request(request, "manual_ticket")

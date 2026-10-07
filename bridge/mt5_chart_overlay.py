@@ -24,6 +24,12 @@ FIELDS = frozenset({
     "strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint",
     "qualification_id", "direction_bar_time", "confirmation_bar_time",
 })
+EXPERIMENTAL_FIELDS = (FIELDS - {"qualification_id"}) | {
+    "signal_mode", "provisional", "entry_window_seconds", "cost_assumptions",
+}
+COST_ASSUMPTION_FIELDS = frozenset({
+    "verified", "method", "commission_round_turn", "slippage_price", "spread_price", "tick_size",
+})
 
 
 class OverlayError(ValueError):
@@ -58,6 +64,23 @@ def safe_text(value, *, limit=128):
     return value
 
 
+def validate_cost_assumptions(value):
+    """Explicit Demo estimates are never treated as certified broker costs."""
+    if (type(value) is not dict or set(value) != COST_ASSUMPTION_FIELDS
+        or value["verified"] is not False or value["method"] != "spread_tick_floor_v1"):
+        raise OverlayError("Invalid experimental cost assumptions")
+    parsed = {}
+    for key in ("commission_round_turn", "slippage_price", "spread_price", "tick_size"):
+        amount = value[key]
+        if type(amount) not in (int, float) or not math.isfinite(amount) or not 0 <= amount <= 1_000_000_000_000:
+            raise OverlayError("Invalid experimental cost assumptions")
+        parsed[key] = Decimal(str(amount))
+    if (parsed["commission_round_turn"] <= 0 or parsed["spread_price"] <= 0 or parsed["tick_size"] <= 0
+        or parsed["slippage_price"] < max(parsed["spread_price"] / 2, 2 * parsed["tick_size"])):
+        raise OverlayError("Understated experimental cost assumptions")
+    return parsed
+
+
 def metadata(value):
     if type(value) is not dict or set(value) != {"tick_size", "point", "digits", "stops_level"}:
         raise OverlayError("Invalid chart precision")
@@ -82,6 +105,7 @@ class DisplayProposal:
     digits: int
     bar: datetime
     expires: datetime
+    experimental: bool = False
 
 
 def fresh_quote(value, now):
@@ -98,7 +122,11 @@ def validate_proposal(value, *, symbol, execution, quote, observed_at):
     """Validate the separate chart DTO without fabricating a claim or draft."""
     now = utc(observed_at)
     fresh_quote(quote, now)
-    if type(value) is not dict or set(value) != FIELDS:
+    if type(value) is not dict:
+        raise OverlayError("Invalid chart proposal")
+    experimental = value.get("signal_mode") == "experimental_demo"
+    expected = EXPERIMENTAL_FIELDS if experimental else FIELDS
+    if set(value) != expected and not (experimental and set(value) == expected | {"qualification_id"} and value["qualification_id"] == ""):
         raise OverlayError("Invalid chart proposal")
     if (
         type(value["version"]) is not int or value["version"] != 2
@@ -109,13 +137,16 @@ def validate_proposal(value, *, symbol, execution, quote, observed_at):
     ):
         raise OverlayError("Incompatible chart proposal")
     if (
-        value["strategy_id"] != "mtf-ema-pullback-60m-v1"
-        or type(value["strategy_version"]) is not int or value["strategy_version"] != 1
-        or value["policy_id"] != "mtf-manual-demo-cost-risk-v1"
+        value["strategy_id"] != ("mtf-ema-pullback-60m-demo-v2" if experimental else "mtf-ema-pullback-60m-v1")
+        or type(value["strategy_version"]) is not int or value["strategy_version"] != (2 if experimental else 1)
+        or value["policy_id"] != ("mtf-manual-demo-estimated-cost-risk-v2" if experimental else "mtf-manual-demo-cost-risk-v1")
         or type(value["horizon_seconds"]) is not int or value["horizon_seconds"] != 3600
-        or any(type(value[key]) is not str or re.fullmatch(r"[0-9a-f]{64}", value[key]) is None for key in ("strategy_fingerprint", "qualification_id"))
+        or type(value["strategy_fingerprint"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["strategy_fingerprint"]) is None
+        or (not experimental and (type(value["qualification_id"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["qualification_id"]) is None))
+        or (experimental and (value["provisional"] is not True or type(value["entry_window_seconds"]) is not int or value["entry_window_seconds"] != 30))
     ):
         raise OverlayError("Unqualified chart proposal")
+    assumptions = validate_cost_assumptions(value["cost_assumptions"]) if experimental else None
     try:
         if type(value["offer_id"]) is not str or str(UUID(value["offer_id"])) != value["offer_id"]:
             raise ValueError
@@ -124,6 +155,8 @@ def validate_proposal(value, *, symbol, execution, quote, observed_at):
     tick, _, digits, _ = metadata(value["execution"])
     if metadata(execution) != metadata(value["execution"]) or type(value["price_digits"]) is not int or value["price_digits"] != digits:
         raise OverlayError("Changed chart precision")
+    if experimental and assumptions["tick_size"] != tick:
+        raise OverlayError("Changed experimental cost precision")
     entry, low, high, stop, target = (positive(value[key]) for key in (
         "entry", "entry_zone_low", "entry_zone_high", "stop", "target",
     ))
@@ -149,7 +182,9 @@ def validate_proposal(value, *, symbol, execution, quote, observed_at):
         raise OverlayError("Invalid chart reference candle")
     if not now < expires <= min(now + timedelta(minutes=5), bar + timedelta(minutes=6)):
         raise OverlayError("Expired chart proposal")
-    return DisplayProposal(value["direction"], entry, low, high, stop, target, digits, bar, expires)
+    if experimental and (now > bar + timedelta(seconds=90) or expires > bar + timedelta(seconds=90)):
+        raise OverlayError("Experimental M1 entry window expired")
+    return DisplayProposal(value["direction"], entry, low, high, stop, target, digits, bar, expires, experimental)
 
 
 def terminal_key(data_path):
@@ -258,6 +293,6 @@ class ChartExporter:
         prices = [format(price, f".{proposal.digits}f") for price in (
             proposal.entry, proposal.zone_low, proposal.zone_high, proposal.stop, proposal.target,
         )]
-        self._write([2, "active", self.symbol, "M1", proposal.direction, *prices, proposal.digits,
+        self._write([2, "experimental" if proposal.experimental else "active", self.symbol, "M1", proposal.direction, *prices, proposal.digits,
                      int(now.timestamp()), int(deadline.timestamp()), int(proposal.bar.timestamp()),
                      self.offset, self.terminal_key, self.nonce, self.binding_hash])

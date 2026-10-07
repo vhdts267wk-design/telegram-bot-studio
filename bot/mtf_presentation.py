@@ -1,4 +1,4 @@
-"""Arabic chart observations and empirically qualified manual proposals."""
+"""Arabic chart observations and clearly labelled manual Demo proposals."""
 
 from datetime import datetime, timedelta, timezone
 import math
@@ -29,6 +29,7 @@ REASONS = {
     "insufficient_reward_after_costs": "العائد إلى المخاطرة بعد التكاليف أقل من 1.5:1.",
     "broker_protection_distance": "الوقف أو الهدف لا يطابق قيود الوسيط.",
     "risk_pause": "الإشارات موقوفة مؤقتاً بسبب فلتر المخاطر.",
+    "experimental_profile_invalid": "بيانات الإشارة التجريبية أو افتراضات تكاليفها غير صالحة للتحقق.",
 }
 HIGH_RISK = {"extreme_true_range", "low_tick_activity", "excessive_or_unknown_spread", "equity_risk_limit", "insufficient_reward_after_costs", "existing_exposure", "insufficient_free_margin"}
 
@@ -41,10 +42,32 @@ def _time(value):
     return value.astimezone(timezone.utc)
 
 
+def _experimental(result):
+    return type(result) is dict and result.get("signal_mode") == "experimental_demo"
+
+
+def _window_text(result):
+    return "30 ثانية" if _experimental(result) else "10 ثوانٍ"
+
+
+def _status_context(result, blocked):
+    if _experimental(result):
+        return {**blocked, "signal_mode": "experimental_demo", "entry_window_seconds": 30, "provisional": True}
+    return blocked
+
+
+def _blocked_proposal(result, now=None):
+    reason = "entry_window_expired" if not mtf_runtime.entry_window_open(result, now) else "experimental_profile_invalid" if _experimental(result) else "evidence_unavailable"
+    return _status_context(result, mtf_runtime.blocked(reason))
+
+
 def status_text(result):
     reason = result.get("reason", "") if type(result) is dict else ""
-    title = "فرصة عالية المخاطر" if reason in HIGH_RISK else "لا توجد فرصة مؤكدة الشروط حاليًا"
-    if reason in REASONS:
+    experimental = _experimental(result)
+    title = "فرصة عالية المخاطر" if reason in HIGH_RISK else "لا توجد إشارة Demo تجريبية مستوفية الشروط حاليًا" if experimental else "لا توجد فرصة مؤكدة الشروط حاليًا"
+    if reason == "entry_window_expired" and experimental:
+        detail = "انتهت نافذة الدخول: 30 ثانية فقط بعد إغلاق شمعة M1؛ انتظر إشارة جديدة."
+    elif reason in REASONS:
         detail = REASONS[reason]
     elif type(result) is dict and result.get("state") == "stale":
         detail = "بيانات MT5 غير حديثة؛ ننتظر تحديث السعر والشموع."
@@ -52,13 +75,16 @@ def status_text(result):
         detail = REASONS["insufficient_history"]
     else:
         detail = "بيانات السوق أو المخاطر غير مكتملة أو شروط الأطر الثلاثة غير متوافقة."
-    return title + "\nالسبب: " + detail
+    text = title + "\nالسبب: " + detail
+    if experimental:
+        text += "\nوضع Demo تجريبي — الأداء غير مثبت؛ التكاليف افتراضات تقديرية غير موثّقة."
+    return text
 
 
 def format_proposal(result, *, symbol="XAUUSD", execution_enabled=False, manual_ticket_enabled=False):
     if not mtf_runtime.eligible_result(result):
         if type(result) is dict and result.get("state") == "signal":
-            result = mtf_runtime.blocked("entry_window_expired") if not mtf_runtime.entry_window_open(result) else mtf_runtime.blocked()
+            result = _blocked_proposal(result)
         return status_text(result)
     try:
         digits = result["price_digits"]
@@ -71,26 +97,40 @@ def format_proposal(result, *, symbol="XAUUSD", execution_enabled=False, manual_
         if not (stop < low <= entry <= high < target <= target2 if direction == "BUY" else target2 <= target < low <= entry <= high < stop if direction == "SELL" else False):
             raise ValueError("Invalid ordered protection")
         text = "شراء BUY" if direction == "BUY" else "بيع SELL"
+        experimental = _experimental(result)
+        window = _window_text(result)
         lines = [
-            f"إشارة مؤهلة للاختبار التجريبي — {symbol} | {text}",
+            f"إشارة Demo تجريبية — الأداء غير مثبت — {symbol} | {text}" if experimental else f"إشارة مؤهلة للاختبار التجريبي — {symbol} | {text}",
             "M15 اتجاه عام → M5 تأكيد → M1 توقيت؛ شموع مكتملة.",
             f"الدخول المقترح: {entry:.{digits}f}",
             f"منطقة الدخول: {low:.{digits}f} – {high:.{digits}f}",
             f"SL: {stop:.{digits}f} | TP1: {target:.{digits}f} | TP2: {target2:.{digits}f}",
             f"العائد إلى المخاطرة: {result['nominal_reward_risk']:.2f}:1؛ بعد التكاليف المقدّرة {result['effective_reward_risk']:.2f}:1.",
-            "السبب: اتجاه M15 واضح، ارتداد M5 مؤكّد، وكسر M1 بإغلاق متوافق، مع اجتياز فلاتر المخاطر والسبريد والنشاط؛ نافذة الدخول 10 ثوانٍ من إغلاق M1.",
-            "الإلغاء: مرور 10 ثوانٍ بعد إغلاق M1، انعكاس الاتجاه أو التأكيد، تدهور السبريد أو حداثة البيانات أو المخاطر، أو تجاوز انحراف السعر والسبريد معاً 0.1R. يبقى الوقف والهدف ثابتين.",
+            f"السبب: اتجاه M15 واضح، ارتداد M5 مؤكّد{' خلال آخر 3 شموع قبل شمعة التأكيد' if experimental else ''}، وكسر M1 بإغلاق متوافق، مع اجتياز فلاتر المخاطر والسبريد والنشاط؛ نافذة الدخول {window} من إغلاق M1.",
+            f"الإلغاء: مرور {window} بعد إغلاق M1، انعكاس الاتجاه أو التأكيد، تدهور السبريد أو حداثة البيانات أو المخاطر، أو تجاوز انحراف السعر والسبريد معاً 0.1R. يبقى الوقف والهدف ثابتين.",
             "مدة تقييم النجاح: 60 دقيقة من الدخول؛ الهدف الأول قبل الوقف، مع احتساب التكاليف. انتهاء المدة دون الهدف يُحسب غير ناجح.",
         ]
-        for metric in result.get("evidence_metrics", []):
-            lines.append(f"اختبار خارج العينة ({metric['scenario']}): {metric['wins']}/{metric['trades']} نجاح؛ النسبة الملاحظة {metric['win_rate']:.1%}، الحد الأدنى لفاصل الثقة 95%: {metric['lower_95']:.1%}.")
+        if experimental:
+            assumptions = result["cost_assumptions"]
+            commission, slippage = (assumptions[key] for key in ("commission_round_turn", "slippage_price"))
+            if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in (commission, slippage)):
+                raise ValueError("Invalid cost assumptions")
+            lines.extend([
+                "Demo فقط | الحجم 0.01 | المخاطرة المقدّرة حتى 1% من حقوق الحساب (Equity).",
+                f"التكاليف افتراضات تقديرية غير موثّقة: عمولة ذهاب وإياب {commission:.8g} بعملة الحساب للحجم 0.01؛ انزلاق {slippage:.8g} بوحدات السعر لكل جهة.",
+                "تقدير الانزلاق يراعي السبريد وحجم أصغر حركة سعر؛ قد تختلف التكاليف الفعلية.",
+            ])
+        else:
+            for metric in result.get("evidence_metrics", []):
+                lines.append(f"اختبار خارج العينة ({metric['scenario']}): {metric['wins']}/{metric['trades']} نجاح؛ النسبة الملاحظة {metric['win_rate']:.1%}، الحد الأدنى لفاصل الثقة 95%: {metric['lower_95']:.1%}.")
         lines.extend([
-            "التنفيذ بموافقتك اليدوية لكل صفقة: وافق على التجهيز خلال 10 ثوانٍ من إغلاق M1؛ تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك. إن فاتت النافذة انتظر إشارة جديدة.",
-            "النتيجة تقدير تاريخي مشروط بنموذج التنفيذ والتكاليف؛ ليست احتمالاً مثبتاً لهذه الصفقة أو ضماناً للربح.",
+            f"التنفيذ بموافقتك اليدوية لكل صفقة: وافق على التجهيز خلال {window} من إغلاق M1؛ تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك. إن فاتت النافذة انتظر إشارة جديدة.",
+            "الأداء غير مثبت؛ اجتياز الشروط لا يثبت احتمال نجاح هذه الصفقة ولا يضمن الربح." if experimental else "النتيجة تقدير تاريخي مشروط بنموذج التنفيذ والتكاليف؛ ليست احتمالاً مثبتاً لهذه الصفقة أو ضماناً للربح.",
         ])
         return "\n".join(lines)
     except (KeyError, TypeError, ValueError, OverflowError):
-        return status_text(mtf_runtime.blocked("invalid_levels"))
+        blocked = mtf_runtime.blocked("experimental_profile_invalid" if _experimental(result) else "invalid_levels")
+        return status_text(_status_context(result, blocked))
 
 
 def format_analysis(feed, result, now, *, received_at=None, include_proposal=True):
@@ -98,12 +138,12 @@ def format_analysis(feed, result, now, *, received_at=None, include_proposal=Tru
     try:
         clock = _time(now)
         if type(feed) is not dict or feed.get("source") != "MetaTrader 5":
-            return "\n".join(lines + ["لا توجد فرصة مؤكدة الشروط حاليًا", "السبب: ربط MT5 لا يزوّد بيانات حديثة."])
+            return "\n".join(lines + [status_text(_status_context(result, {"state": "stale"}))])
         quote = feed["quote"]
         if any(type(quote.get(key)) not in (int, float) or not math.isfinite(quote[key]) or quote[key] <= 0 for key in ("bid", "ask")) or quote["ask"] <= quote["bid"]:
             raise ValueError("Invalid executable quote")
         if not -5 <= (clock - _time(quote["time"])).total_seconds() <= 10 or (received_at is not None and not 0 <= (clock - _time(received_at)).total_seconds() <= 30):
-            return "\n".join(lines + [status_text({"state": "stale"})])
+            return "\n".join(lines + [status_text(_status_context(result, {"state": "stale"}))])
         digits = feed.get("execution", {}).get("digits", 2)
         if type(digits) is not int or not 0 <= digits <= 8:
             raise ValueError("Invalid display precision")
@@ -154,8 +194,9 @@ def format_analysis(feed, result, now, *, received_at=None, include_proposal=Tru
         qualified = mtf_runtime.eligible_payload(proposal, feed, clock)
         displayed = result
         if not qualified and result.get("state") == "signal":
-            displayed = mtf_runtime.blocked("entry_window_expired") if not mtf_runtime.entry_window_open(result, clock) else mtf_runtime.blocked()
-        lines.append(format_proposal(displayed, symbol=feed.get("symbol", "XAUUSD")) if include_proposal else "توجد إشارة اجتازت بوابة الأدلة؛ تفاصيلها عبر /signals." if qualified else status_text(displayed))
+            displayed = _blocked_proposal(result, clock)
+        reference = "توجد إشارة Demo تجريبية — الأداء غير مثبت؛ التكاليف تقديرية، وتفاصيلها عبر /signals." if _experimental(result) else "توجد إشارة اجتازت بوابة الأدلة؛ تفاصيلها عبر /signals."
+        lines.append(format_proposal(displayed, symbol=feed.get("symbol", "XAUUSD")) if include_proposal else reference if qualified else status_text(displayed))
     except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
-        lines.append(status_text({"state": "invalid"}))
+        lines.append(status_text(_status_context(result, {"state": "invalid"})))
     return "\n".join(lines)
