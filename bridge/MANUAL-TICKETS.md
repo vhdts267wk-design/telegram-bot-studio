@@ -2,7 +2,7 @@
 
 `mt5_manual_bridge.py` prepares the installed desktop terminal's **New Order** window for a human review and final native Buy/Sell click. It does not send an order, accept an execution request, modify a position, or close a trade. A `prepared` result means that the visible ticket fields were verified; it is not a trade confirmation.
 
-Keep the intended Windows MT5 **Demo** terminal open, connected, and showing the exact broker gold symbol's **M1** chart. M15 determines direction, M5 confirms a pullback/recovery, and a completed M1 close determines timing. This workflow retains the **0.01 lot** limit and paired device/account identity. Algorithmic trading and external Python trading can remain disabled: the SDK is used only for prices, broker settings, and account checks.
+Keep the intended Windows MT5 **Demo** terminal open and connected. The display indicator can show opportunities on any **XAUUSD chart timeframe**. Keep a separate chart of the exact broker gold symbol on **M1** open for the helper to activate during native ticket preparation. M15 determines direction, M5 confirms a pullback/recovery, and a completed M1 close determines timing regardless of the display timeframe. This workflow retains the **0.01 lot** limit and paired device/account identity. Algorithmic trading and external Python trading can remain disabled: the SDK is used only for prices, broker settings, and account checks.
 
 ## Explicit Demo experimental profile
 
@@ -64,12 +64,15 @@ Press Ctrl+C to stop the foreground helper. It installs no background service or
 Compile `bridge/MT5BotLevels.mq5` in MetaEditor and copy the resulting
 `MT5BotLevels.ex5` into `MQL5/Indicators/MT5Bot` under this terminal's **File >
 Open Data Folder**. Refresh MT5's Navigator and attach **MT5BotLevels** to
-the intended **XAUUSD M1** chart. Use indicator **version 2.10**; old M15/CSV-v1
+the intended **XAUUSD** chart on any timeframe. Use indicator **version 2.11**; old M15/CSV-v1
 snapshots are rejected. It is a display-only custom indicator and needs
 no DLLs, WebRequest permissions or algorithmic-trading setting. Keep the
 paired manual helper running.
 
-CSV version 2 remains exactly 18 fields. Its state is `active` for a qualified proposal, `experimental` for an explicit experimental Demo proposal, or `waiting`. Version 2.10 displays **Demo experimental**, **Estimated costs**, and **No certified win rate** on experimental levels, and overwrites those labels when the mode changes. Older version 2.00 indicators reject the experimental state and show no experimental levels until updated.
+Keep a separate **XAUUSD M1** chart open for native ticket preparation. The
+helper activates and verifies that M1 chart when you request preparation.
+
+CSV version 2 remains exactly 18 fields and retains its M1 signal timeframe. Its state is `active` for a qualified proposal, `experimental` for an explicit experimental Demo proposal, or `waiting`. Version 2.11 displays **Demo experimental**, **Estimated costs**, and **No certified win rate** on experimental levels, and overwrites those labels when the mode changes. Older version 2.00 indicators reject the experimental state and show no experimental levels until updated.
 
 Each latest valid published proposal appears automatically, before a ticket
 preparation request: shaded Entry Zone, gold reference Entry, green TP and red
@@ -78,6 +81,15 @@ the original stop distance, rounded inward to the frozen broker tick grid.
 Telegram and the chart use the same calculation and original SL/TP; spread
 is not included in that reference zone. Native preparation retains its
 existing spread-plus-drift guard and never guarantees a fill at Entry.
+
+After successfully drawing a fresh valid opportunity, the indicator shows one
+native MT5 popup with direction, Entry Zone, SL, TP and UTC expiry. Experimental
+popups retain the estimated-cost and unproven-performance labels. A shared
+anonymous terminal/account marker suppresses repeats for the same M1 trigger
+and direction across chart instances, timeframe changes and indicator reloads
+within that terminal session. It resets when MT5 exits. Waiting, stale,
+blocked or invalid proposals produce no popup. The popup only displays the
+opportunity; requesting preparation and clicking Buy/Sell remain your decisions.
 
 The separate manual-key-authenticated `POST /api/mt5/manual/chart` accepts
 only the paired `device_id`. It neither claims nor changes a proposal, and
@@ -93,12 +105,13 @@ in the verified terminal common folder's
 25 seconds and no later than the proposal or **10-second quote** deadline. It contains a
 random nonce and salted account-binding hash, never the raw account login,
 server, Telegram chat/user, device ID or API key. The indicator checks its
-current Demo account, terminal, XAUUSD M1 chart, UTC expiry, price grid and
-completed broker chart bar before drawing. The broker UTC offset affects
+current Demo account, terminal, XAUUSD symbol, UTC expiry, price grid and
+completed broker M1 bar before drawing on the selected chart timeframe. Native
+ticket preparation still requires the active M1 chart. The broker UTC offset affects
 chart coordinates only; expiry uses `TimeGMT()`.
 
 Missing, malformed, stale or unavailable data clears only the indicator's
-own objects and displays a waiting message. Account changes require reloading
+own objects and displays a quiet waiting label without a popup. Account changes require reloading
 the indicator. User drawings, orders, positions and an already prepared
 native ticket are untouched. Stopping or crashing the helper cannot leave
 active levels displayed past the short local expiry. When no valid proposal

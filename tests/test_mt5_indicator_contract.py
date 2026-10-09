@@ -36,6 +36,55 @@ class IndicatorContractTests(unittest.TestCase):
         self.assertIn('p.experimental && (observed>bar+90 || valid_until>bar+90)', self.source)
         self.assertIn('ObjectSetString(0,name,OBJPROP_TEXT,text)', self.source)
 
+    def test_chart_view_timeframe_is_independent_of_closed_m1_signal_validation(self):
+        # A valid M1 opportunity must be visible while viewing XAUUSD M15/H1.
+        # Changing the chart view never changes the incoming signal timeframe.
+        self.assertNotRegex(self.source, r"\b_Period\b|\bPERIOD_CURRENT\b")
+        self.assertIn('if(_Symbol!="XAUUSD")', self.source)
+        self.assertIn('fields[3]!="M1"', self.source)
+        self.assertIn("iBarShift(_Symbol,PERIOD_M1,chart_bar,true)<1", self.source)
+        self.assertIn("bar+60>observed", self.source)
+
+    def test_notice_can_only_follow_fresh_validated_draw_and_is_informational(self):
+        update = self.source.split("void UpdateOverlay()", 1)[1].split("int OnInit()", 1)[0]
+        notice = self.source.split("void NotifyOpportunity(", 1)[1].split("bool ParseInteger(", 1)[0]
+        self.assertLess(update.index("ReadProposal(p,message)"), update.index("DrawProposal(p)"))
+        self.assertLess(update.index("DrawProposal(p)"), update.index("NotifyOpportunity(p)"))
+        self.assertLess(update.rindex("TimeGMT()>=p.valid_until"), update.index("NotifyOpportunity(p)"))
+        self.assertEqual(self.source.count("Alert("), 1)
+        self.assertEqual(notice.count("TimeGMT()>=p.valid_until"), 2)
+        for guard in ("ACCOUNT_LOGIN", "ACCOUNT_SERVER", "ACCOUNT_TRADE_MODE_DEMO", "TERMINAL_CONNECTED"):
+            self.assertEqual(notice.count(guard), 2)
+        for detail in ("Demo experimental | ", "Entry ", "Zone ", "SL ", "TP ", "Expires UTC ",
+                       "Estimated costs | No certified win rate", "final manual MT5 decision is yours"):
+            self.assertIn(detail, notice)
+        self.assertLess(notice.index("ClaimOpportunityNotice(p)"), notice.index("Alert(notice)"))
+        self.assertNotRegex(self.source, r"\b(?:SendNotification|SendMail|ChartApplyTemplate|ChartSetSymbolPeriod)\b")
+
+    def test_notice_dedup_is_shared_atomic_anonymous_and_survives_waiting_or_reload(self):
+        claim = self.source.split("bool ClaimOpportunityNotice(", 1)[1].split("void NotifyOpportunity(", 1)[0]
+        key = self.source.split("string OpportunityNoticeKey()", 1)[1].split("bool ClaimOpportunityNotice(", 1)[0]
+        self.assertIn("GlobalVariableTemp(g_notice_key)", claim)
+        self.assertIn("GlobalVariableSetOnCondition(g_notice_key,token,previous)", claim)
+        self.assertIn("(long)p.bar<last_bar", claim)
+        self.assertIn("(mask & direction_bit)!=0", claim)
+        self.assertIn("mask | direction_bit", claim)
+        self.assertIn("MT5BotOpportunity/v1", key)
+        self.assertIn("g_terminal_key", key)
+        self.assertIn("g_session_server", key)
+        self.assertIn("g_session_login", key)
+        self.assertIn("CRYPT_HASH_SHA256", key)
+        self.assertNotRegex(key, r"\b(?:nonce|ChartID|_Period|GetTickCount64)\b")
+        # Only this namespaced temporary display state may be written. There is
+        # one bounded value per binding, never a variable per signal or chart.
+        calls = re.findall(r"\b(GlobalVariable\w*)\(([^()]*)\)", self.source)
+        self.assertEqual({name for name, _ in calls}, {
+            "GlobalVariableCheck", "GlobalVariableTemp", "GlobalVariableGet", "GlobalVariableSetOnCondition",
+        })
+        for _, arguments in calls:
+            self.assertTrue(arguments.startswith("g_notice_key"))
+        self.assertNotRegex(self.source, r"\b(?:GlobalVariableDel|GlobalVariablesDeleteAll|GlobalVariableSet)\b")
+
     def test_every_delete_is_limited_to_owned_objects(self):
         self.assertEqual(self.source.count("ObjectsDeleteAll("), 1)
         self.assertIn("ObjectsDeleteAll(0,g_prefix,0,-1)", self.source)
