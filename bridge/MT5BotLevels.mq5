@@ -1,10 +1,10 @@
 #property copyright "MT5 Bot"
-#property version   "2.10"
+#property version   "2.11"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
-#property description "Displays the current bot proposal. Manual trading only."
+#property description "Displays and alerts once for each fresh bot proposal. Manual trading only."
 
 // Headerless ASCII row, exactly 18 semicolon-delimited fields:
 // 0 version, 1 state (active/experimental/waiting), 2 symbol, 3 timeframe, 4 direction,
@@ -36,6 +36,7 @@ struct Proposal
 string g_prefix="";
 string g_terminal_key="";
 string g_source_file="";
+string g_notice_key="";
 long   g_session_login=0;
 string g_session_server="";
 bool   g_account_changed=false;
@@ -94,6 +95,68 @@ bool AccountBindingMatches(const string nonce,const string expected)
    string actual="";
    for(int i=0;i<32;i++) actual+=StringFormat("%02x",(int)digest[i]);
    return(actual==expected);
+  }
+
+string OpportunityNoticeKey()
+  {
+   // Bridge nonces and chart/timeframe IDs change on reload; use a stable,
+   // anonymous account+terminal identity only for display notification dedup.
+   // Raw identity remains in memory and never enters a notice or variable name.
+   string material="MT5BotOpportunity/v1\n"+g_terminal_key+"\n"+g_session_server+"\n"
+                   +IntegerToString(g_session_login)+"\nXAUUSD\nM1";
+   uchar data[],key[],digest[];
+   int copied=StringToCharArray(material,data,0,WHOLE_ARRAY,CP_UTF8);
+   if(copied<2 || data[copied-1]!=0) return("");
+   ArrayResize(data,copied-1);
+   if(CryptEncode(CRYPT_HASH_SHA256,data,key,digest)!=32) return("");
+   string anonymous="";
+   for(int i=0;i<24;i++) anonymous+=StringFormat("%02x",(int)digest[i]);
+   return("MT5BotNotice_"+anonymous); // 61 ASCII characters, one key per binding.
+  }
+
+bool ClaimOpportunityNotice(const Proposal &p)
+  {
+   if(g_notice_key=="" || p.bar<=0) return(false);
+   // Temporary terminal state survives chart reloads and is removed by MT5
+   // on terminal exit. Never overwrite/reset another instance's last notice.
+   if(!GlobalVariableCheck(g_notice_key) && !GlobalVariableTemp(g_notice_key))
+      return(false);
+   double previous=0.0;
+   if(!GlobalVariableGet(g_notice_key,previous) || !MathIsValidNumber(previous)
+      || previous<0.0 || previous!=MathFloor(previous)
+      || previous>(double)((long)TimeGMT()*4+3)) return(false);
+   long last_bar=(long)previous/4;
+   int mask=(int)((long)previous%4);
+   int direction_bit=(p.direction=="BUY" ? 1 : 2);
+   if((long)p.bar<last_bar || ((long)p.bar==last_bar && (mask & direction_bit)!=0))
+      return(false);
+   int next_mask=((long)p.bar==last_bar ? (mask | direction_bit) : direction_bit);
+   double token=(double)((long)p.bar*4+next_mask);
+   // Only one chart instance can claim this new bar/direction atomically.
+   return(GlobalVariableSetOnCondition(g_notice_key,token,previous));
+  }
+
+void NotifyOpportunity(const Proposal &p)
+  {
+   if(!p.active || TimeGMT()>=p.valid_until
+      || AccountInfoInteger(ACCOUNT_LOGIN)!=g_session_login
+      || AccountInfoString(ACCOUNT_SERVER)!=g_session_server
+      || AccountInfoInteger(ACCOUNT_TRADE_MODE)!=ACCOUNT_TRADE_MODE_DEMO
+      || !TerminalInfoInteger(TERMINAL_CONNECTED)) return;
+   string notice="MT5 Bot | "+(p.experimental ? "Demo experimental | " : "Demo | ")
+                 +p.direction+" XAUUSD opportunity\n"
+                 +"Entry "+DoubleToString(p.entry,p.digits)+" | Zone "
+                 +DoubleToString(p.zone_low,p.digits)+" - "+DoubleToString(p.zone_high,p.digits)+"\n"
+                 +"SL "+DoubleToString(p.stop,p.digits)+" | TP "+DoubleToString(p.target,p.digits)+"\n"
+                 +"Expires UTC "+TimeToString(p.valid_until,TIME_DATE|TIME_SECONDS)+"\n"
+                 +(p.experimental ? "Estimated costs | No certified win rate\n" : "")
+                 +"Review first. The final manual MT5 decision is yours.";
+   if(!ClaimOpportunityNotice(p) || TimeGMT()>=p.valid_until
+      || AccountInfoInteger(ACCOUNT_LOGIN)!=g_session_login
+      || AccountInfoString(ACCOUNT_SERVER)!=g_session_server
+      || AccountInfoInteger(ACCOUNT_TRADE_MODE)!=ACCOUNT_TRADE_MODE_DEMO
+      || !TerminalInfoInteger(TERMINAL_CONNECTED)) return;
+   Alert(notice);
   }
 
 bool ParseInteger(const string text,long &value,const bool signed_value=false)
@@ -348,7 +411,8 @@ bool DrawProposal(const Proposal &p)
 void UpdateOverlay()
   {
    if(MQLInfoInteger(MQL_TESTER)) { ShowWaiting("Live terminal required"); return; }
-   if(_Symbol!="XAUUSD" || _Period!=PERIOD_M1) { ShowWaiting("Use XAUUSD / M1: M15 direction + M5 confirmation"); return; }
+   // The view timeframe does not change the closed-M1 signal/history contract.
+   if(_Symbol!="XAUUSD") { ShowWaiting("Use XAUUSD: M15 direction + M5 confirmation + M1 timing"); return; }
    if(g_terminal_key=="") { ShowWaiting("Terminal folder unavailable"); return; }
    if(AccountInfoInteger(ACCOUNT_TRADE_MODE)!=ACCOUNT_TRADE_MODE_DEMO) { ShowWaiting("Demo account required"); return; }
    if(AccountInfoInteger(ACCOUNT_LOGIN)!=g_session_login || AccountInfoString(ACCOUNT_SERVER)!=g_session_server)
@@ -367,6 +431,7 @@ void UpdateOverlay()
    if(!DrawProposal(p)) { ShowWaiting("Display unavailable"); return; }
    if(TimeGMT()>=p.valid_until) { ShowWaiting("Proposal expired"); return; }
    ChartRedraw(0);
+   NotifyOpportunity(p);
   }
 
 int OnInit()
@@ -375,6 +440,7 @@ int OnInit()
    g_source_file="MT5Bot\\levels_"+g_terminal_key+".csv";
    g_session_login=AccountInfoInteger(ACCOUNT_LOGIN);
    g_session_server=AccountInfoString(ACCOUNT_SERVER);
+   g_notice_key=OpportunityNoticeKey();
    g_account_changed=false;
    string base="_MBL_"+IntegerToString(ChartID())+"_"+IntegerToString((long)GetTickCount64())+"_";
    int instance=0;

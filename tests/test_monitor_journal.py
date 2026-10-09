@@ -212,20 +212,31 @@ class MonitorJournalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trade["deadline"], "2026-10-04T12:45:00Z")
         self.assertEqual(trade["source_identity"], "reference:XAUUSD")
         self.assertEqual((trade["entry"], trade["stop"], trade["target"]), (2700.0, 2697.0, 2706.0))
-        signal_message = bot.send_message.await_args_list[1]
+        bot.send_message.assert_awaited_once()
+        self.service.market.assert_not_awaited()
+        signal_message = bot.send_message.await_args
         self.assertIn("synthetic BUY setup", signal_message.args[1])
         self.assertIn("15", signal_message.args[1])
         self.assertEqual(signal_message.kwargs, {"parse_mode": None})
         self.assertEqual(self.cached[f"paper_delivery:{CHAT_ID}"]["payload"]["id"], SIGNAL_ID)
 
     async def test_failed_signal_send_never_opens_or_acknowledges_trade(self):
-        bot = SimpleNamespace(send_message=AsyncMock(side_effect=[None, RuntimeError("synthetic send failure")]))
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("synthetic send failure")))
         with self.assertRaises(RuntimeError):
             await self.service.send_report(bot, CHAT_ID)
         self.open_trade.assert_not_awaited()
         self.cache_write.assert_not_awaited()
         self.assertEqual(self.rows, {})
         self.service.news.assert_not_awaited()
+
+    async def test_unwatch_during_reference_journal_preparation_prevents_queued_signal(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with patch.object(monitor.market_store, "delivery_active", new_callable=AsyncMock,
+                          side_effect=[True, False]):
+            await self.service.send_report(bot, CHAT_ID, "synthetic-lease")
+        bot.send_message.assert_not_awaited()
+        self.open_trade.assert_not_awaited()
+        self.cache_write.assert_not_awaited()
 
     async def test_delayed_signal_ack_starts_window_after_success_and_ignores_earlier_prices(self):
         accepted_at = OPENED + timedelta(minutes=4)
@@ -396,9 +407,7 @@ class MonitorJournalTests(unittest.IsolatedAsyncioTestCase):
         self.open_trade.assert_not_awaited()
         self.assertEqual(self.rows, before)
         self.assertNotIn(f"paper_delivery:{CHAT_ID}", self.cached)
-        self.assertFalse(any("synthetic BUY setup" in call.args[1] for call in paused_bot.send_message.await_args_list))
-        self.assertTrue(any("موقوفة" in call.args[1] and "3" in call.args[1] and "13:12 UTC" in call.args[1]
-                            for call in paused_bot.send_message.await_args_list))
+        paused_bot.send_message.assert_not_awaited()
         self.recent.assert_awaited_with(self.pool, BOT_ID, CHAT_ID, limit=20)
         self.service.news.assert_not_awaited()
         other_chat = CHAT_ID + 1
@@ -513,7 +522,7 @@ class MonitorJournalTests(unittest.IsolatedAsyncioTestCase):
         repeated_bot = SimpleNamespace(send_message=AsyncMock())
         await restarted.send_report(repeated_bot, CHAT_ID)
         self.open_trade.assert_awaited_once()
-        self.assertFalse(any("synthetic BUY setup" in call.args[1] for call in repeated_bot.send_message.await_args_list))
+        repeated_bot.send_message.assert_not_awaited()
         self.now = OPENED + timedelta(minutes=15)
         self.feed([observation(minute) for minute in range(1, 16)])
         await restarted.review_trades()

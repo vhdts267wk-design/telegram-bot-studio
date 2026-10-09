@@ -374,7 +374,7 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
             due.assert_awaited_once_with(self.service.pool, 9901, NOW, limit=5)
             active.assert_awaited_once_with(self.service.pool, 9901, 4401, "synthetic-lease", NOW)
 
-    async def test_scheduled_mt5_report_sends_one_status_without_chart_or_news(self):
+    async def test_scheduled_mt5_report_stays_silent_without_a_new_signal(self):
         self.service.market = AsyncMock(return_value="تحليل الشارت")
         self.service.signals = AsyncMock(return_value=({"state": "no_signal"}, "ننتظر تقاطعاً جديداً", None))
         self.service.news = AsyncMock(side_effect=AssertionError("Automatic reports must not request news"))
@@ -383,11 +383,28 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
             monitor.market_store, "save_cache", new_callable=AsyncMock
         ):
             await self.service.send_report(bot, 4401)
-        bot.send_message.assert_awaited_once()
-        self.assertIn("لا توجد فرصة مؤكدة الشروط", bot.send_message.await_args.args[1])
-        self.assertNotIn("BUY", bot.send_message.await_args.args[1])
+        bot.send_message.assert_not_awaited()
         self.service.market.assert_not_awaited()
         self.service.news.assert_not_awaited()
+
+    async def test_automatic_watch_is_silent_for_all_non_signal_states_on_both_sources(self):
+        self.service.market = AsyncMock(side_effect=AssertionError("Automatic watch must not send market reports"))
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with patch.object(monitor.market_store, "get_cache", new_callable=AsyncMock) as cache, patch.object(
+            monitor.market_store, "save_cache", new_callable=AsyncMock,
+        ) as saved:
+            for source in ("mt5", "reference"):
+                self.service.source = source
+                for state in ("warmup", "blocked", "stale", "invalid", "no_signal"):
+                    with self.subTest(source=source, state=state):
+                        self.service.signals = AsyncMock(return_value=({"state": state}, "waiting", "ignored-id"))
+                        await self.service.send_report(bot, 4401)
+            self.service.signals = AsyncMock(return_value=({"state": "signal"}, "incomplete", None))
+            await self.service.send_report(bot, 4401)
+        bot.send_message.assert_not_awaited()
+        self.service.market.assert_not_awaited()
+        cache.assert_not_awaited()
+        saved.assert_not_awaited()
 
     async def test_unwatch_while_signals_runs_prevents_queued_report(self):
         entered, proceed = asyncio.Event(), asyncio.Event()
@@ -644,7 +661,7 @@ class ManualReportDedupTests(unittest.IsolatedAsyncioTestCase):
                                 signal_id, payload, NOW, NOW + timedelta(seconds=10))
         await self.publish_offer(self.service.pool, self.service.bot_id, self.offer["id"], 77, NOW)
 
-    async def test_successful_manual_offer_skips_full_report_but_changed_blocked_status_arrives(self):
+    async def test_manual_offer_is_only_alert_and_changed_blocked_state_stays_silent(self):
         self.cache["mtf_status:4401"] = {"payload": {"token": "blocked:costs_unverified"}, "updated_at": NOW}
         with patch.object(monitor.manual_ticket_store, "expire_offers", new_callable=AsyncMock), patch.object(
             monitor.trade_store, "list_paired_devices", new_callable=AsyncMock, return_value=[self.device],
@@ -656,19 +673,16 @@ class ManualReportDedupTests(unittest.IsolatedAsyncioTestCase):
             await self.service.send_report(self.bot, 4401)
         self.assertEqual(self.bot.send_message.await_count, 1)
         self.assertIn("جهّز على اللابتوب", self.bot.send_message.await_args.args[1])
-        self.assertEqual(self.cache["mtf_status:4401"]["payload"]["token"], self.offer["signal_id"])
-        self.offer_read.assert_awaited_once_with(self.service.pool, 9901, self.device_id, NOW)
+        self.assertEqual(self.cache["mtf_status:4401"]["payload"]["token"], "blocked:costs_unverified")
+        self.offer_read.assert_not_awaited()
 
         self.feed["risk_context"]["costs_verified"] = False
         await self.service.send_report(self.bot, 4401)
-        self.assertEqual(self.bot.send_message.await_count, 2)
-        blocked_text = self.bot.send_message.await_args.args[1]
-        self.assertIn("تكاليف العمولة والانزلاق غير موثّقة", blocked_text)
-        self.assertNotIn("BUY", blocked_text)
+        self.assertEqual(self.bot.send_message.await_count, 1)
         await self.service.send_report(self.bot, 4401)
-        self.assertEqual(self.bot.send_message.await_count, 2)
+        self.assertEqual(self.bot.send_message.await_count, 1)
 
-    async def test_unpublished_other_setup_or_wrong_owner_cannot_suppress_report(self):
+    async def test_unpublished_other_setup_or_wrong_owner_never_gets_plain_fallback(self):
         await self.publish_current()
         original = copy.deepcopy(self.offer)
         cases = (
@@ -683,41 +697,21 @@ class ManualReportDedupTests(unittest.IsolatedAsyncioTestCase):
                 self.cache.pop("mtf_status:4401", None)
                 self.bot.send_message.reset_mock()
                 await self.service.send_report(self.bot, 4401)
-                self.bot.send_message.assert_awaited_once()
-                self.assertIn("شراء BUY", self.bot.send_message.await_args.args[1])
+                self.bot.send_message.assert_not_awaited()
+                self.assertNotIn("mtf_status:4401", self.cache)
 
-    async def test_offer_lookup_failure_is_not_treated_as_successful_delivery(self):
+    async def test_manual_offer_pipeline_retry_is_not_bypassed_by_plain_report(self):
         await self.publish_current()
         self.offer_read.side_effect = RuntimeError("Synthetic storage failure")
-        with self.assertRaises(RuntimeError):
-            await self.service.send_report(self.bot, 4401)
+        await self.service.send_report(self.bot, 4401)
+        self.offer_read.assert_not_awaited()
         self.bot.send_message.assert_not_awaited()
         self.assertNotIn("mtf_status:4401", self.cache)
 
-    async def test_feed_blocked_during_offer_lookup_sends_current_blocked_status(self):
-        await self.publish_current()
-
-        async def lookup(*args):
-            self.feed["risk_context"]["costs_verified"] = False
-            return copy.deepcopy(self.offer)
-
-        self.offer_read.side_effect = lookup
-        await self.service.send_report(self.bot, 4401)
-        self.bot.send_message.assert_awaited_once()
-        self.assertNotIn("BUY", self.bot.send_message.await_args.args[1])
-
-    async def test_unwatch_during_offer_lookup_prevents_monitoring_delivery(self):
-        await self.publish_current()
-        active = {"value": True}
-
-        async def lookup(*args):
-            active["value"] = False
-            return None
-
-        self.offer_read.side_effect = lookup
-        with patch.object(monitor.market_store, "delivery_active", new_callable=AsyncMock,
-                          side_effect=lambda *args: active["value"]):
-            await self.service.send_report(self.bot, 4401, "synthetic-lease")
+    async def test_manual_monitor_does_not_compute_or_send_waiting_reports(self):
+        self.service.signals = AsyncMock(side_effect=AssertionError("Manual offer path owns signal delivery"))
+        await self.service.send_report(self.bot, 4401, "synthetic-lease")
+        self.service.signals.assert_not_awaited()
         self.bot.send_message.assert_not_awaited()
         self.assertNotIn("mtf_status:4401", self.cache)
 

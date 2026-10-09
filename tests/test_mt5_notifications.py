@@ -233,11 +233,14 @@ class ManualMT5NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["workflow"], "manual_ticket")
         self.assertEqual((payload["stop"], payload["target"]), (signal()["stop"], signal()["target"]))
         sent = self.bot.send_message.await_args
-        for text in ("Demo", "0.01", "TP", "SL", "لا يرسل صفقة", "بنفسك"):
+        for text in ("Demo", "0.01", "TP", "SL", "ما في تنفيذ تلقائي", "بنفسك"):
             self.assertIn(text, sent.args[1])
         self.assertIn("منطقة الدخول:", sent.args[1])
-        for detail in ("TP2", "M15", "M5", "M1", "عشر ثوانٍ", "60 دقيقة", "الأداء التاريخي لا يضمن"):
+        for detail in ("TP2", "M15", "M5", "M1", "10 ثانية", "ما بيضمن الربح"):
             self.assertIn(detail, sent.args[1])
+        for detail in ("لقيت فرصة", "الدخول المقترح", "السبب", "شارت MT5"):
+            self.assertIn(detail, sent.args[1])
+        self.assertLess(len(sent.args[1]), 1400)
         buttons = sent.kwargs["reply_markup"].inline_keyboard[0]
         self.assertEqual(buttons[0].text, "جهّز على اللابتوب")
         for button in buttons:

@@ -22,7 +22,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CallbackQueryHandler, CommandHandler
 
-from bot import manual_ticket_store, market_monitor, market_store, mtf_presentation, mtf_runtime, proposal_overlay, trade_store
+from bot import manual_ticket_store, market_monitor, market_store, mtf_runtime, proposal_overlay, trade_store
 
 
 logger = logging.getLogger(__name__)
@@ -451,27 +451,35 @@ def _offer_text(payload, expires_at) -> str:
 
 
 def _manual_offer_text(payload, expires_at) -> str:
-    if mtf_runtime.is_experimental_result(payload):
-        return (
-            mtf_presentation.format_proposal(payload, symbol=payload["symbol"])
-            + f"\nصلاحية طلب التجهيز حتى: {_utc(expires_at):%Y-%m-%d %H:%M:%S} UTC\n"
-            + "«جهّز على اللابتوب» يفتح نافذة MT5 ويملأ TP وSL فقط؛ تراجع الرمز والحجم والأسعار وتضغط Buy أو Sell بنفسك داخل MT5."
-        )
+    """Lead an automatic alert with the opportunity and its frozen protection."""
     digits = _digits(payload)
     zone = proposal_overlay.reference_zone(payload)
-    return (
-        f"اقتراح تجهيز صفقة على اللابتوب — {payload['symbol']}\n"
-        f"{payload['direction']} | Demo | الحجم: {payload['volume']:g} lot\n"
-        f"دخول مرجعي: {payload['entry']:.{digits}f}\nSL وقف: {payload['stop']:.{digits}f}\nTP هدف: {payload['target']:.{digits}f}\n"
-        f"منطقة الدخول: {zone['entry_zone_low']:.{digits}f} – {zone['entry_zone_high']:.{digits}f}\n"
-        f"TP2: {payload['target2']:.{digits}f} | العائد/المخاطرة: {payload['nominal_reward_risk']:.2f}:1؛ بعد التكاليف {payload['effective_reward_risk']:.2f}:1\n"
-        "السبب: M15 اتجاه، M5 تأكيد ارتداد، M1 كسر متوافق بإغلاق مكتمل؛ اجتازت فلاتر المخاطر والسبريد والنشاط والأدلة خارج العينة.\n"
-        "الإلغاء: مرور عشر ثوانٍ من إغلاق M1، تغيّر الاتجاه أو التأكيد، تقادم البيانات، أو فشل المخاطر. مدة تقييم TP1 قبل SL: 60 دقيقة من الدخول.\n"
-        f"صلاحية طلب التجهيز حتى: {_utc(expires_at):%Y-%m-%d %H:%M:%S} UTC\n"
-        "«جهّز على اللابتوب» يفتح نافذة MT5 ويملأ TP وSL فقط؛ لا يرسل صفقة. "
-        "تراجع الرمز والحجم والأسعار وتضغط Buy أو Sell بنفسك داخل MT5.\n"
-        "يُرفض التجهيز إذا تجاوز السبريد وانحراف الدخول معاً 0.1R. الأداء التاريخي لا يضمن هذه الصفقة."
-    )
+    experimental = mtf_runtime.is_experimental_result(payload)
+    direction = "شراء BUY" if payload["direction"] == "BUY" else "بيع SELL"
+    seconds = mtf_runtime.entry_window_seconds(payload)
+    lines = [
+        f"🔔 لقيت فرصة على الذهب — {payload['symbol']} | {direction}",
+        "Demo تجريبي — الأداء غير مثبت؛ التكاليف افتراضات تقديرية غير موثّقة." if experimental
+        else "Demo — اجتازت شروط الاستراتيجية والأدلة خارج العينة.",
+        f"الدخول المقترح: {payload['entry']:.{digits}f}",
+        f"منطقة الدخول: {zone['entry_zone_low']:.{digits}f} – {zone['entry_zone_high']:.{digits}f}",
+        f"SL وقف: {payload['stop']:.{digits}f} | TP1 هدف: {payload['target']:.{digits}f} | TP2: {payload['target2']:.{digits}f}",
+        f"الحجم: {payload['volume']:g} lot | العائد/المخاطرة بعد التكاليف: {payload['effective_reward_risk']:.2f}:1.",
+        "السبب: اتجاه M15، تأكيد ارتداد M5، وكسر M1 بإغلاق مكتمل؛ اجتازت فلاتر المخاطر والسبريد.",
+        f"مهلة الدخول: {seconds} ثانية من إغلاق M1؛ آخر وقت للتجهيز: {_utc(expires_at):%H:%M:%S} UTC.",
+    ]
+    if experimental:
+        costs = payload["cost_assumptions"]
+        lines.append(
+            f"التكلفة المقدّرة: عمولة {costs['commission_round_turn']:.8g} بعملة الحساب؛ "
+            f"انزلاق {costs['slippage_price']:.8g} لكل جهة. المخاطرة المقدّرة حتى 1% من Equity."
+        )
+    lines.extend([
+        "نفس المستويات بتظهر على شارت MT5 باللابتوب قبل طلب التجهيز.",
+        "«جهّز على اللابتوب» بيملأ نافذة MT5 مع TP وSL فقط. بتراجعها وبتضغط Buy أو Sell بنفسك داخل MT5؛ ما في تنفيذ تلقائي.",
+        "إذا خلصت المهلة أو تغيّرت البيانات أو السعر، بينرفض التجهيز. اجتياز الشروط ما بيضمن الربح.",
+    ])
+    return "\n".join(lines)
 
 
 async def send_offers(service, bot):

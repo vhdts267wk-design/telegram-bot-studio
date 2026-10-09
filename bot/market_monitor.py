@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CommandHandler
 
-from bot import chart_analysis, free_news, journal_store, manual_ticket_store, market_news, market_store, mt5_api, mt5_notifications, mtf_runtime, multi_timeframe, paper_journal, paper_policy, paper_signals, proposal_overlay, reference_market, trade_store
+from bot import chart_analysis, free_news, journal_store, manual_ticket_store, market_news, market_store, mt5_api, mt5_notifications, mtf_runtime, multi_timeframe, paper_journal, paper_policy, paper_signals, reference_market, trade_store
 
 
 logger = logging.getLogger(__name__)
@@ -581,84 +581,56 @@ class MarketService:
         )
 
     async def send_report(self, bot, chat_id, lease_id=None):
+        """Notify only new opportunities; routine state remains available on demand."""
         async def may_send():
             return lease_id is None or await market_store.delivery_active(
                 self.pool, self.bot_id, chat_id, lease_id, utc_now()
             )
         if self.source == "mt5":
+            if self.manual_tickets_enabled:
+                # The durable, owner-bound offer path sends the proposal with
+                # its preparation/approval buttons and exposes it to MT5.
+                # Never bypass its publication retries with a plain alert.
+                return
             result, signal_text, signal_id = await self.signals()
-            until = await self.risk_pause(chat_id)
-            if until is not None:
-                result, signal_id, signal_text = {"state": "blocked", "reason": "risk_pause"}, None, _pause_text(until)
+            if result.get("state") != "signal" or not signal_id or await self.risk_pause(chat_id) is not None:
+                return
             delivery_key = f"mtf_status:{chat_id}"
             previous = await market_store.get_cache(self.pool, self.bot_id, delivery_key)
-            current = await market_store.get_cache(self.pool, self.bot_id, "broker_feed") if result.get("state") == "signal" else None
+            if previous is not None and previous["payload"].get("token") == signal_id:
+                return
+            current = await market_store.get_cache(self.pool, self.bot_id, "broker_feed")
             if not await may_send():
                 return
-            offered, device = None, None
-            if result.get("state") == "signal" and self.manual_tickets_enabled and signal_id and current is not None:
-                try:
-                    device_id = UUID(current["payload"]["device_id"])
-                except (KeyError, TypeError, ValueError, AttributeError):
-                    device_id = None
-                if device_id is not None:
-                    device = await trade_store.get_device(self.pool, self.bot_id, device_id)
-                    if device is not None and device.get("owner_chat_id") == chat_id and device.get("owner_user_id") == chat_id:
-                        offered = await manual_ticket_store.get_chart_offer(self.pool, self.bot_id, device_id, utc_now())
-                    # The lookup may outlast the entry window or a new feed.
-                    current = await market_store.get_cache(self.pool, self.bot_id, "broker_feed")
-                    if not await may_send():
-                        return
             # Recheck after storage/consent awaits. Never deliver stale text or
             # let a legacy signal supplied by a caller bypass qualification.
-            if result.get("state") == "signal":
-                candidate = dict(result, workflow="manual_ticket")
-                if current is None or not mtf_runtime.eligible_payload(candidate, current.get("payload"), utc_now()):
-                    result, signal_id = mtf_runtime.blocked(), None
-                elif (
-                    offered is not None and offered.get("signal_id") == signal_id
-                    and proposal_overlay.build_chart_overlay(offered, device, current.get("payload"), utc_now()) is not None
-                ):
-                    # A published, currently valid owner-bound offer already
-                    # contains this proposal. Waiting/blocked reports still flow.
-                    if previous is None or previous["payload"].get("token") != signal_id:
-                        await market_store.save_cache(self.pool, self.bot_id, delivery_key, {"token": signal_id}, utc_now())
-                    return
-            if until is None:
-                signal_text = chart_analysis.format_chart_proposal(
-                    result, manual_ticket_enabled=self.manual_tickets_enabled,
-                )
-            token = signal_id or f"{result.get('state')}:{result.get('reason')}"
-            if previous is not None and previous["payload"].get("token") == token:
+            candidate = dict(result, workflow="manual_ticket")
+            if current is None or not mtf_runtime.eligible_payload(candidate, current.get("payload"), utc_now()):
                 return
+            signal_text = chart_analysis.format_chart_proposal(result)
             await bot.send_message(chat_id, signal_text, parse_mode=None)
-            await market_store.save_cache(self.pool, self.bot_id, delivery_key, {"token": token}, utc_now())
-            return
-        text = await self.market()
-        if not await may_send():
-            return
-        await bot.send_message(chat_id, text, parse_mode=None)
-        if not await may_send():
+            await market_store.save_cache(self.pool, self.bot_id, delivery_key, {"token": signal_id}, utc_now())
             return
         result, signal_text, signal_id = await self.signals()
-        if not await may_send():
+        if result.get("state") != "signal" or not signal_id:
             return
         until = await self.risk_pause(chat_id)
         if until is not None:
-            signal_id = None
-            signal_text = _pause_text(until)
+            return
         delivery_key = f"paper_delivery:{chat_id}"
         delivered = await market_store.get_cache(self.pool, self.bot_id, delivery_key)
         if not await may_send():
             return
         repeated = signal_id is not None and delivered is not None and delivered["payload"].get("id") == signal_id
         if repeated:
-            signal_text = "الإشارات التجريبية: سبق إرسال إعداد هذه الشمعة؛ لا توجد إشارة جديدة."
+            return
         trade = None
         if signal_id is not None and not repeated and self.journal_enabled:
             identity = await self.source_identity()
             trade = paper_journal.create_trade(signal_id, result, identity, utc_now(), self.trade_minutes)
             signal_text += "\n\nمدة الاختبار: 15 دقيقة من إرسال الإشارة؛ تُرسل مراجعة عند رصد الوقف أو الهدف أو انتهاء المدة."
+        if not await may_send():
+            return
         await bot.send_message(chat_id, signal_text, parse_mode=None)
         if trade is not None:
             # The evaluation window begins only after Telegram accepted the
@@ -950,7 +922,7 @@ async def watch_command(update, context):
                 "تظهر الإشارة عند اجتياز فلاتر المخاطر والسبريد والنشاط: Demo فقط بحجم 0.01، دون صفقات أو أوامر معلّقة، ومخاطرة مقدّرة بعد التكاليف حتى 1% من حقوق الحساب (Equity).\n"
                 "صلاحية الدخول والتجهيز 30 ثانية من إغلاق M1؛ يعاد فحص السعر والسبريد والمخاطر قبل التجهيز. تُذكر قيم العمولة والانزلاق المقدّرة مع كل إشارة.\n"
                 "معيار تقييم التجربة: TP1 قبل SL خلال 60 دقيقة من الدخول وبعد التكاليف؛ لا توجد نسبة نجاح مثبتة.\n"
-                "إذا غابت الشروط تظهر حالة مختصرة عند تغيرها، دون تكرار التنبيه نفسه. التنفيذ يظل يدوياً: تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك؛ ألغِ النافذة عند انتهاء المهلة.\n"
+                "التنبيهات التلقائية فقط عند ظهور فرصة Demo تجريبية جديدة اجتازت الشروط؛ لا تصلك تقارير دورية أو رسائل انتظار. التنفيذ يظل يدوياً: تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك؛ ألغِ النافذة عند انتهاء المهلة.\n"
                 "/market للتحليل، /signals للحالة وإشارة Demo التجريبية، /unwatch للإيقاف. الأخبار بطلب /news فقط.",
                 parse_mode=None,
             )
@@ -959,19 +931,18 @@ async def watch_command(update, context):
             "تم تفعيل المتابعة: M15 للاتجاه، M5 للتأكيد، وM1 لتوقيت الدخول، من شموع مكتملة وأسعار حديثة.\n"
             "اقتراح الصفقة مشروط بتوافق الأطر وفلاتر المخاطر والسبريد والنشاط، وبأدلة خارج العينة: 200 صفقة مستقلة على الأقل والحد الأدنى لفاصل الثقة 95% ≥70% بعد التكاليف.\n"
             "النجاح للاختبار: TP1 قبل SL خلال 60 دقيقة من الدخول؛ انتهاء المدة يُحسب غير ناجح. الأداء التاريخي لا يضمن نتيجة الصفقة.\n"
-            "إذا غابت الشروط تظهر حالة مختصرة عند تغيرها، دون تكرار التنبيه نفسه. التنفيذ يظل يدوياً لكل صفقة: تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك.\n"
+            "التنبيهات التلقائية فقط عند ظهور فرصة جديدة اجتازت الشروط؛ لا تصلك تقارير دورية أو رسائل انتظار. التنفيذ يظل يدوياً لكل صفقة: تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك.\n"
             "/market للتحليل، /signals للحالة والاقتراح المؤهل، /unwatch للإيقاف. الأخبار بطلب /news فقط.",
             parse_mode=None,
         )
         return
     await message.reply_text(
-        "تم تفعيل تحليل شارت XAUUSD كل 15 دقيقة. أول تقرير خلال 15 دقيقة.\n"
-        "يشمل اتجاه الشارت، الدعوم والمقاومات المرصودة، وEMA9/21 وATR14.\n"
+        "تم تفعيل متابعة فرص XAUUSD؛ يصلك تنبيه فقط عند ظهور إشارة ورقية تجريبية جديدة اجتازت الشروط.\n"
         "اقتراح BUY أو SELL مع دخول ووقف وهدف يظهر عند تحقق الشروط فقط، "
-        "بعد 22 شمعة M15 مكتملة ومتتابعة؛ وإلا يوضح سبب الانتظار.\n"
+        "بعد 22 شمعة M15 مكتملة ومتتابعة. لا تصلك تقارير دورية أو رسائل انتظار أو تكرار للإشارة نفسها.\n"
         "مدة الصفقة الورقية 15 دقيقة، مع مراجعة النتيجة وملاحظات محفوظة.\n"
         "استخدم /market للتحليل والاقتراح الآن، و/signals للاقتراح، و/reviews للنتائج، "
-        "و/unwatch لإيقاف التقارير.\n"
+        "و/unwatch لإيقاف التنبيهات.\n"
         "الأخبار عند طلب /news فقط. "
         + (
             "زر «جهّز على اللابتوب» يجهّز نافذة MT5 مع TP وSL؛ التنفيذ يتم حين تضغط Buy أو Sell بنفسك على اللابتوب."

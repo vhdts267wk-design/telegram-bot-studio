@@ -144,6 +144,8 @@ class ExperimentalMtfHandlerTextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("200", text)
         self.assertNotIn("70%", text)
         self.assertNotIn("اقتراح المؤهل", text)
+        self.assertIn("فقط عند ظهور فرصة Demo تجريبية جديدة", text)
+        self.assertIn("لا تصلك تقارير دورية أو رسائل انتظار", text)
 
     async def test_reference_service_ignores_mt5_experimental_setting(self):
         self.service.source = "reference"

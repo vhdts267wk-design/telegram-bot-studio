@@ -71,7 +71,7 @@ Telegram bots cannot display custom buttons before a user starts or messages the
 | `/news` | Cited political and macroeconomic developments |
 | `/signals` | Inspect a qualified M15/M5/M1 proposal or its blocking reason; no order is sent |
 | `/reviews` | Legacy reference-paper observation records; these are not the MTF qualification study |
-| `/watch` | Opt in to private monitoring; MT5 status updates are sent when the state or reason changes |
+| `/watch` | Monitor quietly and notify only about a new eligible opportunity |
 | `/unwatch` | Stop reports and cancel pending preparation requests; close any prepared window yourself |
 | `/connect_mt5 CODE` | Pair the locally started Demo bridge in its owner's private chat |
 
@@ -89,13 +89,23 @@ The legacy chart-photo feature is disabled unless an owner explicitly sets
 
 ## Market and news monitoring without screenshots
 
-Send `/market` or `/news` for a report. With MT5, `/watch` checks for qualified
-opportunities every five seconds; status delivery is checked each minute and
-unchanged states/reasons are suppressed. The separate reference workflow keeps
-its 15-minute report interval. `/unwatch` stops monitoring.
+Send `/market`, `/signals` or `/news` when you want a report. `/watch` monitors
+quietly: waiting, blocked, stale and repeated signals do not send routine
+messages. With MT5, new opportunities are checked every five seconds. The
+paired manual workflow sends one durable owner-only opportunity alert with
+entry, SL, TP1/TP2, reason and expiry plus preparation/reject buttons. It never
+sends a second buttonless report for the same opportunity. The separate
+reference workflow also sends only a new paper signal. `/unwatch` stops monitoring.
 Subscriptions, delivery leases, collected prices and search usage survive restarts
 in PostgreSQL. Reports are private-chat opt-ins. A report already being delivered
 can finish its in-flight Telegram request when unsubscribing.
+
+While the MT5 terminal and its manual helper are open, indicator 2.11 displays
+the same published proposal on any XAUUSD view timeframe before a preparation
+request. A native MT5 alert announces each fresh opportunity once, even when
+another chart tab is selected. Waiting updates do not trigger alerts. Its
+expiry, device binding and closed-M1/fresh-feed checks remain in force. A
+preparation request only fills a native Demo ticket; Buy/Sell remains manual.
 
 The current MT5 strategy is `mtf-ema-pullback-60m-v1`: **M15 direction → M5
 pullback/recovery confirmation → M1 close beyond the previous candle's range**.
@@ -504,9 +514,11 @@ Run migration `20261005_05` before use. Local setup and supported UI checks are
 described in [bridge/MANUAL-TICKETS.md](bridge/MANUAL-TICKETS.md).
 
 The display-only `bridge/MT5BotLevels.mq5` indicator shows the latest valid
-proposal's Entry Zone, reference Entry, green TP1 and red SL on the XAUUSD **M1**
-chart. Use indicator version **2**; old M15/CSV-v1 snapshots are rejected. Its
-levels match the immutable qualified Telegram proposal. The helper reads a
+proposal's Entry Zone, reference Entry, green TP1 and red SL on any XAUUSD
+chart view. Version **2.11** also announces each fresh opportunity once through
+an MT5 informational alert. The signal still requires completed M1 timing;
+old M15/CSV-v1 snapshots are rejected. Its levels match the immutable Telegram
+proposal, including the labelled experimental Demo profile. The helper reads a
 separate authenticated `/api/mt5/manual/chart` endpoint without claiming a
 ticket and publishes an expiring local snapshot. Missing, expired or unsafe
 data clears the indicator's own levels. The native Buy/Sell click stays with

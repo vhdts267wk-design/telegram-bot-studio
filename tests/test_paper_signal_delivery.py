@@ -143,7 +143,7 @@ class PaperSourceGateTests(PinnedSyntheticEvidenceMixin, unittest.TestCase):
 
 class PaperDeliveryTests(PinnedSyntheticEvidenceMixin, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.env = patch.dict(monitor.os.environ, {"MARKET_SOURCE": "mt5", "MT5_MANUAL_TICKETS_ENABLED": "true"}, clear=True)
+        self.env = patch.dict(monitor.os.environ, {"MARKET_SOURCE": "mt5", "MT5_MANUAL_TICKETS_ENABLED": "false"}, clear=True)
         self.clock = patch.object(monitor, "utc_now", return_value=NOW)
         self.env.start(); self.clock_mock = self.clock.start()
         self.addCleanup(self.env.stop); self.addCleanup(self.clock.stop)
@@ -190,20 +190,32 @@ class PaperDeliveryTests(PinnedSyntheticEvidenceMixin, unittest.IsolatedAsyncioT
         self.assertEqual(writes.count("mtf_status:4401"), 1)
         self.assertEqual(writes.count("mtf_status:4402"), 1)
 
-    async def test_status_only_notifies_when_waiting_state_or_reason_changes(self):
+    async def test_changed_blocked_reasons_remain_silent_without_acknowledging_a_signal(self):
         self.saved["broker_feed"]["payload"]["risk_context"]["costs_verified"] = False
         service = self.reporting_service()
         bot = SimpleNamespace(send_message=AsyncMock())
         with self.evidence():
             await service.send_report(bot, 4401)
             await service.send_report(bot, 4401)
-            self.assertEqual(bot.send_message.await_count, 1)
-            self.assert_no_trade(bot.send_message.await_args.args[1])
+            bot.send_message.assert_not_awaited()
             self.saved["broker_feed"]["payload"]["risk_context"].update(costs_verified=True, open_positions=1)
             await service.send_report(bot, 4401)
-            self.assertEqual(bot.send_message.await_count, 2)
-            self.assertIn("فرصة عالية المخاطر", bot.send_message.await_args.args[1])
+            bot.send_message.assert_not_awaited()
         self.assertNotIn("paper_setup", self.saved)
+        self.assertNotIn("mtf_status:4401", self.saved)
+
+    async def test_blocked_interval_does_not_reset_last_delivered_signal(self):
+        service = self.reporting_service()
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with self.evidence():
+            await service.send_report(bot, 4401)
+            token = copy.deepcopy(self.saved["mtf_status:4401"])
+            self.saved["broker_feed"]["payload"]["risk_context"]["open_positions"] = 1
+            await service.send_report(bot, 4401)
+            self.assertEqual(self.saved["mtf_status:4401"], token)
+            self.saved["broker_feed"]["payload"]["risk_context"]["open_positions"] = 0
+            await service.send_report(bot, 4401)
+        bot.send_message.assert_awaited_once()
 
     async def test_manual_inspection_freezes_qualified_setup_without_acknowledging_delivery(self):
         update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=AsyncMock()), effective_chat=SimpleNamespace(type="private", id=4401))
@@ -319,7 +331,23 @@ class PaperDeliveryTests(PinnedSyntheticEvidenceMixin, unittest.IsolatedAsyncioT
         bot = SimpleNamespace(send_message=AsyncMock())
         with self.evidence(), patch.object(mtf_runtime, "_clock", side_effect=lambda *args: self.clock_mock.return_value):
             await service.send_report(bot, 4401)
-        for call in bot.send_message.await_args_list: self.assert_no_trade(call.args[1])
+        bot.send_message.assert_not_awaited()
+        self.assertNotIn("mtf_status:4401", self.saved)
+
+    async def test_exposure_change_after_signal_computation_stays_silent_at_delivery(self):
+        service = self.reporting_service()
+
+        async def changed_risk(pool, bot_id, key):
+            if key.startswith("mtf_status:"):
+                self.saved["broker_feed"]["payload"]["risk_context"]["open_positions"] = 1
+            return await self.read_cache(pool, bot_id, key)
+
+        self.read.side_effect = changed_risk
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with self.evidence():
+            await service.send_report(bot, 4401)
+        bot.send_message.assert_not_awaited()
+        self.assertNotIn("mtf_status:4401", self.saved)
 
     async def test_signals_command_rechecks_timing_after_async_risk_lookup(self):
         update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=AsyncMock()), effective_chat=SimpleNamespace(type="private", id=4401))
@@ -355,7 +383,7 @@ class PaperDeliveryTests(PinnedSyntheticEvidenceMixin, unittest.IsolatedAsyncioT
             monitor.trade_store, "create_offer", new_callable=AsyncMock
         ) as offer:
             await service.send_report(bot, 4401)
-        self.assertIn("موقوفة", bot.send_message.await_args.args[1]); self.assert_no_trade(bot.send_message.await_args.args[1])
+        bot.send_message.assert_not_awaited()
         journal.assert_not_awaited(); offer.assert_not_awaited(); service.news.assert_not_awaited()
         self.assertFalse(service.trading_enabled)
 
