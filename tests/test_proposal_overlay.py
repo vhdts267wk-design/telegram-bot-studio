@@ -65,7 +65,8 @@ class ProposalOverlayTests(unittest.TestCase):
                 "symbol": "XAUUSD", "timeframe": "M1", "direction": payload["direction"],
                 **{key: payload[key] for key in ("entry", "entry_zone_low", "entry_zone_high", "stop", "target", "price_digits", "execution", "bar_time",
                                                "strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint", "qualification_id",
-                                               "direction_bar_time", "confirmation_bar_time")},
+                                               "direction_bar_time", "confirmation_bar_time", "context_bar_times", "timeframe_context",
+                                               "broker_utc_offset_minutes")},
                 "expires_at": (NOW + timedelta(seconds=10)).isoformat(),
             })
             self.assertEqual(original, frozen)

@@ -23,7 +23,12 @@ CONTEXT = {
     "direction": "BUY", "bar_time": (NOW - timedelta(minutes=1)).isoformat(),
     "confirmation_bar_time": (NOW - timedelta(minutes=5)).isoformat(),
     "direction_bar_time": (NOW - timedelta(minutes=15)).isoformat(),
-    "broker_fingerprint": "c" * 64, "policy_id": "mtf-manual-demo-cost-risk-v1",
+    "broker_fingerprint": "c" * 64, "policy_id": "mtf-manual-demo-cost-risk-v2",
+    "broker_utc_offset_minutes": 0,
+    "context_bar_times": {"H1": (NOW - timedelta(hours=1)).isoformat(), "H4": (NOW - timedelta(hours=4)).isoformat()},
+    "timeframe_context": {"trends": {key: "BUY" for key in ("M1", "M5", "M15", "H1", "H4")},
+                          "alignment": "aligned", "confidence": "aligned", "counter_trend": False,
+                          "support": 1900, "resistance": 2100},
     "cost_context": {"commission_round_turn": 0.07, "slippage_price": 0.02,
                      "loss_cash_per_price_unit": 1.0, "profit_cash_per_price_unit": 1.0},
     "execution": {"tick_size": 0.01, "point": 0.01, "digits": 2, "stops_level": 10},
@@ -163,9 +168,9 @@ class ManualTicketStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[-3:-1], [QUALIFICATION, FINGERPRINT])
         self.assertEqual(json.loads(args[-1]), CONTEXT)
         candidate, update = query.split("), claimed AS (", 1)
-        for predicate in ("offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-v1'",
+        for predicate in ("offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-v2'",
                           "offer.payload->>'qualification_id' = $6", "offer.payload->>'strategy_fingerprint' = $7",
-                          "offer.payload->>'strategy_version' = '1'", "offer.payload->>'horizon_seconds' = '3600'",
+                          "offer.payload->>'strategy_version' = '2'", "offer.payload->>'horizon_seconds' = '3600'",
                           "offer.payload->>'display_timeframe' = 'M1'", "offer.payload @> $8::jsonb"):
             self.assertIn(predicate, candidate)
         self.assertIn("UPDATE mt5_manual_ticket_offers", update)
@@ -208,7 +213,7 @@ class ManualTicketStoreTests(unittest.IsolatedAsyncioTestCase):
         candidate = compact(self.pool.fetchrow.await_args.args[0]).split("), claimed AS (", 1)[0]
         self.assertIn("offer.payload->>'qualification_id' = $6", candidate)
         self.assertIn("offer.payload->>'strategy_fingerprint' = $7", candidate)
-        self.assertIn("offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-v1'", candidate)
+        self.assertIn("offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-v2'", candidate)
         self.assertIn("offer.payload @> $8::jsonb", candidate)
         self.assertEqual(json.loads(self.pool.fetchrow.await_args.args[-1]), CONTEXT)
         self.assertIn("FOR UPDATE OF offer, device SKIP LOCKED", candidate)

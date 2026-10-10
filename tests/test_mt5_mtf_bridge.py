@@ -13,6 +13,7 @@ from unittest.mock import Mock
 
 from bridge import mt5_market_bridge as market
 from bridge import mt5_native_ticket as native
+from bridge import mt5_chart_overlay as chart
 from tests import test_mt5_bridge as fixtures
 
 
@@ -22,15 +23,21 @@ class MultiTimeframeFeedTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.sdk, self.settings, self.now = self.fixture.mt5, self.fixture.settings, self.fixture.now
+        self.sdk.mock_add_spec([*self.sdk._mock_methods, "TIMEFRAME_H1", "TIMEFRAME_H4"])
+        self.sdk.TIMEFRAME_H1, self.sdk.TIMEFRAME_H4 = 60, 240
+        for frame in (60, 240):
+            self.fixture.mtf_rates[frame] = [{**row, "time": market.latest_closed_bar(
+                self.now.timestamp(), frame * 60, 0) - (63 - index) * frame * 60}
+                for index, row in enumerate(self.fixture.rates)]
 
     def feed(self, settings=None):
         return market.build_payload(self.sdk, settings or self.settings, self.now)
 
-    def test_three_exact_closed_histories_share_asof_without_account_identity(self):
+    def test_five_exact_closed_histories_share_asof_without_account_identity(self):
         value = self.feed()
         self.assertEqual(value["schema_version"], 2)
         self.assertEqual(value["as_of"], value["risk_context"]["as_of"])
-        self.assertEqual(set(value["timeframes"]), {"M15", "M5", "M1"})
+        self.assertEqual(set(value["timeframes"]), {"H4", "H1", "M15", "M5", "M1"})
         self.assertEqual(value["candles"], value["timeframes"]["M15"])
         for label, seconds in market.TIMEFRAMES.items():
             bars = value["timeframes"][label]
@@ -42,7 +49,7 @@ class MultiTimeframeFeedTests(unittest.TestCase):
         self.assertNotIn(self.settings.key, encoded)
 
     def test_missing_old_duplicate_misaligned_or_forming_history_fails_closed(self):
-        for label in (5, 1):
+        for label in (240, 60, 5, 1):
             original = deepcopy(self.fixture.mtf_rates[label])
             for failure in ("missing", "empty", "old", "duplicate", "misaligned", "forming", "future", "overlong"):
                 changed = deepcopy(original)
@@ -62,6 +69,46 @@ class MultiTimeframeFeedTests(unittest.TestCase):
                 with self.subTest(label=label, failure=failure), self.assertRaises(market.MarketDataError):
                     self.feed()
             self.fixture.mtf_rates[label] = original
+
+    def test_higher_candles_use_broker_grid_and_one_shared_utc_boundary(self):
+        # UTC midnight is not necessarily a broker H4 boundary. Quarter-hour
+        # broker offsets also change H1 boundaries after normalization.
+        for offset in (180, -300, 345):
+            configured = replace(self.settings, broker_utc_offset_minutes=offset)
+            self.sdk.symbol_info_tick.return_value.time = int(self.now.timestamp()) + offset * 60 - 5
+            for label, seconds in market.TIMEFRAMES.items():
+                last = market.latest_closed_bar(self.now.timestamp(), seconds, offset) + offset * 60
+                rows = [{**row, "time": last - (63 - index) * seconds}
+                        for index, row in enumerate(self.fixture.rates)]
+                if label == "M15":
+                    self.sdk.copy_rates_from_pos.return_value = rows
+                else:
+                    self.fixture.mtf_rates[seconds // 60] = rows
+            value = self.feed(configured)
+            for label, seconds in market.TIMEFRAMES.items():
+                last = market.broker_timestamp_utc(self.sdk.copy_rates_from_pos(
+                    self.settings.symbol, getattr(self.sdk, "TIMEFRAME_" + label), 1, 64)[-1]["time"], configured)
+                self.assertEqual(value["timeframes"][label][-1]["time"], market.utc_timestamp(last))
+                self.assertEqual((last + offset * 60) % seconds, 0)
+                self.assertLessEqual(last + seconds, self.now.timestamp())
+                self.assertLess(self.now.timestamp() - (last + seconds), seconds)
+            self.assertEqual(value["as_of"], value["risk_context"]["as_of"])
+
+    def test_forming_h4_is_rejected_at_broker_close_boundary(self):
+        configured = replace(self.settings, broker_utc_offset_minutes=180)
+        self.now = self.now.replace(hour=13)  # 16:00 on this broker's clock.
+        self.sdk.symbol_info_tick.return_value.time = int(self.now.timestamp()) + 180 * 60
+        for label, seconds in market.TIMEFRAMES.items():
+            last = market.latest_closed_bar(self.now.timestamp(), seconds, 180) + 180 * 60
+            rows = [{**row, "time": last - (63 - index) * seconds} for index, row in enumerate(self.fixture.rates)]
+            if label == "M15":
+                self.sdk.copy_rates_from_pos.return_value = rows
+            else:
+                self.fixture.mtf_rates[seconds // 60] = rows
+        self.feed(configured)
+        self.fixture.mtf_rates[240][-1]["time"] += 14400
+        with self.assertRaises(market.MarketDataError):
+            self.feed(configured)
 
     def test_actual_short_histories_and_session_gaps_are_preserved_without_filling(self):
         for label, seconds in market.TIMEFRAMES.items():
@@ -170,6 +217,35 @@ class MultiTimeframeFeedTests(unittest.TestCase):
             self.feed()
 
 
+class StandaloneFiveFrameParityTests(unittest.TestCase):
+    def test_new_core_buy_sell_results_match_local_context_and_native_provenance(self):
+        from bot import multi_timeframe as model
+        from tests.test_multi_timeframe import MultiTimeframeTests
+        fixture = MultiTimeframeTests()
+        for offset in (0, 180, 345, -300):
+            for sell in (False, True):
+                for experimental in (False, True):
+                    feed = fixture.feed(sell=sell, broker_offset=offset)
+                    result = model.analyze_multi_timeframe(feed, fixture.now, experimental_demo=experimental)
+                    with self.subTest(offset=offset, sell=sell, experimental=experimental):
+                        self.assertEqual(result["state"], "signal", result)
+                        context = chart.current_timeframe_context(feed, observed_at=fixture.now, broker_offset_minutes=offset)
+                        self.assertEqual(context, result["timeframe_context"])
+                        draft = native.Draft(
+                            result["symbol"], result["direction"], Decimal("0.01"), Decimal(str(result["stop"])),
+                            Decimal(str(result["target"])), result["price_digits"],
+                            fixture.now + timedelta(seconds=30 if experimental else 10),
+                            **{key: result[key] for key in ("strategy_id", "strategy_version", "policy_id", "horizon_seconds",
+                                "strategy_fingerprint", "display_timeframe", "context_bar_times", "timeframe_context", "broker_utc_offset_minutes")},
+                            qualification_id="" if experimental else "b" * 64,
+                            signal_mode="experimental_demo" if experimental else "qualified", provisional=experimental,
+                            entry_window_seconds=30 if experimental else 10, cost_assumptions=result.get("cost_assumptions"),
+                            direction_bar_time=chart.utc(result["direction_bar_time"]),
+                            confirmation_bar_time=chart.utc(result["confirmation_bar_time"]), bar_time=chart.utc(result["bar_time"]),
+                        )
+                        native.require_qualified(draft, fixture.now)
+
+
 class QualifiedNativeTests(unittest.TestCase):
     def setUp(self):
         self.now = fixtures.MT5BridgeTests("test_exact_symbol_completed_bar_read_and_utc_payload")
@@ -178,12 +254,18 @@ class QualifiedNativeTests(unittest.TestCase):
         self.time = self.now.now
         self.draft = native.Draft("XAUUSD", "BUY", Decimal("0.01"), Decimal("2490"), Decimal("2520"), 2,
                                   self.time + timedelta(minutes=5), display_timeframe="M1",
-                                  strategy_id="mtf-ema-pullback-60m-v1", strategy_version=1,
-                                  policy_id="mtf-manual-demo-cost-risk-v1", horizon_seconds=3600,
+                                  strategy_id="mtf-ema-pullback-60m-v2", strategy_version=2,
+                                  policy_id="mtf-manual-demo-cost-risk-v2", horizon_seconds=3600,
                                   strategy_fingerprint="a" * 64, qualification_id="b" * 64,
                                   direction_bar_time=self.time - timedelta(minutes=15),
                                   confirmation_bar_time=self.time - timedelta(minutes=5),
                                   bar_time=self.time - timedelta(minutes=1))
+        self.draft = replace(self.draft,
+            context_bar_times={frame: market.utc_timestamp(market.latest_closed_bar(self.time.timestamp(), seconds, 0))
+                               for frame, seconds in (("H1", 3600), ("H4", 14400))},
+            timeframe_context={"trends": {frame: "BUY" for frame in market.TIMEFRAMES}, "alignment": "aligned",
+                               "confidence": "aligned", "counter_trend": False, "support": 2490.0, "resistance": 2520.0},
+            broker_utc_offset_minutes=0)
 
     def test_legacy_or_missing_qualification_never_operates_backend(self):
         for changed in (replace(self.draft, display_timeframe="M15"), replace(self.draft, qualification_id=""),

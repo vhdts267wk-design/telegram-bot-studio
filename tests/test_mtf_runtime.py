@@ -136,7 +136,8 @@ class MtfRuntimeTests(unittest.TestCase):
         keys = ("direction", "symbol", "strategy_version", "display_timeframe", "decision_time", "quote_time",
                 "bar_time", "confirmation_bar_time", "direction_bar_time", "entry", "stop", "target", "target2",
                 "entry_zone_low", "entry_zone_high", "original_stop_distance", "execution", "price_digits",
-                "account_mode", "volume", "nominal_reward_risk", "effective_reward_risk")
+                "account_mode", "volume", "nominal_reward_risk", "effective_reward_risk",
+                "context_bar_times", "timeframe_context", "broker_utc_offset_minutes")
         with pinned_synthetic_evidence(self.feed, self.now):
             original = self.qualified()
             for key in keys:
@@ -214,6 +215,70 @@ class MtfRuntimeTests(unittest.TestCase):
             self.assertTrue(mtf_runtime.eligible_payload(payload, updated, self.now))
             self.assertEqual(payload, original)
             self.assertNotEqual(multi_timeframe.analyze_multi_timeframe(updated, self.now)["entry"], payload["entry"])
+
+    def test_missing_tampered_or_numerical_confidence_context_cannot_authorize_a_frozen_offer(self):
+        with pinned_synthetic_evidence(self.feed, self.now):
+            original = {**self.qualified(), "workflow": "manual_ticket"}
+            for key, value in (("confidence", .99), ("alignment", "counter_trend"), ("counter_trend", True),
+                               ("support", float("nan")), ("resistance", -1), ("confidence", "strong")):
+                changed = deepcopy(original)
+                changed["timeframe_context"][key] = value
+                self.assertFalse(mtf_runtime.eligible_result(changed, self.now), key)
+            for frame in multi_timeframe.TIMEFRAME_SECONDS:
+                for value in ("SELL", "NEUTRAL", "UP", True):
+                    changed = deepcopy(original)
+                    changed["timeframe_context"]["trends"][frame] = value
+                    self.assertFalse(mtf_runtime.eligible_result(changed, self.now), (frame, value))
+            for key in ("trends", "support", "resistance", "confidence", "counter_trend", "alignment"):
+                changed = deepcopy(original)
+                del changed["timeframe_context"][key]
+                self.assertFalse(mtf_runtime.eligible_result(changed, self.now), key)
+            changed = deepcopy(original)
+            changed["timeframe_context"]["support"] -= 1
+            self.assertTrue(mtf_runtime.eligible_result(changed, self.now))
+            self.assertFalse(mtf_runtime.eligible_payload(changed, self.feed, self.now))
+
+    def test_both_higher_references_are_required_latest_closed_and_bound_to_broker_clock(self):
+        with pinned_synthetic_evidence(self.feed, self.now):
+            original = {**self.qualified(), "workflow": "manual_ticket"}
+            for frame in ("H1", "H4"):
+                seconds = multi_timeframe.TIMEFRAME_SECONDS[frame]
+                for delta in (-seconds, seconds, 1):
+                    changed = deepcopy(original)
+                    stamp = multi_timeframe._utc(changed["context_bar_times"][frame]) + timedelta(seconds=delta)
+                    changed["context_bar_times"][frame] = stamp.isoformat()
+                    self.assertFalse(mtf_runtime.eligible_result(changed, self.now), (frame, delta))
+                changed = deepcopy(original)
+                del changed["context_bar_times"][frame]
+                self.assertFalse(mtf_runtime.eligible_result(changed, self.now))
+            changed = dict(original, broker_utc_offset_minutes=0)
+            self.assertFalse(mtf_runtime.eligible_result(changed, self.now))
+            legacy = deepcopy(self.feed)
+            del legacy["timeframes"]["H4"]
+            self.assertFalse(mtf_runtime.eligible_payload(original, legacy, self.now))
+
+    def test_new_opposing_or_neutral_higher_context_invalidates_frozen_buy_and_sell(self):
+        for sell in (False, True):
+            feed = candle_fixtures.MultiTimeframeTests().feed(sell=sell)
+            with pinned_synthetic_evidence(feed, self.now):
+                original = dict(mtf_runtime.evaluate_feed(feed, self.now), workflow="manual_ticket")
+                self.assertEqual(original["state"], "signal", original)
+                for frame in ("H1", "H4"):
+                    changed = deepcopy(feed)
+                    changed["timeframes"][frame] = candle_fixtures.MultiTimeframeTests().feed(sell=not sell)["timeframes"][frame]
+                    self.assertEqual(mtf_runtime.evaluate_feed(changed, self.now)["reason"], "higher_timeframe_conflict")
+                    self.assertFalse(mtf_runtime.eligible_payload(original, changed, self.now))
+                    for bar in changed["timeframes"][frame]:
+                        bar.update(open=2000, high=2000.1, low=1999.9, close=2000)
+                    self.assertEqual(mtf_runtime.evaluate_feed(changed, self.now)["reason"], "higher_timeframe_neutral")
+                    self.assertFalse(mtf_runtime.eligible_payload(original, changed, self.now))
+
+    def test_five_frame_strategy_identity_rejects_old_three_frame_evidence(self):
+        report = synthetic_report(self.feed, self.now)
+        report["strategy"] = {**multi_timeframe.strategy_identity(),
+                              "strategy_id": "mtf-ema-pullback-60m-v1", "policy_id": "mtf-manual-demo-cost-risk-v1"}
+        with pinned_synthetic_evidence(self.feed, self.now, report=report):
+            self.assertEqual(mtf_runtime.evaluate_feed(self.feed, self.now)["reason"], "evidence_unavailable")
 
     def test_current_exposure_margin_cost_and_freshness_fail_closed_for_frozen_offer(self):
         with pinned_synthetic_evidence(self.feed, self.now):

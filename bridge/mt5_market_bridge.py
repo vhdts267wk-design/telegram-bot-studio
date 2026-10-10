@@ -25,7 +25,7 @@ POLL_SECONDS = 60
 REQUEST_TIMEOUT = 15
 MAX_QUOTE_AGE_SECONDS = 10
 FUTURE_TOLERANCE_SECONDS = 5
-TIMEFRAMES = {"M15": 900, "M5": 300, "M1": 60}
+TIMEFRAMES = {"H4": 14400, "H1": 3600, "M15": 900, "M5": 300, "M1": 60}
 FIXED_VOLUME = 0.01
 TERMINAL_FAILURE_MESSAGES = {
     "terminal_unavailable": "The MT5 client connection is unavailable. Check that the selected terminal is open and connected.",
@@ -215,8 +215,14 @@ def broker_timestamp_utc(value: Any, settings: Settings) -> int:
     return normalized
 
 
+def latest_closed_bar(now_seconds, seconds, broker_utc_offset_minutes):
+    """Floor on the verified broker clock before normalizing back to UTC."""
+    offset = validate_broker_utc_offset_minutes(broker_utc_offset_minutes) * 60
+    return int((now_seconds + offset) // seconds) * seconds - seconds - offset
+
+
 def closed_candles(mt5, settings, label, seconds, now_seconds):
-    # All three frames share the same UTC snapshot boundary; index zero is
+    # All five frames share the same UTC snapshot boundary; index zero is
     # always the forming bar and is never requested.
     rates = mt5.copy_rates_from_pos(settings.symbol, getattr(mt5, "TIMEFRAME_" + label), 1, BAR_COUNT)
     if rates is None or not 1 <= len(rates) <= BAR_COUNT:
@@ -232,7 +238,7 @@ def closed_candles(mt5, settings, label, seconds, now_seconds):
             raise MarketDataError("Incomplete broker candle.") from exc
         if (
             bar_time <= 0
-            or bar_time % seconds
+            or (bar_time + settings.broker_utc_offset_minutes * 60) % seconds
             or bar_time + seconds > now_seconds
             or bar_time in seen_times
             or volume < 0
@@ -244,7 +250,7 @@ def closed_candles(mt5, settings, label, seconds, now_seconds):
         candles.append({"time": utc_timestamp(bar_time), **prices, "tick_volume": volume})
     candles.sort(key=lambda candle: candle["time"])
     times = sorted(seen_times)
-    if times[-1] != int(now_seconds // seconds) * seconds - seconds:
+    if times[-1] != latest_closed_bar(now_seconds, seconds, settings.broker_utc_offset_minutes):
         raise MarketDataError("Required closed histories must be current.")
     # Broker session breaks are real missing intervals. Preserve them instead
     # of fabricating candles; the analyzer resets its indicator warmup after

@@ -100,17 +100,71 @@ def evaluate_feed(feed, now=None):
     result = multi_timeframe.analyze_multi_timeframe(feed, clock, experimental_demo=True) if experimental else multi_timeframe.analyze_multi_timeframe(feed, clock)
     if result.get("state") != "signal":
         return result
+    def blocked_with_context(reason="evidence_unavailable"):
+        # Keep causal observations available to an on-demand report, while
+        # withholding the actionable direction, entry and protection levels.
+        return {**blocked(reason), **{key: result[key] for key in (
+            "context_bar_times", "timeframe_context", "broker_utc_offset_minutes",
+        )}}
     if not entry_window_open(result, clock):
-        return blocked("entry_window_expired")
+        return blocked_with_context("entry_window_expired")
     if experimental:
         return result
     evidence = configured_evidence(clock)
     if not strategy_evidence.qualification_gate(result, evidence, now=clock):
-        return blocked()
+        return blocked_with_context()
     qualified = dict(result)
     qualified["qualification_id"] = evidence.artifact_sha256
     qualified["evidence_metrics"] = list(evidence.scenario_metrics)
     return qualified
+
+
+def timeframe_context_valid(result, *, require_aligned=True):
+    """Validate qualitative five-frame context and causal higher references.
+
+    This is a shape/provenance guard, never empirical qualification. A frozen
+    payload must additionally be compared with freshly recomputed market data.
+    """
+    try:
+        offset = multi_timeframe.broker_utc_offset_minutes(result["broker_utc_offset_minutes"])
+        context, references = result["timeframe_context"], result["context_bar_times"]
+        if (type(context) is not dict or set(context) != {
+                "trends", "alignment", "confidence", "counter_trend", "support", "resistance"}
+                or type(references) is not dict or set(references) != {"H1", "H4"}):
+            return False
+        trends = context["trends"]
+        if (type(trends) is not dict or set(trends) != set(multi_timeframe.TIMEFRAME_SECONDS)
+                or any(type(value) is not str or value not in {"BUY", "SELL", "NEUTRAL"} for value in trends.values())
+                or type(context["counter_trend"]) is not bool):
+            return False
+        direction = trends["M15"]
+        counter = direction != "NEUTRAL" and any(
+            trends[key] not in {direction, "NEUTRAL"} for key in ("H1", "H4")
+        )
+        aligned = direction != "NEUTRAL" and all(value == direction for value in trends.values())
+        if (context["counter_trend"] != counter
+                or context["alignment"] != ("counter_trend" if counter else "aligned" if aligned else "unconfirmed")
+                or context["confidence"] != ("reduced" if counter else "aligned" if aligned else "unconfirmed")):
+            return False
+        if require_aligned and (not aligned or result.get("direction") != direction):
+            return False
+        for key in ("support", "resistance"):
+            value = context[key]
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or not 0 < value < 1e9):
+                return False
+        if context["support"] is not None and context["resistance"] is not None and context["support"] > context["resistance"]:
+            return False
+        closed = multi_timeframe._utc(result["bar_time"]) + timedelta(seconds=60)
+        for key in ("H1", "H4"):
+            stamp = multi_timeframe._utc(references[key])
+            seconds = multi_timeframe.TIMEFRAME_SECONDS[key]
+            if (type(references[key]) is not str or stamp.microsecond
+                    or (stamp.timestamp() + offset * 60) % seconds
+                    or not timedelta(0) <= closed - stamp - timedelta(seconds=seconds) < timedelta(seconds=seconds)):
+                return False
+        return True
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return False
 
 
 def eligible_result(result, now=None):
@@ -118,6 +172,8 @@ def eligible_result(result, now=None):
     try:
         clock = _clock(now)
         if type(result) is not dict or result.get("state") != "signal":
+            return False
+        if not timeframe_context_valid(result):
             return False
         experimental = is_experimental_result(result)
         if experimental != (signal_mode() == multi_timeframe.EXPERIMENTAL_SIGNAL_MODE):
@@ -131,7 +187,8 @@ def eligible_result(result, now=None):
                 return False
         elif result.get("provisional") is True or result.get("signal_mode", "qualified") != "qualified":
             return False
-        expected_version = 2 if experimental else 1
+        expected_version = (multi_timeframe.EXPERIMENTAL_STRATEGY_VERSION if experimental
+                            else multi_timeframe.STRATEGY_VERSION)
         if type(result.get("strategy_version")) is not int or result["strategy_version"] != expected_version or result.get("display_timeframe") != "M1" or result.get("account_mode") != "demo" or result.get("volume") != 0.01:
             return False
         if type(result.get("symbol")) is not str or not result["symbol"] or type(result.get("price_digits")) is not int or not 0 <= result["price_digits"] <= 8:
@@ -144,7 +201,7 @@ def eligible_result(result, now=None):
             if stamp.tzinfo is None:
                 return False
             stamp = stamp.astimezone(timezone.utc)
-            if stamp.microsecond or stamp.timestamp() % seconds:
+            if stamp.microsecond or (stamp.timestamp() + result["broker_utc_offset_minutes"] * 60) % seconds:
                 return False
             stamps[key] = stamp + timedelta(seconds=seconds)
         decision = datetime.fromisoformat(result["decision_time"].replace("Z", "+00:00"))
@@ -240,6 +297,7 @@ def eligible_payload(payload, feed, now=None):
             return False
         if any(current.get(key) != payload.get(key) for key in (
             "bar_time", "direction_bar_time", "confirmation_bar_time", "strategy_fingerprint", "broker_fingerprint", "execution",
+            "context_bar_times", "timeframe_context", "broker_utc_offset_minutes",
         )):
             return False
         if experimental:
@@ -248,10 +306,14 @@ def eligible_payload(payload, feed, now=None):
                 return False
         elif current.get("cost_context") != payload.get("cost_context"):
             return False
-        for key, seconds in (("bar_time", 60), ("confirmation_bar_time", 300), ("direction_bar_time", 900)):
-            stamp = datetime.fromisoformat(payload[key].replace("Z", "+00:00")).astimezone(timezone.utc)
-            bars = feed["timeframes"][{60: "M1", 300: "M5", 900: "M15"}[seconds]]
-            if stamp.microsecond or stamp.timestamp() % seconds or stamp + timedelta(seconds=seconds) > clock:
+        references = {"M1": payload["bar_time"], "M5": payload["confirmation_bar_time"],
+                      "M15": payload["direction_bar_time"], **payload["context_bar_times"]}
+        for frame, reference in references.items():
+            seconds = multi_timeframe.TIMEFRAME_SECONDS[frame]
+            stamp = datetime.fromisoformat(reference.replace("Z", "+00:00")).astimezone(timezone.utc)
+            bars = feed["timeframes"][frame]
+            if (stamp.microsecond or (stamp.timestamp() + payload["broker_utc_offset_minutes"] * 60) % seconds
+                    or stamp + timedelta(seconds=seconds) > clock):
                 return False
             if not any(datetime.fromisoformat(bar["time"].replace("Z", "+00:00")).astimezone(timezone.utc) == stamp for bar in bars):
                 return False

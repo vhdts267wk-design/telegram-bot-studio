@@ -150,6 +150,20 @@ def prepare_draft(mt5, settings, ledger, preparation, now):
             reference = trade.utc_date(payload[key])
             if not any(trade.utc_date(row["time"]) == reference for row in current["timeframes"][frame]):
                 raise trade.GuardError("The completed timeframe reference is unavailable.")
+        try:
+            local_context = chart.current_timeframe_context(current, observed_at=now,
+                broker_offset_minutes=settings.market.broker_utc_offset_minutes)
+            chart.validate_timeframe_context(local_context, direction)
+            if local_context != payload["timeframe_context"]:
+                raise chart.OverlayError("The local five-timeframe context changed")
+            references = chart.validate_context_references(payload["context_bar_times"],
+                trigger=trade.utc_date(payload["bar_time"]).timestamp(), boundary=now.timestamp(),
+                broker_offset_minutes=settings.market.broker_utc_offset_minutes)
+            for frame, reference in references.items():
+                if trade.utc_date(current["timeframes"][frame][-1]["time"]) != reference:
+                    raise chart.OverlayError("The local higher-timeframe reference changed")
+        except chart.OverlayError:
+            raise trade.GuardError("Current aligned five-timeframe context could not be verified.") from None
         slippage = Decimal(str(costs["slippage_price"]))
         commission = Decimal(str(costs["commission_round_turn"]))
         loss = (abs(price - stop) + 2 * slippage) * Decimal(str(risk["loss_cash_per_price_unit"])) + commission
@@ -157,7 +171,7 @@ def prepare_draft(mt5, settings, ledger, preparation, now):
         if loss <= 0 or loss > Decimal(str(risk["equity"])) * Decimal("0.01") or gain / loss < Decimal("1.5") or risk["free_margin"] < 2 * risk["margin_required"]:
             raise trade.GuardError("The current cash risk, reward or margin guard failed.")
     except market.MarketDataError:
-        raise trade.GuardError("Current three-timeframe risk data is unavailable.") from None
+        raise trade.GuardError("Current five-timeframe risk data is unavailable.") from None
     return native.Draft(
         settings.market.symbol, direction, settings.volume, stop, target, digits, expires,
         **{key: payload[key] for key in ("display_timeframe", "strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint")},
@@ -168,6 +182,8 @@ def prepare_draft(mt5, settings, ledger, preparation, now):
         direction_bar_time=trade.utc_date(payload["direction_bar_time"]),
         confirmation_bar_time=trade.utc_date(payload["confirmation_bar_time"]),
         bar_time=trade.utc_date(payload["bar_time"]),
+        context_bar_times=payload["context_bar_times"], timeframe_context=payload["timeframe_context"],
+        broker_utc_offset_minutes=settings.market.broker_utc_offset_minutes,
     )
 
 
@@ -216,17 +232,17 @@ def validate_manual_offer(offer, settings, now):
     experimental = payload.get("signal_mode") == "experimental_demo"
     profile_valid = (
         payload.get("provisional") is True
-        and payload.get("strategy_id") == "mtf-ema-pullback-60m-demo-v2"
-        and type(payload.get("strategy_version")) is int and payload["strategy_version"] == 2
-        and payload.get("policy_id") == "mtf-manual-demo-estimated-cost-risk-v2"
+        and payload.get("strategy_id") == "mtf-ema-pullback-60m-demo-v3"
+        and type(payload.get("strategy_version")) is int and payload["strategy_version"] == 3
+        and payload.get("policy_id") == "mtf-manual-demo-estimated-cost-risk-v3"
         and type(payload.get("entry_window_seconds")) is int and payload["entry_window_seconds"] == 30
         and payload.get("qualification_id", "") == ""
         and "evidence_metrics" not in payload
     ) if experimental else (
         payload.get("provisional") is False
-        and payload.get("strategy_id") == "mtf-ema-pullback-60m-v1"
-        and type(payload.get("strategy_version")) is int and payload["strategy_version"] == 1
-        and payload.get("policy_id") == "mtf-manual-demo-cost-risk-v1"
+        and payload.get("strategy_id") == "mtf-ema-pullback-60m-v2"
+        and type(payload.get("strategy_version")) is int and payload["strategy_version"] == 2
+        and payload.get("policy_id") == "mtf-manual-demo-cost-risk-v2"
         and payload.get("signal_mode", "qualified") == "qualified"
         and type(payload.get("entry_window_seconds", 10)) is int and payload.get("entry_window_seconds", 10) == 10
         and "cost_assumptions" not in payload
@@ -241,7 +257,13 @@ def validate_manual_offer(offer, settings, now):
         or type(payload.get("horizon_seconds")) is not int or payload["horizon_seconds"] != 3600
         or any(type(payload.get(key)) is not str or re.fullmatch(r"[0-9a-f]{64}", payload[key]) is None for key in ("strategy_fingerprint", "broker_fingerprint"))
     ):
-        raise trade.GuardError("A complete three-timeframe manual Demo signal profile is required.")
+        raise trade.GuardError("A complete five-timeframe manual Demo signal profile is required.")
+    try:
+        if chart.validate_broker_offset(payload.get("broker_utc_offset_minutes")) != settings.market.broker_utc_offset_minutes:
+            raise chart.OverlayError("Changed broker offset")
+        chart.validate_timeframe_context(payload.get("timeframe_context"), payload["direction"])
+    except chart.OverlayError:
+        raise trade.GuardError("A complete aligned five-timeframe manual Demo context is required.") from None
     if experimental:
         try:
             chart.validate_cost_assumptions(payload.get("cost_assumptions"))
@@ -255,8 +277,13 @@ def validate_manual_offer(offer, settings, now):
         raise trade.GuardError("The manual M1 entry window of " + str(window) + " seconds or its deadline expired.")
     for key, seconds in (("bar_time", 60), ("confirmation_bar_time", 300), ("direction_bar_time", 900)):
         stamp = trade.utc_date(payload[key])
-        if stamp.microsecond or stamp.timestamp() % seconds or not timedelta(0) <= bar + timedelta(minutes=1) - (stamp + timedelta(seconds=seconds)) < timedelta(seconds=seconds):
+        if stamp.microsecond or stamp.timestamp() != market.latest_closed_bar(bar.timestamp() + 60, seconds, settings.market.broker_utc_offset_minutes):
             raise trade.GuardError("The closed timeframe references are invalid.")
+    try:
+        chart.validate_context_references(payload.get("context_bar_times"), trigger=bar.timestamp(),
+            boundary=now.timestamp(), broker_offset_minutes=settings.market.broker_utc_offset_minutes)
+    except chart.OverlayError:
+        raise trade.GuardError("The closed H1/H4 context references are invalid.") from None
     entry, stop, target = (trade.positive_decimal(payload.get(key)) for key in ("entry", "stop", "target"))
     if not (stop < entry < target if payload["direction"] == "BUY" else target < entry < stop) or trade.positive_decimal(payload.get("max_drift_r")) != trade.MAX_DRIFT_R:
         raise trade.GuardError("The frozen manual protection or drift limit is invalid.")

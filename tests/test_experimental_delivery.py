@@ -34,7 +34,8 @@ class ExperimentalDeliveryTests(unittest.IsolatedAsyncioTestCase):
         text = self.bot.send_message.await_args.args[1]
         for detail in ("الأداء غير مثبت", "التكاليف افتراضات تقديرية", "30 ثانية", "Buy أو Sell", "0.01"):
             self.assertIn(detail, text)
-        for detail in ("لقيت فرصة", "الدخول المقترح", "SL وقف", "TP1", "TP2", "السبب", "ما في تنفيذ تلقائي"):
+        for detail in ("لقيت فرصة", "الدخول المقترح", "SL وقف", "TP1", "TP2", "السبب", "ما في تنفيذ تلقائي",
+                       "H1", "H4", "متوافقة مع الدخول", "دعم", "مقاومة", "ليست نسبة نجاح"):
             self.assertIn(detail, text)
         self.assertLess(len(text), 1400)
         self.assertNotIn("مدة تقييم النجاح", text)

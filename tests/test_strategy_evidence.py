@@ -61,7 +61,8 @@ def report(*, wins=180, total=200):
             "files": [{"name": name + ".jsonl", "kind": kind, "timeframe": timeframe,
                        "sha256": "d" * 64} for name, kind, timeframe in
                       (("M1", "candles", "M1"), ("M5", "candles", "M5"),
-                       ("M15", "candles", "M15"), ("ticks", "ticks", None))],
+                       ("M15", "candles", "M15"), ("H1", "candles", "H1"),
+                       ("H4", "candles", "H4"), ("ticks", "ticks", None))],
             "cost_scenarios": [cost],
             "execution_specs": {"tick_size": .01, "point": .01, "digits": 2, "stops_level": 0,
                                 "verified": True, "evidence_sha256": "b" * 64,

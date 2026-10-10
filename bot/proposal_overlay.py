@@ -154,7 +154,7 @@ def build_chart_overlay(offer, device, feed, now):
             "entry": payload["entry"], **zone, "stop": payload["stop"], "target": payload["target"],
             "price_digits": payload["price_digits"], "execution": dict(payload["execution"]),
             "bar_time": bar_time.isoformat(), "expires_at": expiry.isoformat(),
-            **{key: payload[key] for key in ("strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint", "direction_bar_time", "confirmation_bar_time")},
+            **{key: payload[key] for key in ("strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint", "direction_bar_time", "confirmation_bar_time", "context_bar_times", "timeframe_context", "broker_utc_offset_minutes")},
         }
         if mtf_runtime.is_experimental_result(payload):
             dto.update(signal_mode="experimental_demo", provisional=True, entry_window_seconds=30,

@@ -137,12 +137,12 @@ def validate_feed(payload, now, expected_symbol=None):
         if not timedelta(0) <= now - as_of <= timedelta(seconds=30) or type(offset) is not int or not -720 <= offset <= 840 or offset % 15:
             raise ValueError("Invalid normalized snapshot clock")
         frames = payload.get("timeframes")
-        if type(frames) is not dict or set(frames) != {"M15", "M5", "M1"}:
-            raise ValueError("All three timeframes are required")
+        if type(frames) is not dict or set(frames) != {"M15", "M5", "M1", "H1", "H4"}:
+            raise ValueError("All five timeframes are required")
         clean_frames = {"M15": clean_bars}
         if frames["M15"] != payload["candles"]:
             raise ValueError("Conflicting M15 history")
-        for frame, seconds in (("M5", 300), ("M1", 60)):
+        for frame, seconds in (("M5", 300), ("M1", 60), ("H1", 3600), ("H4", 14400)):
             rows = frames[frame]
             if type(rows) is not list or not 1 <= len(rows) <= 64:
                 raise ValueError("Insufficient timeframe history")
@@ -151,7 +151,7 @@ def validate_feed(payload, now, expected_symbol=None):
                 if type(row) is not dict or set(row) != {"time", "open", "high", "low", "close", "tick_volume"}:
                     raise ValueError("Invalid timeframe candle")
                 opened = _utc(row["time"])
-                if opened.microsecond or int(opened.timestamp()) % seconds or opened + timedelta(seconds=seconds) > now or opened < now - timedelta(days=30) or (prior is not None and opened <= prior):
+                if opened.microsecond or (int(opened.timestamp()) + offset * 60) % seconds or opened + timedelta(seconds=seconds) > as_of or opened < now - timedelta(days=30) or (prior is not None and opened <= prior):
                     raise ValueError("Invalid completed candle time")
                 prices = {name: _number(row[name]) for name in ("open", "high", "low", "close")}
                 if prices["low"] > min(prices["open"], prices["close"]) or prices["high"] < max(prices["open"], prices["close"]) or prices["low"] > prices["high"]:
@@ -882,7 +882,7 @@ async def reviews_command(update, context):
         if historical:
             await message.reply_text(
                 "أرشيف السجل الورقي القديم — عرض عند الطلب فقط.\n"
-                "هذه سجلات محفوظة كما كانت، ولا تُحدّث الآن. لا تخص استراتيجية M15/M5/M1 الحالية أو تقييمها لمدة 60 دقيقة، "
+                "هذه سجلات محفوظة كما كانت، ولا تُحدّث الآن. لا تخص استراتيجية H4/H1/M15/M5/M1 الحالية أو تقييمها لمدة 60 دقيقة، "
                 "ولا تُستخدم كأدلة لتأهيل الإشارات أو لإيقافها. /signals لعرض الحالة الحالية.",
                 parse_mode=None,
             )
@@ -918,7 +918,8 @@ async def watch_command(update, context):
         if mtf_runtime.signal_mode() == "experimental_demo":
             await message.reply_text(
                 "تم تفعيل متابعة إشارات Demo التجريبية — الأداء غير مثبت؛ التكاليف افتراضات تقديرية غير موثّقة.\n"
-                "M15 للاتجاه، M5 لتأكيد ارتداد خلال آخر 3 شموع قبل شمعة التأكيد، وM1 لتوقيت الدخول؛ شموع مكتملة وأسعار حديثة.\n"
+                "H4 للاتجاه العام والدعم والمقاومة، H1 للاتجاه القريب، M15 للتأكيد، وM5/M1 للدخول؛ شموع مكتملة وأسعار حديثة. تعارض H1 أو H4 يعني الانتظار.\n"
+                "ارتداد M5 خلال آخر 3 شموع قبل شمعة التأكيد؛ يبقى كسر M1 بإغلاق مكتمل مطلوباً.\n"
                 "تظهر الإشارة عند اجتياز فلاتر المخاطر والسبريد والنشاط: Demo فقط بحجم 0.01، دون صفقات أو أوامر معلّقة، ومخاطرة مقدّرة بعد التكاليف حتى 1% من حقوق الحساب (Equity).\n"
                 "صلاحية الدخول والتجهيز 30 ثانية من إغلاق M1؛ يعاد فحص السعر والسبريد والمخاطر قبل التجهيز. تُذكر قيم العمولة والانزلاق المقدّرة مع كل إشارة.\n"
                 "معيار تقييم التجربة: TP1 قبل SL خلال 60 دقيقة من الدخول وبعد التكاليف؛ لا توجد نسبة نجاح مثبتة.\n"
@@ -928,7 +929,7 @@ async def watch_command(update, context):
             )
             return
         await message.reply_text(
-            "تم تفعيل المتابعة: M15 للاتجاه، M5 للتأكيد، وM1 لتوقيت الدخول، من شموع مكتملة وأسعار حديثة.\n"
+            "تم تفعيل المتابعة: H4 للاتجاه العام، H1 للاتجاه القريب، M15 للتأكيد، وM5/M1 للدخول، من شموع مكتملة وأسعار حديثة. التعارض يعني الانتظار.\n"
             "اقتراح الصفقة مشروط بتوافق الأطر وفلاتر المخاطر والسبريد والنشاط، وبأدلة خارج العينة: 200 صفقة مستقلة على الأقل والحد الأدنى لفاصل الثقة 95% ≥70% بعد التكاليف.\n"
             "النجاح للاختبار: TP1 قبل SL خلال 60 دقيقة من الدخول؛ انتهاء المدة يُحسب غير ناجح. الأداء التاريخي لا يضمن نتيجة الصفقة.\n"
             "التنبيهات التلقائية فقط عند ظهور فرصة جديدة اجتازت الشروط؛ لا تصلك تقارير دورية أو رسائل انتظار. التنفيذ يظل يدوياً لكل صفقة: تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك.\n"

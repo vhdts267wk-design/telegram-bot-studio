@@ -217,8 +217,10 @@ async def claim_offer(pool, bot_id, device_id, now, *, qualification_id=None, st
         return None
     if not hex_digest(strategy_fingerprint):
         return None
-    required_context = {"direction", "bar_time", "confirmation_bar_time", "direction_bar_time", "broker_fingerprint", "policy_id", "cost_context", "execution"}
+    required_context = {"direction", "bar_time", "confirmation_bar_time", "direction_bar_time", "context_bar_times", "timeframe_context", "broker_utc_offset_minutes", "broker_fingerprint", "policy_id", "cost_context", "execution"}
     if type(proposal_context) is not dict or set(proposal_context) != required_context:
+        return None
+    if not mtf_runtime.timeframe_context_valid(proposal_context):
         return None
     if experimental:
         return await _claim_experimental_offer(pool, bot_id, device_id, now, strategy_fingerprint, proposal_context)
@@ -231,10 +233,10 @@ async def claim_offer(pool, bot_id, device_id, now, *, qualification_id=None, st
             JOIN market_subscriptions AS subscription
                 ON subscription.bot_id = offer.bot_id AND subscription.chat_id = offer.chat_id
             WHERE offer.bot_id = $1 AND offer.device_id = $2 AND offer.status = 'requested'
-                AND offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-v1'
+                AND offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-v2'
                 AND offer.payload->>'qualification_id' = $6
                 AND offer.payload->>'strategy_fingerprint' = $7
-                AND offer.payload->>'strategy_version' = '1'
+                AND offer.payload->>'strategy_version' = '2'
                 AND offer.payload->>'horizon_seconds' = '3600'
                 AND offer.payload->>'display_timeframe' = 'M1'
                 AND offer.payload @> $8::jsonb
@@ -279,9 +281,9 @@ async def _claim_experimental_offer(pool, bot_id, device_id, now, fingerprint, p
             JOIN market_subscriptions AS subscription
                 ON subscription.bot_id = offer.bot_id AND subscription.chat_id = offer.chat_id
             WHERE offer.bot_id = $1 AND offer.device_id = $2 AND offer.status = 'requested'
-                AND offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-demo-v2'
-                AND offer.payload->>'strategy_version' = '2'
-                AND offer.payload->>'policy_id' = 'mtf-manual-demo-estimated-cost-risk-v2'
+                AND offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-demo-v3'
+                AND offer.payload->>'strategy_version' = '3'
+                AND offer.payload->>'policy_id' = 'mtf-manual-demo-estimated-cost-risk-v3'
                 AND offer.payload->>'signal_mode' = 'experimental_demo'
                 AND offer.payload->'provisional' = 'true'::jsonb
                 AND offer.payload->>'entry_window_seconds' = '30'

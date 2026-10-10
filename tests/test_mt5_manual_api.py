@@ -148,6 +148,7 @@ class ManualAPITests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(preparation["expires_at"], self.offer["expires_at"].isoformat())
             expected_context = {key: self.offer["payload"][key] for key in (
                 "direction", "bar_time", "confirmation_bar_time", "direction_bar_time",
+                "context_bar_times", "timeframe_context", "broker_utc_offset_minutes",
                 "broker_fingerprint", "policy_id", "cost_context", "execution")}
             claim.assert_awaited_once_with(self.service.pool, 991, DEVICE, NOW,
                                            qualification_id=self.pin,
