@@ -31,7 +31,7 @@ class MtfHandlerTextTests(unittest.IsolatedAsyncioTestCase):
                 await command(self.update, self.context)
                 self.message.reply_text.assert_awaited_once()
                 text = self.message.reply_text.await_args.args[0]
-                for phrase in ("M15", "M5", "M1", "200", "مستقلة", "Wilson", "ذي الطرفين", "95%", "70%", "التكاليف", "10 ثوانٍ", "60 دقيقة", "5 ثوانٍ", "كل دقيقة"):
+                for phrase in ("M15", "M5", "M1", "H1", "H4", "200", "مستقلة", "Wilson", "ذي الطرفين", "95%", "70%", "التكاليف", "10 ثوانٍ", "60 دقيقة", "5 ثوانٍ", "لا تقارير دورية"):
                     self.assertIn(phrase, text)
                 self.assertIn("غياب الأدلة", text)
                 self.assertNotIn("Accept", text)
@@ -63,7 +63,7 @@ class MtfHandlerTextTests(unittest.IsolatedAsyncioTestCase):
 
     def test_command_descriptions_do_not_advertise_old_cadence_or_automatic_accept(self):
         commands = dict(handlers.BOT_COMMANDS)
-        for frame in ("M15", "M5", "M1"):
+        for frame in ("M15", "M5", "M1", "H1", "H4"):
             self.assertIn(frame, commands["market"])
         self.assertIn("خارج العينة", commands["signals"])
         self.assertIn("ليست تأهيل", commands["reviews"])
@@ -103,8 +103,8 @@ class ExperimentalMtfHandlerTextTests(unittest.IsolatedAsyncioTestCase):
                     await command(self.update, self.context)
                     text = self.message.reply_text.await_args.args[0]
                     for phrase in ("Demo", "الأداء غير مثبت", "التكاليف افتراضات تقديرية غير موثّقة",
-                                   "M15", "M5", "M1", "3 شموع قبل شمعة التأكيد", "30 ثانية",
-                                   "60 دقيقة", "كل 5 ثوانٍ", "كل دقيقة", "1% من حقوق الحساب (Equity)"):
+                                   "M15", "M5", "M1", "H1", "H4", "3 شموع قبل شمعة التأكيد", "30 ثانية",
+                                   "60 دقيقة", "كل 5 ثوانٍ", "لا تقارير دورية", "1% من حقوق الحساب (Equity)"):
                         self.assertIn(phrase, text)
                     for phrase in ("200", "70%", "Wilson", "10 ثوانٍ من إغلاق M1", "غياب الأدلة"):
                         self.assertNotIn(phrase, text)
@@ -146,6 +146,8 @@ class ExperimentalMtfHandlerTextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("اقتراح المؤهل", text)
         self.assertIn("فقط عند ظهور فرصة Demo تجريبية جديدة", text)
         self.assertIn("لا تصلك تقارير دورية أو رسائل انتظار", text)
+        self.assertIn("H1", text)
+        self.assertIn("H4", text)
 
     async def test_reference_service_ignores_mt5_experimental_setting(self):
         self.service.source = "reference"
@@ -182,7 +184,8 @@ class MtfMediaAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(market_monitor, "market_command", new_callable=AsyncMock) as analysis:
                     await handlers.gold_photo(self.update, self.context)
                     analysis.assert_awaited_once_with(self.update, self.context)
-                self.assertIn("M15 وM5 وM1", self.message.reply_text.await_args.args[0])
+                for frame in ("M1", "M5", "M15", "H1", "H4"):
+                    self.assertIn(frame, self.message.reply_text.await_args.args[0])
                 self.photo.get_file.assert_not_awaited()
                 self.client.assert_not_called()
                 self.vision.assert_not_awaited()

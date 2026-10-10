@@ -16,7 +16,7 @@ class ChartAnalysisTests(unittest.TestCase):
         self.assertNotIn("SL:", text)
         self.assertNotIn("الدخول المقترح:", text)
 
-    def test_public_names_are_the_three_timeframe_formatters(self):
+    def test_public_names_are_the_five_timeframe_formatters(self):
         self.assertIs(chart_analysis.format_chart_analysis, mtf_presentation.format_analysis)
         self.assertIs(chart_analysis.format_chart_proposal, mtf_presentation.format_proposal)
 
@@ -31,12 +31,12 @@ class ChartAnalysisTests(unittest.TestCase):
                 self.assert_no_trade(chart_analysis.format_chart_proposal(legacy, execution_enabled=True))
                 self.assert_no_trade(chart_analysis.format_chart_analysis(self.feed, legacy, self.now))
 
-    def test_public_api_requires_qualified_fresh_three_frame_result(self):
+    def test_public_api_requires_qualified_fresh_five_frame_result(self):
         with fixtures.pinned_synthetic_evidence(self.feed, self.now):
             self.assert_no_trade(chart_analysis.format_chart_proposal(self.candidate))
             result = mtf_runtime.evaluate_feed(self.feed, self.now)
             text = chart_analysis.format_chart_analysis(self.feed, result, self.now)
-            self.assertIn("M15 / M5 / M1", text)
+            self.assertIn("M1 / M5 / M15 / H1 / H4", text)
             self.assertEqual(text.count("شراء BUY"), 1)
             self.assertIn("موافقتك اليدوية لكل صفقة", text)
 

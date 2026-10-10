@@ -27,19 +27,24 @@ def proposal():
         "stop": 2490.0, "target": 2520.0, "price_digits": 2,
         "execution": deepcopy(EXECUTION), "bar_time": (NOW - timedelta(minutes=1)).isoformat(),
         "expires_at": (NOW + timedelta(minutes=4)).isoformat(),
-        "strategy_id": "mtf-ema-pullback-60m-v1", "strategy_version": 1,
-        "policy_id": "mtf-manual-demo-cost-risk-v1", "horizon_seconds": 3600,
+        "strategy_id": "mtf-ema-pullback-60m-v2", "strategy_version": 2,
+        "policy_id": "mtf-manual-demo-cost-risk-v2", "horizon_seconds": 3600,
         "strategy_fingerprint": "a" * 64, "qualification_id": "b" * 64,
         "direction_bar_time": (NOW - timedelta(minutes=15)).isoformat(),
         "confirmation_bar_time": (NOW - timedelta(minutes=5)).isoformat(),
+        "broker_utc_offset_minutes": 180,
+        "context_bar_times": {frame: datetime.fromtimestamp(chart.latest_closed_reference(
+            NOW.timestamp(), seconds, 180), timezone.utc).isoformat() for frame, seconds in (("H1", 3600), ("H4", 14400))},
+        "timeframe_context": {"trends": {frame: "BUY" for frame in chart.FRAME_SECONDS}, "alignment": "aligned",
+                              "confidence": "aligned", "counter_trend": False, "support": 2490.0, "resistance": 2520.0},
     }
 
 
 def experimental_proposal():
     value = proposal()
     value.pop("qualification_id")
-    value.update(strategy_id="mtf-ema-pullback-60m-demo-v2", strategy_version=2,
-                 policy_id="mtf-manual-demo-estimated-cost-risk-v2", signal_mode="experimental_demo",
+    value.update(strategy_id="mtf-ema-pullback-60m-demo-v3", strategy_version=3,
+                 policy_id="mtf-manual-demo-estimated-cost-risk-v3", signal_mode="experimental_demo",
                  provisional=True, entry_window_seconds=30, expires_at=(NOW + timedelta(seconds=30)).isoformat(),
                  cost_assumptions={"verified": False, "method": "spread_tick_floor_v1", "commission_round_turn": 0.2,
                                    "slippage_price": 0.1, "spread_price": 0.2, "tick_size": 0.01})
@@ -49,14 +54,15 @@ def experimental_proposal():
 class ValidationTests(unittest.TestCase):
     def validate(self, value=None, *, execution=None, quote=None, now=NOW):
         return chart.validate_proposal(value if value is not None else proposal(), symbol="XAUUSD",
-                                       execution=execution or EXECUTION, quote=quote or QUOTE, observed_at=now)
+                                       execution=execution or EXECUTION, quote=quote or QUOTE, observed_at=now,
+                                       broker_offset_minutes=180)
 
     def test_experimental_profile_requires_distinct_ids_explicit_estimates_and_window(self):
         value = experimental_proposal()
         later = NOW + timedelta(seconds=20)
         self.assertTrue(self.validate(value, quote=dict(QUOTE, time=later.isoformat()), now=later).experimental)
         self.assertFalse(self.validate().experimental)
-        for field, changed in (("strategy_id", "mtf-ema-pullback-60m-v1"), ("provisional", False),
+        for field, changed in (("strategy_id", "mtf-ema-pullback-60m-v2"), ("provisional", False),
                                ("strategy_version", 1), ("entry_window_seconds", 10),
                                ("qualification_id", "b" * 64), ("cost_assumptions", None),
                                ("expires_at", (NOW + timedelta(seconds=31)).isoformat())):
@@ -80,6 +86,7 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(self.validate(value).entry, Decimal("2500"))
         value = proposal()
         value.update(direction="SELL", stop=2510.0, target=2480.0)
+        value["timeframe_context"]["trends"] = {frame: "SELL" for frame in chart.FRAME_SECONDS}
         result = self.validate(value)
         self.assertEqual((result.direction, result.stop, result.target), ("SELL", Decimal("2510"), Decimal("2480")))
 
@@ -107,6 +114,32 @@ class ValidationTests(unittest.TestCase):
         del changed["qualification_id"]
         with self.assertRaises(chart.OverlayError):
             self.validate(changed)
+
+    def test_five_frame_context_and_offset_causal_higher_references_are_required(self):
+        mutations = [
+            lambda value: value.pop("context_bar_times"),
+            lambda value: value["context_bar_times"].pop("H4"),
+            lambda value: value["context_bar_times"].update(H1=NOW.isoformat()),
+            lambda value: value["context_bar_times"].update(H4=NOW.replace(hour=8, minute=0).isoformat()),
+            lambda value: value.update(broker_utc_offset_minutes=0),
+            lambda value: value.update(broker_utc_offset_minutes=True),
+            lambda value: value["timeframe_context"]["trends"].pop("H1"),
+            lambda value: value["timeframe_context"]["trends"].update(H4="SELL"),
+            lambda value: value["timeframe_context"]["trends"].update(H1="NEUTRAL"),
+            lambda value: value["timeframe_context"].update(alignment="counter_trend", confidence="reduced", counter_trend=True),
+            lambda value: value["timeframe_context"].update(support=float("nan")),
+            lambda value: value["timeframe_context"].update(resistance=True),
+            lambda value: value.update(strategy_id="mtf-ema-pullback-60m-v1", strategy_version=1),
+        ]
+        for mutate in mutations:
+            value = proposal()
+            mutate(value)
+            with self.subTest(mutation=mutate), self.assertRaises(chart.OverlayError):
+                self.validate(value)
+        # The configured +03:00 broker's last completed H4 began at 05:00 UTC,
+        # whereas flooring UTC directly would incorrectly select 08:00 UTC.
+        self.assertEqual(chart.utc(proposal()["context_bar_times"]["H4"]).hour, 5)
+        self.validate()
 
     def test_original_reference_bars_remain_fixed_until_the_original_expiry(self):
         later = NOW + timedelta(minutes=2)

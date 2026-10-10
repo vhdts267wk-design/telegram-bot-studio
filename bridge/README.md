@@ -5,7 +5,7 @@ The manually started helpers connect to the selected MetaTrader 5 desktop termin
 | Helper | Purpose | Orders |
 | --- | --- | --- |
 | `mt5_market_bridge.py` | Upload gold quotes and completed M15 candles | Read-only; never places, changes or closes orders |
-| `mt5_manual_bridge.py` | Upload M15/M5/M1 and prepare a native ticket for human review | Paired Demo 0.01 only; never submits an order |
+| `mt5_manual_bridge.py` | Upload M1/M5/M15/H1/H4 and prepare a native ticket for human review | Paired Demo 0.01 only; never submits an order |
 | `start_mt5_bridge.ps1` / `mt5_trade_bridge.py` | Upload market data and process owner-approved Telegram requests | Demo account only, exactly 0.01 lot per accepted offer |
 
 The bot defaults to paper signals and `MT5_TRADING_ENABLED=false`. The Demo helper needs explicit enablement on the server and a local confirmation. This release does not support Real accounts or other lot sizes. Keep the SDK on Windows; Railway never connects directly to MT5 or sends an order.
@@ -13,6 +13,18 @@ The bot defaults to paper signals and `MT5_TRADING_ENABLED=false`. The Demo help
 For the current manual-ticket workflow, use [MANUAL-TICKETS.md](MANUAL-TICKETS.md). The default `MT5_SIGNAL_MODE=qualified` requires verified costs and reviewed performance evidence. Explicit `MT5_SIGNAL_MODE=experimental_demo` instead emits provisional Demo signals with labelled `spread_tick_floor_v1` cost assumptions and a **30-second window after the M1 close**; it does not certify performance or enable automatic execution. The local manual helper retains all quote, identity, grid, exposure, 1% cash-risk, reward/risk and margin checks and recomputes risk with at least the frozen estimates. Use display indicator **2.11** on any **XAUUSD chart timeframe** to see each fresh valid opportunity automatically and receive one native MT5 popup after its levels are successfully drawn. Waiting and unavailable proposals remain quiet. The indicator still validates the completed M1 trigger; keep a separate **XAUUSD M1** chart open for the helper to activate during native ticket preparation. The SDK remains read-only in this workflow; the user reviews the native ticket and presses Buy/Sell themselves. The legacy order helper described below is a separate workflow.
 
 ## Shared requirements
+
+The current manual strategy uses H4 for the overall trend, H1 for the near
+trend, M15 for confirmation and M5/M1 for entry timing. Every stream needs at
+least 22 contiguous completed bars, with verified broker-offset boundaries.
+An H1/H4 conflict or neutral higher trend waits quietly; reduced qualitative
+confidence describes disagreement, not a probability of winning. Telegram
+opportunity messages include H1/H4 alignment and the range of the last 20
+completed H4 bars as observed support/resistance. On-demand commands explain
+waiting reasons; automatic alerts remain limited to new eligible opportunities.
+The qualified `mtf-ema-pullback-60m-v2` and experimental Demo
+`mtf-ema-pullback-60m-demo-v3` profiles invalidate older three-frame proposals
+and evidence. Demo 0.01, expiry and final manual Buy/Sell requirements still apply.
 
 Use an awake Windows x64 computer or Windows VPS, the broker's MT5 desktop terminal, and compatible x64 Python. Open the **exact intended terminal yourself**, log in there and confirm that it is connected. Neither helper accepts an account password or changes the logged-in account. This is not a mobile or web MT5 connection.
 

@@ -22,7 +22,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CallbackQueryHandler, CommandHandler
 
-from bot import manual_ticket_store, market_monitor, market_store, mtf_runtime, proposal_overlay, trade_store
+from bot import manual_ticket_store, market_monitor, market_store, mtf_presentation, mtf_runtime, proposal_overlay, trade_store
 
 
 logger = logging.getLogger(__name__)
@@ -117,7 +117,7 @@ def _execution_metadata(feed):
 
 
 def _normalise_signal(result, feed):
-    """Preserve an empirically qualified executable entry and frozen SL/TP."""
+    """Preserve an eligible five-timeframe entry and frozen SL/TP."""
     if not mtf_runtime.eligible_result(result):
         raise ValueError("Qualified multi-timeframe evidence is required.")
     tick, digits, quantum = _execution_metadata(feed)
@@ -181,8 +181,8 @@ def _fresh_feed(snapshot, device, now) -> dict | None:
         if not _demo_policy(device):
             return None
         _positive(device["volume"])
-        # Legacy validation accepts its original schema; the device binding is
-        # checked separately against the raw authenticated cached envelope.
+        # Validate the five closed streams; device binding is checked
+        # separately against the raw authenticated cached envelope.
         clean = {key: value for key, value in payload.items() if key != "device_id"}
         validated = market_monitor.validate_feed(clean, now, symbol)
         _execution_metadata(validated)
@@ -465,7 +465,8 @@ def _manual_offer_text(payload, expires_at) -> str:
         f"منطقة الدخول: {zone['entry_zone_low']:.{digits}f} – {zone['entry_zone_high']:.{digits}f}",
         f"SL وقف: {payload['stop']:.{digits}f} | TP1 هدف: {payload['target']:.{digits}f} | TP2: {payload['target2']:.{digits}f}",
         f"الحجم: {payload['volume']:g} lot | العائد/المخاطرة بعد التكاليف: {payload['effective_reward_risk']:.2f}:1.",
-        "السبب: اتجاه M15، تأكيد ارتداد M5، وكسر M1 بإغلاق مكتمل؛ اجتازت فلاتر المخاطر والسبريد.",
+        *mtf_presentation.context_lines(payload, digits),
+        "السبب: H4 اتجاه عام، H1 قريب، M15 تأكيد، M5/M1 دخول؛ اجتازت فلاتر المخاطر والسبريد.",
         f"مهلة الدخول: {seconds} ثانية من إغلاق M1؛ آخر وقت للتجهيز: {_utc(expires_at):%H:%M:%S} UTC.",
     ]
     if experimental:

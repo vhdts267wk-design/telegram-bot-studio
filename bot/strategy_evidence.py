@@ -18,7 +18,7 @@ import re
 from types import MappingProxyType
 
 
-STRATEGY_ID = "mtf-ema-pullback-60m-v1"
+STRATEGY_ID = "mtf-ema-pullback-60m-v2"
 HORIZON_SECONDS = 3600
 MIN_OOS_TRADES = 200
 MIN_LOWER_BOUND = 0.70
@@ -319,8 +319,8 @@ def validate_evidence_report(report, *, identity=None):
         execution = _execution_specs(dataset["execution_specs"], start, end)
         ranges = _splits(report["splits"], start, end)
         files = dataset["files"]
-        if type(files) is not list or not 4 <= len(files) <= 20:
-            raise ValueError("M1/M5/M15 and tick datasets are required")
+        if type(files) is not list or not 6 <= len(files) <= 20:
+            raise ValueError("M1/M5/M15/H1/H4 and tick datasets are required")
         kinds = set()
         names = set()
         for item in files:
@@ -331,7 +331,7 @@ def validate_evidence_report(report, *, identity=None):
                 raise ValueError("Invalid dataset file fingerprint")
             names.add(item["name"])
             kinds.add((item["kind"], item["timeframe"]))
-        if not {("candles", "M1"), ("candles", "M5"), ("candles", "M15"), ("ticks", None)} <= kinds:
+        if not {("candles", "M1"), ("candles", "M5"), ("candles", "M15"), ("candles", "H1"), ("candles", "H4"), ("ticks", None)} <= kinds:
             raise ValueError("Missing multi-timeframe or tick dataset")
         risk = dataset["risk_model"]
         if type(risk) is not dict or set(risk) != {"mode", "equity", "free_margin", "margin_required"} or risk["mode"] != "fixed_demo_0.01_simulation":

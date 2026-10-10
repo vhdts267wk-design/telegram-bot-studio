@@ -274,7 +274,7 @@ def install_routes(app, application, settings):
             qualified = mtf_runtime.evaluate_feed(feed, now)
             if not mtf_runtime.eligible_result(qualified, now):
                 return manual_poll_response()
-            proposal_context = {key: qualified[key] for key in ("direction", "bar_time", "confirmation_bar_time", "direction_bar_time", "broker_fingerprint", "policy_id", "cost_context", "execution")}
+            proposal_context = {key: qualified[key] for key in ("direction", "bar_time", "confirmation_bar_time", "direction_bar_time", "context_bar_times", "timeframe_context", "broker_utc_offset_minutes", "broker_fingerprint", "policy_id", "cost_context", "execution")}
             claim_options = {"qualification_id": qualified.get("qualification_id"),
                              "strategy_fingerprint": qualified["strategy_fingerprint"],
                              "proposal_context": proposal_context}

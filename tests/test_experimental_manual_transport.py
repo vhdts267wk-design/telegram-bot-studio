@@ -20,7 +20,7 @@ class ExperimentalClaimTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.pool = SimpleNamespace(fetchrow=AsyncMock(return_value=store_fixtures.row(status="preparing")))
         self.context = deepcopy(store_fixtures.CONTEXT)
-        self.context["policy_id"] = "mtf-manual-demo-estimated-cost-risk-v2"
+        self.context["policy_id"] = "mtf-manual-demo-estimated-cost-risk-v3"
 
     async def claim(self, **changes):
         options = dict(strategy_fingerprint=store_fixtures.FINGERPRINT,
@@ -46,8 +46,8 @@ class ExperimentalClaimTests(unittest.IsolatedAsyncioTestCase):
         query, *args = self.pool.fetchrow.await_args.args
         candidate = store_fixtures.compact(query).split("), claimed AS (", 1)[0]
         for predicate in (
-            "offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-demo-v2'",
-            "offer.payload->>'strategy_version' = '2'",
+            "offer.payload->>'strategy_id' = 'mtf-ema-pullback-60m-demo-v3'",
+            "offer.payload->>'strategy_version' = '3'",
             "offer.payload->>'signal_mode' = 'experimental_demo'",
             "offer.payload->'provisional' = 'true'::jsonb",
             "offer.payload->>'entry_window_seconds' = '30'",
@@ -72,7 +72,7 @@ class ExperimentalClaimTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"MT5_SIGNAL_MODE": "experimental_demo"}):
             self.context["policy_id"] = "legacy"
             self.assertIsNone(await self.claim())
-            self.context["policy_id"] = "mtf-manual-demo-estimated-cost-risk-v2"
+            self.context["policy_id"] = "mtf-manual-demo-estimated-cost-risk-v3"
             del self.context["cost_context"]["loss_cash_per_price_unit"]
             self.assertIsNone(await self.claim())
             self.pool.fetchrow.assert_not_awaited()

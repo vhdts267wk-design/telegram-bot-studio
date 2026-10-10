@@ -38,7 +38,7 @@ class ExperimentalMtfTests(unittest.TestCase):
             result = self.evaluate()
             self.assertEqual(result["state"], "signal", result)
             self.assertEqual((result["strategy_id"], result["strategy_version"], result["policy_id"]),
-                             (mtf.EXPERIMENTAL_STRATEGY_ID, 2, mtf.EXPERIMENTAL_POLICY_ID))
+                             (mtf.EXPERIMENTAL_STRATEGY_ID, 3, mtf.EXPERIMENTAL_POLICY_ID))
             self.assertTrue(result["provisional"])
             self.assertEqual(result["signal_mode"], "experimental_demo")
             self.assertEqual(result["entry_window_seconds"], 30)
@@ -59,6 +59,30 @@ class ExperimentalMtfTests(unittest.TestCase):
             self.assertFalse(mtf_runtime.eligible_result(result, self.now))
         result = mtf.analyze_multi_timeframe(self.feed, self.now, research_only=True, experimental_demo=True)
         self.assertEqual(result["reason"], "invalid_signal_profile")
+
+    def test_experimental_profile_never_promotes_counter_trend_or_missing_higher_context(self):
+        with patch.dict(os.environ, {"MT5_SIGNAL_MODE": "experimental_demo"}):
+            for sell in (False, True):
+                feed = self.fixture.feed(sell=sell)
+                feed["risk_context"]["costs_verified"] = False
+                original = dict(self.evaluate(feed), workflow="manual_ticket")
+                self.assertEqual(original["state"], "signal", original)
+                self.assertTrue(mtf_runtime.eligible_payload(original, feed, self.now))
+                for frame in ("H1", "H4"):
+                    changed = deepcopy(feed)
+                    changed["timeframes"][frame] = self.fixture.feed(sell=not sell)["timeframes"][frame]
+                    result = self.evaluate(changed)
+                    self.assertEqual((result["state"], result["reason"]), ("no_signal", "higher_timeframe_conflict"))
+                    self.assertEqual(result["timeframe_context"]["confidence"], "reduced")
+                    self.assertNotIn("entry", result)
+                    self.assertNotIn("direction", result)
+                    self.assertFalse(mtf_runtime.eligible_payload(original, changed, self.now))
+                    del changed["timeframes"][frame]
+                    self.assertFalse(mtf_runtime.eligible_payload(original, changed, self.now))
+                legacy = deepcopy(original)
+                legacy.update(strategy_id="mtf-ema-pullback-60m-demo-v2", strategy_version=2,
+                              policy_id="mtf-manual-demo-estimated-cost-risk-v2")
+                self.assertFalse(mtf_runtime.eligible_result(legacy, self.now))
 
     def test_estimates_are_nonzero_copy_inputs_and_never_claim_verification(self):
         self.feed["risk_context"].update(commission_round_turn=0, slippage_price=0, costs_verified=True)

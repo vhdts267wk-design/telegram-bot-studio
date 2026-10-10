@@ -69,7 +69,7 @@ class BrokerFeedTests(unittest.TestCase):
         self.assertIsInstance(result["candles"][0]["close"], float)
         self.assertEqual(result["quote"]["time"], original["quote"]["time"])
         self.assertEqual(original["candles"][0]["close"], 1995.4)
-        self.assertEqual(set(result["timeframes"]), {"M15", "M5", "M1"})
+        self.assertEqual(set(result["timeframes"]), {"M15", "M5", "M1", "H1", "H4"})
         self.assertEqual(result["risk_context"], original["risk_context"])
 
     def test_rejects_bad_shapes_values_times_ranges_and_tick_counts(self):
@@ -152,11 +152,11 @@ class BrokerFeedTests(unittest.TestCase):
         text = monitor.market_text({"payload": feed, "updated_at": NOW}, NOW)
         self.assertIn("تجهيز السجل (4/22", text)
         self.assertIn("22 شمعة", text)
-        self.assertNotIn("M5 — تأكيد الفرصة: ميل", text)
+        self.assertNotIn("M5 — إشارة الدخول: ميل", text)
         self.assertNotIn("دعم محتمل", text)
         text = monitor.market_text({"payload": broker_feed(), "updated_at": NOW}, NOW)
-        self.assertIn("M15 — الاتجاه العام: ميل", text)
-        self.assertIn("M5 — تأكيد الفرصة: ميل", text)
+        self.assertIn("M15 — تأكيد الاتجاه: ميل", text)
+        self.assertIn("M5 — إشارة الدخول: ميل", text)
         self.assertIn("M1 — توقيت الدخول: ميل", text)
         self.assertIn("لا توجد فرصة مؤكدة الشروط", text)
         self.assertNotIn("/news", text)
@@ -165,12 +165,12 @@ class BrokerFeedTests(unittest.TestCase):
         feed = broker_feed()
         feed["quote"]["time"] = (NOW + timedelta(seconds=5)).isoformat()
         text = monitor.market_text({"payload": feed, "updated_at": NOW}, NOW)
-        self.assertIn("M15 — الاتجاه العام: ميل", text)
+        self.assertIn("M15 — تأكيد الاتجاه: ميل", text)
         for receipt, quote_lead in ((NOW + timedelta(seconds=1), 0), (NOW, 6)):
             feed["quote"]["time"] = (NOW + timedelta(seconds=quote_lead)).isoformat()
             with self.subTest(receipt=receipt, quote_lead=quote_lead):
                 text = monitor.market_text({"payload": feed, "updated_at": receipt}, NOW)
-                self.assertNotIn("M15 — الاتجاه العام: ميل", text)
+                self.assertNotIn("M15 — تأكيد الاتجاه: ميل", text)
                 self.assertNotRegex(text, r"(?i)\b(?:BUY|SELL)\b")
 
     def test_corrupt_persisted_huge_number_yields_unavailable_text(self):
@@ -446,9 +446,9 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
             await monitor.market_command(update, context)
         message.reply_text.assert_awaited_once()
         text = message.reply_text.await_args.args[0]
-        self.assertIn("M15 / M5 / M1", text)
-        self.assertIn("M15 — الاتجاه العام: ميل", text)
-        self.assertIn("M5 — تأكيد الفرصة: ميل", text)
+        self.assertIn("M1 / M5 / M15 / H1 / H4", text)
+        self.assertIn("M15 — تأكيد الاتجاه: ميل", text)
+        self.assertIn("M5 — إشارة الدخول: ميل", text)
         self.assertIn("M1 — توقيت الدخول: ميل", text)
         self.assertEqual(text.count("شراء BUY"), 1)
         for field in ("entry", "stop", "target", "target2"):
@@ -493,7 +493,7 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
             await monitor.market_command(update, context)
         message.reply_text.assert_awaited_once()
         text = message.reply_text.await_args.args[0]
-        self.assertIn("M15 / M5 / M1", text)
+        self.assertIn("M1 / M5 / M15 / H1 / H4", text)
         self.assertIn("M1 — توقيت الدخول", text)
         self.assertEqual(text.count("لا توجد فرصة مؤكدة الشروط"), 1)
         self.assertEqual(text.count("السبب:"), 1)
@@ -518,9 +518,9 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
         ) as save, patch.object(monitor.trade_store, "create_offer", new_callable=AsyncMock) as offer:
             await monitor.market_command(update, context)
         text = message.reply_text.await_args.args[0]
-        self.assertIn("M15 / M5 / M1", text)
-        self.assertIn("M15 — الاتجاه العام: ميل", text)
-        self.assertIn("M5 — تأكيد الفرصة: ميل", text)
+        self.assertIn("M1 / M5 / M15 / H1 / H4", text)
+        self.assertIn("M15 — تأكيد الاتجاه: ميل", text)
+        self.assertIn("M5 — إشارة الدخول: ميل", text)
         self.assertIn("M1 — توقيت الدخول: ميل", text)
         self.assertEqual(text.count("شراء BUY"), 1)
         self.assertIn("2000.003", text)

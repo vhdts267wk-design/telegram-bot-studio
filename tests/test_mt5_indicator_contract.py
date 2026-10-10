@@ -161,11 +161,16 @@ class IndicatorContractTests(unittest.TestCase):
             "entry": 4000.00, "entry_zone_low": 3999.00, "entry_zone_high": 4001.00,
             "stop": 3990.00, "target": 4020.00, "price_digits": 2, "execution": execution,
             "bar_time": "2026-10-05T16:21:00Z", "expires_at": "2026-10-05T16:22:10Z",
-            "strategy_id": "mtf-ema-pullback-60m-v1", "strategy_version": 1,
-            "policy_id": "mtf-manual-demo-cost-risk-v1", "horizon_seconds": 3600,
+            "strategy_id": "mtf-ema-pullback-60m-v2", "strategy_version": 2,
+            "policy_id": "mtf-manual-demo-cost-risk-v2", "horizon_seconds": 3600,
             "strategy_fingerprint": "a" * 64, "qualification_id": "b" * 64,
             "direction_bar_time": "2026-10-05T16:00:00Z",
             "confirmation_bar_time": "2026-10-05T16:15:00Z",
+            "broker_utc_offset_minutes": 180,
+            "context_bar_times": {"H1": "2026-10-05T15:00:00Z", "H4": "2026-10-05T09:00:00Z"},
+            "timeframe_context": {"trends": {key: "BUY" for key in ("M1", "M5", "M15", "H1", "H4")},
+                                  "alignment": "aligned", "confidence": "aligned", "counter_trend": False,
+                                  "support": 3900, "resistance": 4100},
         }
         quote = {"time": now.isoformat(), "bid": 3999.99, "ask": 4000.01}
         with tempfile.TemporaryDirectory(prefix="indicator-contract-") as temporary:

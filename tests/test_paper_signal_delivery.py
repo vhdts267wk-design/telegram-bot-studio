@@ -105,8 +105,9 @@ class PaperSourceGateTests(PinnedSyntheticEvidenceMixin, unittest.TestCase):
 
     def test_fresh_quote_does_not_make_old_completed_bars_fresh(self):
         snapshot = broker_snapshot()
+        # Keep every completed stream on its grid, including H4, while aging it.
         for rows in snapshot["payload"]["timeframes"].values():
-            for bar in rows: bar["time"] = (monitor._utc(bar["time"]) - timedelta(hours=1)).isoformat()
+            for bar in rows: bar["time"] = (monitor._utc(bar["time"]) - timedelta(hours=4)).isoformat()
         snapshot["payload"]["candles"] = copy.deepcopy(snapshot["payload"]["timeframes"]["M15"])
         result, _, _ = monitor.paper_result(snapshot, NOW, "mt5")
         self.assertEqual(result["state"], "stale")

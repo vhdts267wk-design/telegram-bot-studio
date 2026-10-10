@@ -22,7 +22,7 @@ if __package__ in (None, ""):
 from bot import strategy_evidence as evidence
 
 
-TF_SECONDS = {"M1": 60, "M5": 300, "M15": 900}
+TF_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600, "H4": 14400}
 
 
 def stamp(value):
@@ -86,6 +86,9 @@ class TickSeries:
 
 
 def load_data(manifest, base, *, include_ticks=True):
+    offset = manifest.get("broker_utc_offset_minutes", 0)
+    if type(offset) is not int or not -720 <= offset <= 840 or offset % 15:
+        raise ValueError("Explicit normalized broker clock offset is invalid")
     candles = {tf: [] for tf in TF_SECONDS}
     ticks = TickSeries()
     fingerprints = []
@@ -110,7 +113,7 @@ def load_data(manifest, base, *, include_ticks=True):
                     raise ValueError("Exact OHLC/tick-volume columns are required")
                 time = evidence.utc(row["time"])
                 prices = [float(evidence.finite(row[key], positive=True)) for key in ("open", "high", "low", "close")]
-                if time.microsecond or int(time.timestamp()) % seconds or (target and time <= evidence.utc(target[-1]["time"])):
+                if time.microsecond or (int(time.timestamp()) + offset * 60) % seconds or (target and time <= evidence.utc(target[-1]["time"])):
                     raise ValueError("Candles must be UTC aligned, ordered and unique")
                 if prices[1] < max(prices[0], prices[2], prices[3]) or prices[2] > min(prices[0], prices[1], prices[3]):
                     raise ValueError("Invalid historical OHLC")
@@ -148,7 +151,7 @@ def make_feed(manifest, windows, quote, now, cost, *, research=False):
         "costs_verified": cost.get("verified") is True and not research,
         "as_of": iso(now), "broker_fingerprint": manifest.get("broker_fingerprint", ""),
     }
-    return {"schema_version": 2, "as_of": iso(now), "source": "MetaTrader 5", "symbol": manifest["symbol"], "timeframe": "M15",
+    return {"schema_version": 2, "as_of": iso(now), "broker_utc_offset_minutes": manifest.get("broker_utc_offset_minutes", 0), "source": "MetaTrader 5", "symbol": manifest["symbol"], "timeframe": "M15",
             "candles": windows["M15"], "timeframes": windows, "quote": quote,
             "execution": manifest["execution"], "risk_context": context}
 
@@ -276,7 +279,7 @@ def evaluate(manifest, candles, ticks, *, analyzer=None, exploratory_cost=None):
     if not costs:
         return [], ["No verified or explicitly declared cost model is available"], []
     if any(len(candles[tf]) < 22 for tf in TF_SECONDS):
-        return [], ["Fewer than22 completed bars for M1, M5 or M15"], []
+        return [], ["Fewer than22 completed bars for M1, M5, M15, H1 or H4"], []
     for cost in costs:
         research = exploratory_cost is not None
         if research:
@@ -361,7 +364,7 @@ def evaluation_summary(assessment, report, provisional):
     text = evidence.arabic_summary(assessment)
     if not provisional:
         return text
-    lines = [text, "", "التقييم الاستكشافي: اتجاه M15، تأكيد M5، توقيت M1؛ الهدف الأساسي TP1 = 2R والوقف الأصلي، مدة نموذجية60 دقيقة.",
+    lines = [text, "", "التقييم الاستكشافي: اتجاه H4 العام وH1 القريب، تأكيد M15، دخول M5/M1؛ التعارض ينتظر. الهدف الأساسي TP1 = 2R والوقف الأصلي، مدة نموذجية60 دقيقة.",
              "الدخول بسعر افتتاح فترة M1 التالية مع سبريد افتراضي؛ وقت أول تيك وتأخر الدخول خلال10 ثوانٍ غير مثبتين بالشموع.",
              "التكاليف والنموذج المالي افتراضيان ومعلنان؛ ليست رسوماً تاريخية مثبتة أو رصيد الحساب الفعلي."]
     labels = {"development": "التطوير", "validation": "التحقق", "oos": "خارج العينة"}

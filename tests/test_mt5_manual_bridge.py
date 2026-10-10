@@ -3,7 +3,7 @@
 from contextlib import redirect_stdout, redirect_stderr
 from copy import deepcopy
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import io
@@ -27,11 +27,16 @@ def qualified_draft():
     return native.Draft(
         "XAUUSD", "BUY", Decimal("0.01"), Decimal("2490"), Decimal("2520"), 2,
         NOW + timedelta(minutes=5), display_timeframe="M1",
-        strategy_id="mtf-ema-pullback-60m-v1", strategy_version=1,
-        policy_id="mtf-manual-demo-cost-risk-v1", horizon_seconds=3600,
+        strategy_id="mtf-ema-pullback-60m-v2", strategy_version=2,
+        policy_id="mtf-manual-demo-cost-risk-v2", horizon_seconds=3600,
         strategy_fingerprint="a" * 64, qualification_id="b" * 64,
         direction_bar_time=NOW - timedelta(minutes=15),
         confirmation_bar_time=NOW - timedelta(minutes=5), bar_time=NOW - timedelta(minutes=1),
+        context_bar_times={frame: trade.iso_date(datetime.fromtimestamp(manual.market.latest_closed_bar(
+            NOW.timestamp(), seconds, 0), timezone.utc)) for frame, seconds in (("H1", 3600), ("H4", 14400))},
+        timeframe_context={"trends": {frame: "BUY" for frame in manual.market.TIMEFRAMES}, "alignment": "aligned",
+                           "confidence": "aligned", "counter_trend": False, "support": 2490.0, "resistance": 2520.0},
+        broker_utc_offset_minutes=0,
     )
 
 
@@ -41,8 +46,8 @@ def estimated_costs():
 
 
 def experimental_draft():
-    return replace(qualified_draft(), strategy_id="mtf-ema-pullback-60m-demo-v2", strategy_version=2,
-                   policy_id="mtf-manual-demo-estimated-cost-risk-v2", signal_mode="experimental_demo",
+    return replace(qualified_draft(), strategy_id="mtf-ema-pullback-60m-demo-v3", strategy_version=3,
+                   policy_id="mtf-manual-demo-estimated-cost-risk-v3", signal_mode="experimental_demo",
                    provisional=True, entry_window_seconds=30, qualification_id="", cost_assumptions=estimated_costs(),
                    expires_at=NOW + timedelta(seconds=30))
 
@@ -58,17 +63,19 @@ class ManualBridgeTests(unittest.TestCase):
         self.settings = manual.Settings(verified_market, old.state_directory, old.account_mode, old.volume, True)
         self.mt5, self.ledger = self.fixture.mt5, self.fixture.ledger
         self.mt5.mock_add_spec([*self.mt5._mock_methods, "order_calc_profit", "order_calc_margin",
-                               "copy_rates_from_pos", "TIMEFRAME_M15", "TIMEFRAME_M5", "TIMEFRAME_M1"])
+                               "copy_rates_from_pos", "TIMEFRAME_M15", "TIMEFRAME_M5", "TIMEFRAME_M1", "TIMEFRAME_H1", "TIMEFRAME_H4"])
         self.mt5.TIMEFRAME_M15, self.mt5.TIMEFRAME_M5, self.mt5.TIMEFRAME_M1 = 15, 5, 1
+        self.mt5.TIMEFRAME_H1, self.mt5.TIMEFRAME_H4 = 60, 240
         self.mt5.order_calc_profit.side_effect = lambda side, symbol, volume, start, end: (end - start) * (1 if side == 0 else -1)
         self.mt5.order_calc_margin.return_value = 25.0
         self.fixture.account.equity, self.fixture.account.margin_free, self.fixture.account.currency = 10000.0, 9000.0, "USD"
         self.fixture.tick.time = int(NOW.timestamp()) - 1
         self.rates = {
-            frame: [{"time": int(NOW.timestamp()) - (64 - index) * frame * 60,
-                     "open": 2500.0, "high": 2501.0, "low": 2499.0, "close": 2500.0, "tick_volume": 120}
+            frame: [{"time": manual.market.latest_closed_bar(NOW.timestamp(), frame * 60, 0) - (63 - index) * frame * 60,
+                     "open": 2500.0 - (63 - index) * 0.1, "high": 2500.5 - (63 - index) * 0.1,
+                     "low": 2499.5 - (63 - index) * 0.1, "close": 2500.0 - (63 - index) * 0.1, "tick_volume": 120}
                     for index in range(64)]
-            for frame in (15, 5, 1)
+            for frame in (240, 60, 15, 5, 1)
         }
         self.mt5.copy_rates_from_pos.side_effect = lambda symbol, frame, start, count: self.rates[frame]
         self.journal = manual.ManualJournal(self.ledger)
@@ -78,8 +85,8 @@ class ManualBridgeTests(unittest.TestCase):
         self.preparation["payload"].update(
             execution=trade.execution_metadata(self.fixture.symbol), price_digits=2,
             original_stop_distance=10.0, state="signal", provisional=False,
-            strategy_id="mtf-ema-pullback-60m-v1", strategy_version=1,
-            policy_id="mtf-manual-demo-cost-risk-v1", horizon_seconds=3600,
+            strategy_id="mtf-ema-pullback-60m-v2", strategy_version=2,
+            policy_id="mtf-manual-demo-cost-risk-v2", horizon_seconds=3600,
             strategy_fingerprint="a" * 64, qualification_id="b" * 64, display_timeframe="M1",
             bar_time=trade.iso_date(NOW - timedelta(minutes=1)),
             decision_time=trade.iso_date(NOW),
@@ -98,6 +105,11 @@ class ManualBridgeTests(unittest.TestCase):
         self.mt5.order_check.side_effect = AssertionError("A draft must never call order_check")
         self.feed = manual.market.build_payload(self.mt5, self.settings.market, NOW)
         self.feed["execution"] = trade.execution_metadata(self.fixture.symbol)
+        self.preparation["payload"].update(
+            broker_utc_offset_minutes=0,
+            context_bar_times={frame: self.feed["timeframes"][frame][-1]["time"] for frame in ("H1", "H4")},
+            timeframe_context=manual.chart.current_timeframe_context(self.feed, observed_at=NOW, broker_offset_minutes=0),
+        )
 
     def draft(self, preparation=None):
         return manual.prepare_draft(self.mt5, self.settings, self.ledger, preparation or self.preparation, NOW)
@@ -106,8 +118,8 @@ class ManualBridgeTests(unittest.TestCase):
         preparation = deepcopy(self.preparation)
         preparation["expires_at"] = trade.iso_date(NOW + timedelta(seconds=30))
         payload = preparation["payload"]
-        payload.update(strategy_id="mtf-ema-pullback-60m-demo-v2", strategy_version=2,
-                       policy_id="mtf-manual-demo-estimated-cost-risk-v2", signal_mode="experimental_demo",
+        payload.update(strategy_id="mtf-ema-pullback-60m-demo-v3", strategy_version=3,
+                       policy_id="mtf-manual-demo-estimated-cost-risk-v3", signal_mode="experimental_demo",
                        provisional=True, entry_window_seconds=30, cost_assumptions=estimated_costs())
         payload.pop("qualification_id")
         payload["cost_context"].update(commission_round_turn=0.2, slippage_price=0.1)
@@ -136,7 +148,7 @@ class ManualBridgeTests(unittest.TestCase):
         self.mt5.order_check.assert_not_called()
 
     def test_partial_experimental_profiles_fake_certification_and_understated_costs_reject(self):
-        for key, changed in (("signal_mode", "qualified"), ("provisional", False), ("strategy_id", "mtf-ema-pullback-60m-v1"),
+        for key, changed in (("signal_mode", "qualified"), ("provisional", False), ("strategy_id", "mtf-ema-pullback-60m-v2"),
                              ("strategy_version", 1), ("entry_window_seconds", 10), ("entry_window_seconds", True),
                              ("qualification_id", "b" * 64), ("evidence_metrics", {}), ("account_mode", "real")):
             preparation = self.experimental_preparation()
@@ -207,6 +219,60 @@ class ManualBridgeTests(unittest.TestCase):
         self.assertEqual(draft.bar_time, NOW - timedelta(minutes=1))
         self.mt5.order_send.assert_not_called()
         self.mt5.order_check.assert_not_called()
+
+    def test_old_partial_countertrend_or_future_higher_context_rejects_before_market_or_native_work(self):
+        mutations = [
+            lambda value: value.update(strategy_id="mtf-ema-pullback-60m-v1", strategy_version=1),
+            lambda value: value.pop("timeframe_context"),
+            lambda value: value["timeframe_context"]["trends"].pop("H4"),
+            lambda value: value["timeframe_context"]["trends"].update(H1="SELL"),
+            lambda value: value["timeframe_context"].update(alignment="counter_trend", confidence="reduced", counter_trend=True),
+            lambda value: value["context_bar_times"].pop("H1"),
+            lambda value: value["context_bar_times"].update(H4=trade.iso_date(NOW)),
+            lambda value: value.update(broker_utc_offset_minutes=180),
+        ]
+        for mutate in mutations:
+            preparation = deepcopy(self.preparation)
+            mutate(preparation["payload"])
+            self.mt5.symbol_info.reset_mock()
+            with self.subTest(mutation=mutate), self.assertRaises(trade.GuardError):
+                self.draft(preparation)
+            self.mt5.symbol_info.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_local_higher_trend_or_reference_mismatch_blocks_frozen_aligned_offer(self):
+        for frame in (60, 240):
+            original = deepcopy(self.rates[frame])
+            self.rates[frame] = [dict(row, open=2500.0 + (63 - index) * 0.1,
+                close=2500.0 + (63 - index) * 0.1, high=2500.5 + (63 - index) * 0.1,
+                low=2499.5 + (63 - index) * 0.1) for index, row in enumerate(original)]
+            with self.subTest(frame=frame), self.assertRaisesRegex(trade.GuardError, "five-timeframe context"):
+                self.draft()
+            self.rates[frame] = original
+        self.mt5.order_send.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+
+    def test_standalone_local_context_matches_server_for_aligned_neutral_and_countertrend_histories(self):
+        from bot import multi_timeframe as model
+        for scenario in ("aligned", "neutral", "counter_trend"):
+            feed = deepcopy(self.feed)
+            if scenario == "neutral":
+                for rows in feed["timeframes"].values():
+                    for row in rows:
+                        row.update(open=2500.0, close=2500.0, high=2500.5, low=2499.5)
+            elif scenario == "counter_trend":
+                for index, row in enumerate(feed["timeframes"]["H4"]):
+                    close = 2500.0 + (63 - index) * 0.1
+                    row.update(open=close, close=close, high=close + 0.5, low=close - 0.5)
+            bars = {frame: model._contiguous_suffix(model._bars(rows, frame, NOW, 0), frame)
+                    for frame, rows in feed["timeframes"].items()}
+            indicators = {frame: model._indicators(rows) for frame, rows in bars.items()}
+            expected = model._timeframe_context(bars, indicators, feed["quote"]["bid"], feed["quote"]["ask"])
+            actual = manual.chart.current_timeframe_context(feed, observed_at=NOW, broker_offset_minutes=0)
+            with self.subTest(scenario=scenario):
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual["alignment"], "unconfirmed" if scenario == "neutral" else scenario)
 
     def test_manual_entry_window_allows_ten_seconds_and_rejects_later_fresh_quotes(self):
         for seconds in (10, 10.000001, 11):
@@ -296,7 +362,7 @@ class ManualBridgeTests(unittest.TestCase):
             with self.subTest(age=age):
                 self.draft()
         self.fixture.tick.time = int(NOW.timestamp()) - 1
-        for frame in (1, 5, 15):
+        for frame in (1, 5, 15, 60, 240):
             original = deepcopy(self.rates[frame])
             for failure in ("missing", "forming"):
                 self.rates[frame] = deepcopy(original)
@@ -929,11 +995,28 @@ class NativeTicketTests(unittest.TestCase):
         self.assertLessEqual(len(self.backend.comment), 31)
         self.assertEqual(draft.qualification_id, "")
 
+    def test_incomplete_countertrend_or_future_higher_context_never_operates_native_backend(self):
+        counter = deepcopy(self.draft.timeframe_context)
+        counter.update(alignment="counter_trend", confidence="reduced", counter_trend=True)
+        counter["trends"]["H4"] = "SELL"
+        partial = deepcopy(self.draft.timeframe_context)
+        partial["trends"].pop("H1")
+        future = dict(self.draft.context_bar_times, H1=NOW.isoformat())
+        for changed in (replace(self.draft, timeframe_context=None), replace(self.draft, timeframe_context=counter),
+                        replace(self.draft, timeframe_context=partial), replace(self.draft, context_bar_times=future),
+                        replace(self.draft, broker_utc_offset_minutes=180),
+                        replace(self.draft, strategy_id="mtf-ema-pullback-60m-v1", strategy_version=1)):
+            check = Mock()
+            with self.subTest(draft=changed), self.assertRaises(native.TicketError):
+                self.adapter.prepare(changed, recheck_account=check)
+            self.assertEqual(self.backend.events, [])
+            check.assert_not_called()
+
     def test_incomplete_experimental_native_draft_rejects_before_any_window_actions(self):
         for changed in (replace(experimental_draft(), qualification_id="b" * 64),
                         replace(experimental_draft(), provisional=False),
                         replace(experimental_draft(), entry_window_seconds=10),
-                        replace(experimental_draft(), strategy_id="mtf-ema-pullback-60m-v1"),
+                        replace(experimental_draft(), strategy_id="mtf-ema-pullback-60m-v2"),
                         replace(experimental_draft(), cost_assumptions=None)):
             check = Mock()
             with self.subTest(draft=changed), self.assertRaises(native.TicketError):

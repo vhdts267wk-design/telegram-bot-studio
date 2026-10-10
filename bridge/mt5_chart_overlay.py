@@ -23,6 +23,7 @@ FIELDS = frozenset({
     "execution", "bar_time", "expires_at",
     "strategy_id", "strategy_version", "policy_id", "horizon_seconds", "strategy_fingerprint",
     "qualification_id", "direction_bar_time", "confirmation_bar_time",
+    "context_bar_times", "timeframe_context", "broker_utc_offset_minutes",
 })
 EXPERIMENTAL_FIELDS = (FIELDS - {"qualification_id"}) | {
     "signal_mode", "provisional", "entry_window_seconds", "cost_assumptions",
@@ -30,6 +31,7 @@ EXPERIMENTAL_FIELDS = (FIELDS - {"qualification_id"}) | {
 COST_ASSUMPTION_FIELDS = frozenset({
     "verified", "method", "commission_round_turn", "slippage_price", "spread_price", "tick_size",
 })
+FRAME_SECONDS = {"H4": 14400, "H1": 3600, "M15": 900, "M5": 300, "M1": 60}
 
 
 class OverlayError(ValueError):
@@ -81,6 +83,132 @@ def validate_cost_assumptions(value):
     return parsed
 
 
+def validate_broker_offset(value):
+    if type(value) is not int or not -720 <= value <= 840 or value % 15:
+        raise OverlayError("Invalid context broker offset")
+    return value
+
+
+def latest_closed_reference(boundary, seconds, broker_offset_minutes):
+    offset = validate_broker_offset(broker_offset_minutes) * 60
+    return int((boundary + offset) // seconds) * seconds - seconds - offset
+
+
+def validate_timeframe_context(value, direction):
+    """Only a complete, aligned five-frame context can accompany an offer."""
+    if (type(value) is not dict or set(value) != {
+        "trends", "alignment", "confidence", "counter_trend", "support", "resistance",
+    } or type(value["trends"]) is not dict or set(value["trends"]) != set(FRAME_SECONDS)
+        or direction not in ("BUY", "SELL")
+        or any(type(trend) is not str or trend != direction for trend in value["trends"].values())
+        or value["alignment"] != "aligned" or value["confidence"] != "aligned"
+        or value["counter_trend"] is not False):
+        raise OverlayError("Incomplete or unaligned five-timeframe context")
+    support, resistance = value["support"], value["resistance"]
+    for price in (support, resistance):
+        if price is not None:
+            positive(price)
+    if support is not None and resistance is not None and support > resistance:
+        raise OverlayError("Invalid higher-timeframe levels")
+    return value
+
+
+def validate_context_references(value, *, trigger, boundary, broker_offset_minutes):
+    """Require the last closed H1/H4 bar at both signal and current boundary."""
+    if type(value) is not dict or set(value) != {"H1", "H4"}:
+        raise OverlayError("Incomplete higher-timeframe references")
+    result = {}
+    for frame in ("H1", "H4"):
+        if type(value[frame]) is not str:
+            raise OverlayError("Invalid higher-timeframe reference format")
+        reference = utc(value[frame])
+        seconds = FRAME_SECONDS[frame]
+        if (reference.microsecond
+            or reference.timestamp() != latest_closed_reference(trigger + 60, seconds, broker_offset_minutes)
+            or reference.timestamp() != latest_closed_reference(boundary, seconds, broker_offset_minutes)):
+            raise OverlayError("Stale or future higher-timeframe reference")
+        result[frame] = reference
+    return result
+
+
+def current_timeframe_context(feed, *, observed_at, broker_offset_minutes):
+    """Recompute the read-only five-frame trend contract from local closed bars.
+
+    This standalone bridge cannot import the server. These EMA/ATR operations
+    match its declared strategy, and never prepare or submit a ticket.
+    """
+    now = utc(observed_at)
+    offset = validate_broker_offset(broker_offset_minutes)
+    if type(feed) is not dict or type(feed.get("timeframes")) is not dict or set(feed["timeframes"]) != set(FRAME_SECONDS):
+        raise OverlayError("Incomplete local five-timeframe history")
+    if validate_broker_offset(feed.get("broker_utc_offset_minutes")) != offset:
+        raise OverlayError("Changed local context broker offset")
+    fresh_quote(feed.get("quote"), now)
+    streams = {}
+    for frame, seconds in FRAME_SECONDS.items():
+        rows = feed["timeframes"][frame]
+        if type(rows) is not list or not 22 <= len(rows) <= 64:
+            raise OverlayError("Insufficient local five-timeframe history")
+        parsed = []
+        for row in rows:
+            if type(row) is not dict:
+                raise OverlayError("Invalid local context candle")
+            stamp = utc(row.get("time"))
+            prices = {key: float(positive(row.get(key))) for key in ("open", "high", "low", "close")}
+            if (stamp.microsecond or (stamp.timestamp() + offset * 60) % seconds
+                or stamp.timestamp() + seconds > now.timestamp()
+                or (parsed and stamp <= parsed[-1]["time"])
+                or prices["high"] < max(prices["open"], prices["close"], prices["low"])
+                or prices["low"] > min(prices["open"], prices["close"], prices["high"])):
+                raise OverlayError("Invalid local context candle")
+            parsed.append({"time": stamp, **prices})
+        if parsed[-1]["time"].timestamp() != latest_closed_reference(now.timestamp(), seconds, offset):
+            raise OverlayError("Stale local context history")
+        start = len(parsed) - 1
+        while start > 0 and (parsed[start]["time"] - parsed[start - 1]["time"]).total_seconds() == seconds:
+            start -= 1
+        streams[frame] = parsed[start:]
+        if len(streams[frame]) < 22:
+            raise OverlayError("Insufficient contiguous context history")
+
+    def ema(closes, period):
+        current = math.fsum(closes[:period]) / period
+        values = [None] * (period - 1) + [current]
+        for close in closes[period:]:
+            current += (2 / (period + 1)) * (close - current)
+            values.append(current)
+        return values
+
+    trends = {}
+    for frame, rows in streams.items():
+        closes = [row["close"] for row in rows]
+        fast, slow = ema(closes, 9), ema(closes, 21)
+        separation, slope = fast[-1] - slow[-1], fast[-1] - fast[-2]
+        if frame in ("M1", "M5"):
+            trends[frame] = "BUY" if separation > 0 else "SELL" if separation < 0 else "NEUTRAL"
+            continue
+        ranges = [max(current["high"] - current["low"], abs(current["high"] - previous["close"]),
+                      abs(current["low"] - previous["close"])) for previous, current in zip(rows, rows[1:])]
+        atr = math.fsum(ranges[:14]) / 14
+        for value in ranges[14:]:
+            atr = (atr * 13 + value) / 14
+        if not math.isfinite(atr) or atr <= 0 or abs(separation) < 0.05 * atr:
+            trends[frame] = "NEUTRAL"
+        else:
+            trends[frame] = ("BUY" if separation > 0 and slope > 0 and closes[-1] > fast[-1]
+                             else "SELL" if separation < 0 and slope < 0 and closes[-1] < fast[-1] else "NEUTRAL")
+    direction = trends["M15"]
+    aligned = direction != "NEUTRAL" and all(trend == direction for trend in trends.values())
+    counter = direction != "NEUTRAL" and any(trends[frame] not in (direction, "NEUTRAL") for frame in ("H1", "H4"))
+    midpoint = (positive(feed["quote"]["bid"]) + positive(feed["quote"]["ask"])) / 2
+    support = min(row["low"] for row in streams["H4"][-20:])
+    resistance = max(row["high"] for row in streams["H4"][-20:])
+    return {"trends": trends, "alignment": "aligned" if aligned else "counter_trend" if counter else "unconfirmed",
+            "confidence": "aligned" if aligned else "reduced" if counter else "unconfirmed", "counter_trend": counter,
+            "support": support if Decimal(str(support)) <= midpoint else None,
+            "resistance": resistance if Decimal(str(resistance)) >= midpoint else None}
+
+
 def metadata(value):
     if type(value) is not dict or set(value) != {"tick_size", "point", "digits", "stops_level"}:
         raise OverlayError("Invalid chart precision")
@@ -118,7 +246,7 @@ def fresh_quote(value, now):
     return stamp
 
 
-def validate_proposal(value, *, symbol, execution, quote, observed_at):
+def validate_proposal(value, *, symbol, execution, quote, observed_at, broker_offset_minutes=0):
     """Validate the separate chart DTO without fabricating a claim or draft."""
     now = utc(observed_at)
     fresh_quote(quote, now)
@@ -137,15 +265,18 @@ def validate_proposal(value, *, symbol, execution, quote, observed_at):
     ):
         raise OverlayError("Incompatible chart proposal")
     if (
-        value["strategy_id"] != ("mtf-ema-pullback-60m-demo-v2" if experimental else "mtf-ema-pullback-60m-v1")
-        or type(value["strategy_version"]) is not int or value["strategy_version"] != (2 if experimental else 1)
-        or value["policy_id"] != ("mtf-manual-demo-estimated-cost-risk-v2" if experimental else "mtf-manual-demo-cost-risk-v1")
+        value["strategy_id"] != ("mtf-ema-pullback-60m-demo-v3" if experimental else "mtf-ema-pullback-60m-v2")
+        or type(value["strategy_version"]) is not int or value["strategy_version"] != (3 if experimental else 2)
+        or value["policy_id"] != ("mtf-manual-demo-estimated-cost-risk-v3" if experimental else "mtf-manual-demo-cost-risk-v2")
         or type(value["horizon_seconds"]) is not int or value["horizon_seconds"] != 3600
         or type(value["strategy_fingerprint"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["strategy_fingerprint"]) is None
         or (not experimental and (type(value["qualification_id"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["qualification_id"]) is None))
         or (experimental and (value["provisional"] is not True or type(value["entry_window_seconds"]) is not int or value["entry_window_seconds"] != 30))
     ):
         raise OverlayError("Unqualified chart proposal")
+    if validate_broker_offset(value["broker_utc_offset_minutes"]) != validate_broker_offset(broker_offset_minutes):
+        raise OverlayError("Changed chart broker offset")
+    validate_timeframe_context(value["timeframe_context"], value["direction"])
     assumptions = validate_cost_assumptions(value["cost_assumptions"]) if experimental else None
     try:
         if type(value["offer_id"]) is not str or str(UUID(value["offer_id"])) != value["offer_id"]:
@@ -176,10 +307,12 @@ def validate_proposal(value, *, symbol, execution, quote, observed_at):
     if (
         any(stamp.microsecond for stamp in (bar, direction, confirmation)) or trigger % 60
         or not trigger + 60 <= now.timestamp() <= trigger + 360
-        or direction.timestamp() != int((trigger + 60) // 900) * 900 - 900
-        or confirmation.timestamp() != int((trigger + 60) // 300) * 300 - 300
+        or direction.timestamp() != latest_closed_reference(trigger + 60, 900, broker_offset_minutes)
+        or confirmation.timestamp() != latest_closed_reference(trigger + 60, 300, broker_offset_minutes)
     ):
         raise OverlayError("Invalid chart reference candle")
+    validate_context_references(value["context_bar_times"], trigger=trigger, boundary=now.timestamp(),
+                                broker_offset_minutes=broker_offset_minutes)
     if not now < expires <= min(now + timedelta(minutes=5), bar + timedelta(minutes=6)):
         raise OverlayError("Expired chart proposal")
     if experimental and (now > bar + timedelta(seconds=90) or expires > bar + timedelta(seconds=90)):
@@ -284,7 +417,8 @@ class ChartExporter:
         if value is None:
             self.clear(observed_at)
             return
-        proposal = validate_proposal(value, symbol=self.symbol, execution=execution, quote=quote, observed_at=observed_at)
+        proposal = validate_proposal(value, symbol=self.symbol, execution=execution, quote=quote, observed_at=observed_at,
+                                     broker_offset_minutes=self.offset)
         now = utc(observed_at)
         deadline = min(proposal.expires, now + timedelta(seconds=10),
                        fresh_quote(quote, now) + timedelta(seconds=10))
