@@ -64,13 +64,16 @@ def install_routes(app, application, settings):
         # The configured manual mode must block legacy execution even if a
         # stale service object still advertises automatic execution.
         manual = manual_flag is True or os.getenv("MT5_MANUAL_TICKETS_ENABLED", "false").strip().lower() == "true"
+        demo = manual_flag is True and mtf_runtime.demo_orders_enabled()
         key = os.getenv("MT5_MANUAL_BRIDGE_KEY", "") if manual else getattr(settings, "market_bridge_key", "")
         # Ambiguous configuration fails closed, including legacy clients.
         enabled = automatic != manual
         if workflow == "automatic":
             enabled = enabled and automatic
         elif workflow == "manual_ticket":
-            enabled = enabled and manual
+            enabled = enabled and manual and not demo
+        elif workflow == "demo_execution":
+            enabled = enabled and demo
         if not isinstance(key, str) or len(key) < 32 or service is None or not enabled:
             return None, None, JSONResponse({"detail": "Requested MT5 workflow is not configured"}, status_code=404)
         if not hmac.compare_digest(
@@ -147,7 +150,13 @@ def install_routes(app, application, settings):
                           "payload": offer["payload"], "expires_at": offer["expires_at"].isoformat()}}
 
     async def result(request: Request):
-        service, payload, error = await read_request(request, "automatic")
+        return await execution_result(request, "automatic")
+
+    async def demo_result(request: Request):
+        return await execution_result(request, "demo_execution")
+
+    async def execution_result(request, workflow):
+        service, payload, error = await read_request(request, workflow)
         if error is not None:
             return error
         try:
@@ -164,6 +173,8 @@ def install_routes(app, application, settings):
                 raise ValueError("Invalid ticket")
             if outcome["status"] == "filled" and (outcome.get("code") != 10009 or "order_ticket" not in outcome):
                 raise ValueError("An actual full execution result is required")
+            if workflow == "demo_execution" and outcome["status"] == "filled" and "executed_at" not in outcome:
+                raise ValueError("An execution timestamp is required")
             now = now_utc()
             if "executed_at" in outcome:
                 if type(outcome["executed_at"]) is not str or len(outcome["executed_at"]) > 40:
@@ -171,7 +182,8 @@ def install_routes(app, application, settings):
                 stamp = datetime.fromisoformat(outcome["executed_at"].replace("Z", "+00:00"))
                 if stamp.tzinfo is None or not now - timedelta(days=1) <= stamp <= now + timedelta(seconds=30):
                     raise ValueError("Invalid result time")
-            completed = await trade_store.complete_offer(
+            complete = trade_store.complete_demo_offer if workflow == "demo_execution" else trade_store.complete_offer
+            completed = await complete(
                 service.pool, service.bot_id, _uuid(payload["device_id"]),
                 _uuid(payload["offer_id"]), _uuid(payload["claim_id"]), outcome, now,
             )
@@ -333,9 +345,90 @@ def install_routes(app, application, settings):
             return JSONResponse({"detail": "Preparation claim is no longer active"}, status_code=409)
         return {"ok": True}
 
+    async def demo_chart(request: Request):
+        service, payload, error = await read_request(request, "demo_execution")
+        if error is not None:
+            return error
+        try:
+            if set(payload) != {"device_id"}:
+                raise ValueError("Invalid fields")
+            device_id = _uuid(payload["device_id"])
+            current = await fresh_manual_device(service, device_id, include_feed=True)
+            if current is None:
+                return {"proposal": None}
+            owner = (current[0]["owner_chat_id"], current[0]["owner_user_id"])
+            if await service.risk_pause(owner[0]) is not None:
+                return {"proposal": None}
+            offer = await trade_store.get_demo_chart_offer(service.pool, service.bot_id, device_id, now_utc())
+            if offer is None or not await trade_store.subscription_active(service.pool, service.bot_id, owner[0]):
+                return {"proposal": None}
+            current = await fresh_manual_device(service, device_id, include_feed=True)
+            if current is None or (current[0]["owner_chat_id"], current[0]["owner_user_id"]) != owner:
+                return {"proposal": None}
+            return {"proposal": proposal_overlay.build_chart_overlay(offer, current[0], current[2], current[1])}
+        except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
+            return JSONResponse({"detail": "Invalid device or market data"}, status_code=422)
+
+    async def demo_poll(request: Request):
+        service, payload, error = await read_request(request, "demo_execution")
+        if error is not None:
+            return error
+        offer = None
+        try:
+            if set(payload) != {"device_id"}:
+                raise ValueError("Invalid fields")
+            device_id, now = _uuid(payload["device_id"]), now_utc()
+            device = await trade_store.get_device(service.pool, service.bot_id, device_id)
+            if device is None:
+                return JSONResponse({"detail": "Device is not registered"}, status_code=404)
+            _policy(device)
+            await trade_store.heartbeat(service.pool, service.bot_id, device_id, now)
+            await trade_store.expire_offers(service.pool, service.bot_id, now)
+            current = await fresh_manual_device(service, device_id, include_feed=True)
+            if current is None or await service.risk_pause(current[0]["owner_chat_id"]) is not None:
+                return {"trade": None}
+            owner = (current[0]["owner_chat_id"], current[0]["owner_user_id"])
+            current = await fresh_manual_device(service, device_id, include_feed=True)
+            if current is None or (current[0]["owner_chat_id"], current[0]["owner_user_id"]) != owner:
+                return {"trade": None}
+            qualified = mtf_runtime.evaluate_feed(current[2], current[1])
+            if not mtf_runtime.eligible_result(qualified, current[1]):
+                return {"trade": None}
+            offer = await trade_store.claim_demo_offer(service.pool, service.bot_id, device_id, current[1], qualified=qualified)
+            if offer is None:
+                return {"trade": None}
+            # A claim reserves an attempt, not permission to bypass current
+            # eligibility. If anything changes, settle it as failed without
+            # delivering it to the bridge; never put it back in the queue.
+            active = await trade_store.subscription_active(service.pool, service.bot_id, owner[0])
+            paused = await service.risk_pause(owner[0])
+            current = await fresh_manual_device(service, device_id, include_feed=True)
+            if (
+                not active or paused is not None or current is None
+                or (current[0]["owner_chat_id"], current[0]["owner_user_id"]) != owner
+                or (offer["chat_id"], offer["user_id"]) != owner
+                or offer["payload"].get("workflow") != "demo_execution"
+                or current[1] >= offer["expires_at"]
+                or not mtf_runtime.eligible_payload(offer["payload"], current[2], current[1])
+            ):
+                await trade_store.complete_demo_offer(service.pool, service.bot_id, device_id, offer["id"], offer["claim_id"], {"status": "failed", "code": 0}, now_utc())
+                return {"trade": None}
+            return {"trade": {
+                "id": str(offer["id"]), "claim_id": str(offer["claim_id"]), "workflow": "demo_execution",
+                "payload": offer["payload"], "expires_at": offer["expires_at"].isoformat(),
+            }}
+        except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
+            if offer is not None:
+                await trade_store.complete_demo_offer(service.pool, service.bot_id, device_id, offer["id"], offer["claim_id"], {"status": "failed", "code": 0}, now_utc())
+                return {"trade": None}
+            return JSONResponse({"detail": "Invalid device or market data"}, status_code=422)
+
     app.add_api_route("/api/mt5/register", register, methods=["POST"])
     app.add_api_route("/api/mt5/poll", poll, methods=["POST"])
     app.add_api_route("/api/mt5/result", result, methods=["POST"])
     app.add_api_route("/api/mt5/manual/poll", manual_poll, methods=["POST"])
     app.add_api_route("/api/mt5/manual/result", manual_result, methods=["POST"])
     app.add_api_route("/api/mt5/manual/chart", manual_chart, methods=["POST"])
+    app.add_api_route("/api/mt5/demo/poll", demo_poll, methods=["POST"])
+    app.add_api_route("/api/mt5/demo/result", demo_result, methods=["POST"])
+    app.add_api_route("/api/mt5/demo/chart", demo_chart, methods=["POST"])

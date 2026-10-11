@@ -599,12 +599,14 @@ class ManualMT5NotificationTests(unittest.IsolatedAsyncioTestCase):
     def test_registration_separates_manual_and_disabled_legacy_callbacks(self):
         application = SimpleNamespace(add_handler=Mock())
         notifications.register_handlers(application)
-        command, callback, manual_callback = [call.args[0] for call in application.add_handler.call_args_list]
+        command, callback, manual_callback, demo_callback = [call.args[0] for call in application.add_handler.call_args_list]
         self.assertIn("connect_mt5", command.commands)
         self.assertIsNotNone(callback.pattern.match(f"mt5:a:{OFFER_ID.hex}"))
         self.assertIsNone(callback.pattern.match("command:help"))
         self.assertIsNotNone(manual_callback.pattern.match(f"mt5manual:p:{OFFER_ID.hex}"))
         self.assertIsNone(manual_callback.pattern.match(f"mt5:a:{OFFER_ID.hex}"))
+        self.assertIsNotNone(demo_callback.pattern.match(f"mt5demo:a:{OFFER_ID.hex}"))
+        self.assertIsNone(demo_callback.pattern.match(f"mt5manual:p:{OFFER_ID.hex}"))
 
 
 if __name__ == "__main__":
