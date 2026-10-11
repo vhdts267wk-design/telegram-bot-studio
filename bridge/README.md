@@ -1,5 +1,14 @@
 # Windows MT5 bridges
 
+For the current **Telegram Accept / Decline → Demo market order** workflow, use
+[DEMO-APPROVAL.md](DEMO-APPROVAL.md) and `mt5_demo_bridge.py`. The old
+`start_mt5_bridge.ps1` / `mt5_trade_bridge.py` execution path and
+`MT5_TRADING_ENABLED=true` setup below are retired; their server execution
+endpoints remain disabled. The legacy execution sections are historical
+reference, not activation instructions for the current workflow. The new helper
+requires existing terminal trading permission and does not change security
+settings.
+
 The manually started helpers connect to the selected MetaTrader 5 desktop terminal:
 
 | Helper | Purpose | Orders |
