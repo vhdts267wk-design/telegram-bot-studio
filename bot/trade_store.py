@@ -445,6 +445,145 @@ async def complete_offer(pool, bot_id, device_id, offer_id, claim_id, result, no
     return _offer(row)
 
 
+async def claim_demo_offer(pool, bot_id, device_id, now, *, qualified):
+    """Claim one current five-frame Demo approval under an exclusive device lock."""
+    from bot import mtf_runtime
+    if not mtf_runtime.demo_orders_enabled() or not mtf_runtime.eligible_result(qualified, _utc(now)):
+        return None
+    # Lock in a separate statement: a single-statement NOT EXISTS check can
+    # retain an older snapshot after another claim releases its row lock.
+    async with pool.acquire() as connection:
+        async with connection.transaction(isolation="read_committed"):
+            locked = await connection.fetchval(
+                "SELECT TRUE FROM mt5_devices WHERE bot_id = $1 AND device_id = $2 FOR UPDATE",
+                _identifier(bot_id, positive=True), _uuid(device_id),
+            )
+            if not locked:
+                return None
+            return await _claim_demo_offer_locked(connection, bot_id, device_id, now, qualified=qualified)
+
+
+async def _claim_demo_offer_locked(pool, bot_id, device_id, now, *, qualified):
+    """The caller holds the device lock; this statement gets a fresh snapshot."""
+    from bot import mtf_runtime
+    bot_id, device_id, now = _identifier(bot_id, positive=True), _uuid(device_id), _utc(now)
+    if not mtf_runtime.demo_orders_enabled() or not mtf_runtime.eligible_result(qualified, now):
+        return None
+    keys = ("direction", "bar_time", "confirmation_bar_time", "direction_bar_time",
+            "context_bar_times", "timeframe_context", "broker_utc_offset_minutes",
+            "broker_fingerprint", "policy_id", "cost_context", "execution",
+            "strategy_id", "strategy_version", "strategy_fingerprint", "horizon_seconds",
+            "display_timeframe", "account_mode", "volume", "closed_history_sha256")
+    context = {key: qualified[key] for key in keys}
+    experimental = mtf_runtime.is_experimental_result(qualified)
+    if experimental:
+        context.update(signal_mode="experimental_demo", provisional=True, entry_window_seconds=30)
+        context["cost_context"] = {key: qualified["cost_context"][key]
+                                   for key in ("loss_cash_per_price_unit", "profit_cash_per_price_unit")}
+    else:
+        context["qualification_id"] = qualified["qualification_id"]
+    window = mtf_runtime.entry_window_seconds(qualified)
+    row = await pool.fetchrow(
+        """
+        WITH candidate AS (
+            SELECT offer.id FROM mt5_trade_offers AS offer
+            JOIN mt5_devices AS device ON device.bot_id = offer.bot_id AND device.device_id = offer.device_id
+            JOIN market_subscriptions AS subscription
+                ON subscription.bot_id = offer.bot_id AND subscription.chat_id = offer.chat_id
+            WHERE offer.bot_id = $1 AND offer.device_id = $2 AND offer.status = 'accepted'
+                AND offer.payload->>'workflow' = 'demo_execution'
+                AND offer.payload->>'account_mode' = 'demo' AND offer.payload->>'volume' = '0.01'
+                AND device.account_mode = 'demo' AND device.volume = 0.01
+                AND offer.payload @> $6::jsonb
+                AND (NOT $8 OR (COALESCE(offer.payload->>'qualification_id', '') = ''
+                    AND NOT (offer.payload ? 'evidence_metrics')))
+                AND offer.expires_at > $3 AND offer.decided_at <= $3
+                AND offer.published_at <= offer.decided_at
+                AND (offer.payload->>'bar_time')::timestamptz + INTERVAL '60 seconds' <= $3
+                AND offer.expires_at <= (offer.payload->>'bar_time')::timestamptz
+                    + INTERVAL '60 seconds' + make_interval(secs => $7)
+                AND device.owner_chat_id = offer.chat_id AND device.owner_user_id = offer.user_id
+                AND offer.chat_id = offer.user_id
+                AND device.last_seen_at >= $4 AND device.last_seen_at <= $3 AND subscription.active
+                AND NOT EXISTS (
+                    SELECT 1 FROM mt5_trade_offers AS active
+                    WHERE active.bot_id = $1 AND active.device_id = $2 AND active.status = 'executing'
+                )
+            ORDER BY offer.decided_at, offer.id LIMIT 1 FOR UPDATE OF offer, device SKIP LOCKED
+        ), claimed AS (
+            UPDATE mt5_trade_offers AS offer SET status = 'executing', claim_id = $5,
+                executing_at = $3, updated_at = $3
+            FROM candidate WHERE offer.id = candidate.id AND offer.bot_id = $1 AND offer.status = 'accepted'
+            RETURNING offer.*
+        )
+        SELECT claimed.*, device.symbol, device.account_mode, device.volume FROM claimed
+        JOIN mt5_devices AS device ON device.bot_id = claimed.bot_id AND device.device_id = claimed.device_id
+        """,
+        bot_id, device_id, now, now - HEARTBEAT_TTL, uuid4(), _json_object(context), float(window), experimental,
+    )
+    return _offer(row)
+
+
+async def complete_demo_offer(pool, bot_id, device_id, offer_id, claim_id, result, now):
+    """Settle this workflow once; identical result retries remain read-only."""
+    encoded, status = _json_object(result), result.get("status")
+    if type(status) is not str or status not in RESULT_STATUSES:
+        raise ValueError("An execution result must be filled, failed, or unknown.")
+    row = await pool.fetchrow(
+        """
+        WITH completed AS (
+            UPDATE mt5_trade_offers AS offer SET status = $5, result = $6::jsonb,
+                completed_at = $7, updated_at = $7
+            FROM mt5_devices AS owner
+            WHERE offer.bot_id = $1 AND offer.device_id = $2 AND offer.id = $3 AND offer.claim_id = $4
+                AND offer.status = 'executing' AND offer.executing_at <= $7
+                AND offer.payload->>'workflow' = 'demo_execution'
+                AND offer.payload->>'account_mode' = 'demo' AND offer.payload->>'volume' = '0.01'
+                AND owner.bot_id = offer.bot_id AND owner.device_id = offer.device_id
+                AND owner.account_mode = 'demo' AND owner.volume = 0.01
+                AND owner.owner_chat_id = offer.chat_id AND owner.owner_user_id = offer.user_id
+            RETURNING offer.*
+        ), resolved AS (
+            SELECT * FROM completed UNION ALL SELECT * FROM mt5_trade_offers
+            WHERE bot_id = $1 AND device_id = $2 AND id = $3 AND claim_id = $4
+                AND payload->>'workflow' = 'demo_execution'
+                AND status = $5 AND status IN ('filled', 'failed', 'unknown') AND result = $6::jsonb
+        )
+        SELECT resolved.*, device.symbol, device.account_mode, device.volume FROM resolved
+        JOIN mt5_devices AS device ON device.bot_id = resolved.bot_id AND device.device_id = resolved.device_id
+        WHERE device.owner_chat_id = resolved.chat_id AND device.owner_user_id = resolved.user_id
+            AND device.account_mode = 'demo' AND device.volume = 0.01
+        """,
+        _identifier(bot_id, positive=True), _uuid(device_id), _uuid(offer_id), _uuid(claim_id), status, encoded, _utc(now),
+    )
+    return _offer(row)
+
+
+async def get_demo_chart_offer(pool, bot_id, device_id, now):
+    """Expose only the newest pending offer; Accept immediately clears it."""
+    now = _utc(now)
+    return _offer(await pool.fetchrow(
+        """
+        WITH latest AS (
+            SELECT * FROM mt5_trade_offers WHERE bot_id = $1 AND device_id = $2
+                AND payload->>'workflow' = 'demo_execution' AND published_at IS NOT NULL
+            ORDER BY published_at DESC, id DESC LIMIT 1
+        )
+        SELECT latest.*, device.symbol, device.account_mode, device.volume FROM latest
+        JOIN mt5_devices AS device ON device.bot_id = latest.bot_id AND device.device_id = latest.device_id
+        JOIN market_subscriptions AS subscription
+            ON subscription.bot_id = latest.bot_id AND subscription.chat_id = latest.chat_id
+        WHERE latest.status = 'offered' AND latest.expires_at > $3 AND latest.published_at <= $3
+            AND latest.payload->>'account_mode' = 'demo' AND latest.payload->>'volume' = '0.01'
+            AND device.account_mode = 'demo' AND device.volume = 0.01
+            AND device.owner_chat_id = latest.chat_id AND device.owner_user_id = latest.user_id
+            AND latest.chat_id = latest.user_id AND subscription.active
+            AND device.last_seen_at >= $4 AND device.last_seen_at <= $3
+        """,
+        _identifier(bot_id, positive=True), _uuid(device_id), now, now - HEARTBEAT_TTL,
+    ))
+
+
 async def list_notifications(pool, bot_id, limit=20):
     """Deliver final execution acknowledgments to the bound owner.
 
@@ -462,6 +601,28 @@ async def list_notifications(pool, bot_id, limit=20):
                 OR (offer.status IN ('expired', 'cancelled')
                     AND offer.decided_at IS NOT NULL AND offer.executing_at IS NULL))
             AND device.owner_chat_id = offer.chat_id AND device.owner_user_id = offer.user_id
+        ORDER BY offer.updated_at, offer.id LIMIT $2
+        """,
+        bot_id, limit,
+    )
+    return [_offer(row) for row in rows]
+
+
+async def list_demo_notifications(pool, bot_id, limit=20):
+    """Filter workflow before LIMIT so old legacy receipts cannot starve Demo."""
+    bot_id, limit = _identifier(bot_id, positive=True), _limit(limit)
+    if limit == 0:
+        return []
+    rows = await pool.fetch(
+        OFFER_SELECT + """
+        WHERE offer.bot_id = $1 AND NOT offer.notified
+            AND offer.payload->>'workflow' = 'demo_execution'
+            AND offer.payload->>'account_mode' = 'demo' AND offer.payload->>'volume' = '0.01'
+            AND (offer.status IN ('filled', 'failed', 'unknown')
+                OR (offer.status IN ('expired', 'cancelled')
+                    AND offer.decided_at IS NOT NULL AND offer.executing_at IS NULL))
+            AND device.owner_chat_id = offer.chat_id AND device.owner_user_id = offer.user_id
+            AND device.account_mode = 'demo' AND device.volume = 0.01
         ORDER BY offer.updated_at, offer.id LIMIT $2
         """,
         bot_id, limit,

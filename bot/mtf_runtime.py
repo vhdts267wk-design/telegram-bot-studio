@@ -108,6 +108,9 @@ def evaluate_feed(feed, now=None):
         )}}
     if not entry_window_open(result, clock):
         return blocked_with_context("entry_window_expired")
+    if demo_orders_enabled():
+        from bridge.mt5_history_contract import closed_history_sha256
+        result["closed_history_sha256"] = closed_history_sha256(feed)
     if experimental:
         return result
     evidence = configured_evidence(clock)
@@ -275,13 +278,29 @@ def _experimental_costs_valid(result, distance, tick):
     return type(fraction) in (int, float) and math.isfinite(fraction) and 0 < fraction <= .01
 
 
+def demo_orders_enabled():
+    """Execution is opt-in, Demo-only, and requires the paired manual transport."""
+    return (
+        os.getenv("MT5_DEMO_ORDERS_ENABLED", "false").strip().lower() == "true"
+        and os.getenv("MT5_MANUAL_TICKETS_ENABLED", "false").strip().lower() == "true"
+        and os.getenv("MARKET_SOURCE", "reference").strip().lower() == "mt5"
+    )
+
+
 def eligible_payload(payload, feed, now=None):
     """Check current risk, prices and closed-bar provenance without moving SL/TP."""
     try:
         clock = _clock(now)
         if not eligible_result(payload, clock) or type(feed) is not dict:
             return False
-        if payload.get("workflow") != "manual_ticket" or payload.get("account_mode") != "demo" or payload.get("volume") != 0.01:
+        workflow = payload.get("workflow")
+        if workflow != "manual_ticket" and not (workflow == "demo_execution" and demo_orders_enabled()):
+            return False
+        if workflow == "demo_execution":
+            from bridge.mt5_history_contract import closed_history_sha256
+            if payload.get("closed_history_sha256") != closed_history_sha256(feed):
+                return False
+        if payload.get("account_mode") != "demo" or payload.get("volume") != 0.01:
             return False
         # Recompute current technical/risk eligibility; the old result's
         # protection remains frozen even if a rolling window changes.

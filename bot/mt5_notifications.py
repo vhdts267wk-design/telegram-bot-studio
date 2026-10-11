@@ -28,6 +28,7 @@ from bot import manual_ticket_store, market_monitor, market_store, mtf_presentat
 logger = logging.getLogger(__name__)
 CALLBACK_PATTERN = re.compile(r"^mt5:([ar]):([0-9a-f]{32})$")
 MANUAL_CALLBACK_PATTERN = re.compile(r"^mt5manual:([pr]):([0-9a-f]{32})$")
+DEMO_CALLBACK_PATTERN = re.compile(r"^mt5demo:([ar]):([0-9a-f]{32})$")
 FRESH_SECONDS = 180
 QUOTE_FUTURE_TOLERANCE_SECONDS = 5
 OFFER_MINUTES = 5
@@ -47,11 +48,17 @@ def _id(value) -> UUID:
 
 
 def _enabled(service) -> bool:
-    return _manual_enabled(service) or _automatic_enabled(service)
+    return _manual_enabled(service) or _demo_enabled(service) or _automatic_enabled(service)
 
 
 def _manual_enabled(service) -> bool:
-    return service is not None and getattr(service, "manual_tickets_enabled", False) is True
+    return service is not None and getattr(service, "manual_tickets_enabled", False) is True and not _demo_enabled(service)
+
+
+def _demo_enabled(service) -> bool:
+    return (service is not None and getattr(service, "source", None) == "mt5"
+            and getattr(service, "manual_tickets_enabled", False) is True
+            and mtf_runtime.demo_orders_enabled())
 
 
 def _automatic_enabled(service) -> bool:
@@ -336,8 +343,8 @@ async def connect_mt5_command(update, context):
             "تراجعها وتضغط Buy أو Sell بنفسك داخل MT5. زر الرفض يلغي اقتراح التجهيز. "
             "/unwatch يوقف التنبيهات ويلغي طلبات التجهيز المعلقة."
             if _manual_enabled(service) else
-            "Accept يوافق على طلب تنفيذ عبر جهازك؛ لا يُعد الطلب منفذاً حتى يصل تأكيد MT5. "
-            "Reject يرفضه. /unwatch يوقف التنبيهات ويلغي الطلبات المعلقة."
+            "Accept يطلب صفقة Demo واحدة بحجم 0.01 مع SL وTP1 عبر جهازك؛ لا يتأكد التنفيذ حتى يصل تأكيد MT5. "
+            "Decline يرفضها. /unwatch يوقف التنبيهات ويلغي الطلبات المعلقة، ولا يغلق الصفقات المفتوحة."
         )
         await message.reply_text(
             f"تم اقتران الجهاز وتفعيل التنبيهات. الحساب: {mode} | الرمز: {device['symbol']} | الحجم: {volume:g} lot.\n"
@@ -359,14 +366,19 @@ async def manual_decision_callback(update, context):
     await _decision_callback(update, context, manual=True)
 
 
-async def _decision_callback(update, context, *, manual):
+async def demo_decision_callback(update, context):
+    """One owner approval authorizes one guarded Demo market-order attempt."""
+    await _decision_callback(update, context, manual=False, demo=True)
+
+
+async def _decision_callback(update, context, *, manual, demo=False):
     query = update.callback_query
     if query is None:
         return
     service = _service(context)
-    pattern = MANUAL_CALLBACK_PATTERN if manual else CALLBACK_PATTERN
+    pattern = DEMO_CALLBACK_PATTERN if demo else MANUAL_CALLBACK_PATTERN if manual else CALLBACK_PATTERN
     match = pattern.fullmatch(query.data) if isinstance(query.data, str) else None
-    enabled = _manual_enabled(service) if manual else _automatic_enabled(service)
+    enabled = _demo_enabled(service) if demo else _manual_enabled(service) if manual else _automatic_enabled(service)
     store = manual_ticket_store if manual else trade_store
     effective_status = _manual_effective_status if manual else _effective_status
     message, user = query.message, query.from_user
@@ -386,6 +398,7 @@ async def _decision_callback(update, context, *, manual):
             offer is None or offer.get("bot_id") != service.bot_id
             or offer.get("chat_id") != message.chat.id or offer.get("user_id") != user.id
             or offer.get("message_id") != message.message_id
+            or (demo and offer.get("payload", {}).get("workflow") != "demo_execution")
         ):
             await _answer(query, "هذا الطلب غير متاح لك.", alert=True)
             return
@@ -450,7 +463,7 @@ def _offer_text(payload, expires_at) -> str:
     )
 
 
-def _manual_offer_text(payload, expires_at) -> str:
+def _manual_offer_text(payload, expires_at, *, demo=False) -> str:
     """Lead an automatic alert with the opportunity and its frozen protection."""
     digits = _digits(payload)
     zone = proposal_overlay.reference_zone(payload)
@@ -467,7 +480,7 @@ def _manual_offer_text(payload, expires_at) -> str:
         f"الحجم: {payload['volume']:g} lot | العائد/المخاطرة بعد التكاليف: {payload['effective_reward_risk']:.2f}:1.",
         *mtf_presentation.context_lines(payload, digits),
         "السبب: H4 اتجاه عام، H1 قريب، M15 تأكيد، M5/M1 دخول؛ اجتازت فلاتر المخاطر والسبريد.",
-        f"مهلة الدخول: {seconds} ثانية من إغلاق M1؛ آخر وقت للتجهيز: {_utc(expires_at):%H:%M:%S} UTC.",
+        f"مهلة الدخول: {seconds} ثانية من إغلاق M1؛ آخر وقت {'للتنفيذ' if demo else 'للتجهيز'}: {_utc(expires_at):%H:%M:%S} UTC.",
     ]
     if experimental:
         costs = payload["cost_assumptions"]
@@ -475,12 +488,23 @@ def _manual_offer_text(payload, expires_at) -> str:
             f"التكلفة المقدّرة: عمولة {costs['commission_round_turn']:.8g} بعملة الحساب؛ "
             f"انزلاق {costs['slippage_price']:.8g} لكل جهة. المخاطرة المقدّرة حتى 1% من Equity."
         )
+    if demo:
+        lines.extend([
+            "Accept يوافق على محاولة واحدة لفتح صفقة Demo بسعر السوق مع SL وTP1 أعلاه؛ TP2 مرجع فقط.",
+            "Decline يرفضها. لا تعني الموافقة تنفيذ الصفقة؛ انتظر تأكيد MT5. لا تُعاد محاولة التنفيذ تلقائياً.",
+            "إذا انتهت المهلة أو تغير السعر أو المخاطر، يُرفض التنفيذ. اجتياز الشروط لا يضمن الربح.",
+        ])
+        return "\n".join(lines)
     lines.extend([
         "نفس المستويات بتظهر على شارت MT5 باللابتوب قبل طلب التجهيز.",
         "«جهّز على اللابتوب» بيملأ نافذة MT5 مع TP وSL فقط. بتراجعها وبتضغط Buy أو Sell بنفسك داخل MT5؛ ما في تنفيذ تلقائي.",
         "إذا خلصت المهلة أو تغيّرت البيانات أو السعر، بينرفض التجهيز. اجتياز الشروط ما بيضمن الربح.",
     ])
     return "\n".join(lines)
+
+
+def _demo_offer_text(payload, expires_at) -> str:
+    return _manual_offer_text(payload, expires_at, demo=True)
 
 
 async def send_offers(service, bot):
@@ -517,6 +541,8 @@ async def send_offers(service, bot):
                 )
                 if manual:
                     payload["workflow"] = "manual_ticket"
+                elif _demo_enabled(service):
+                    payload["workflow"] = "demo_execution"
                 if not mtf_runtime.eligible_payload(payload, feed, market_monitor.utc_now()):
                     continue
                 offer = await store.create_offer(
@@ -536,10 +562,10 @@ async def send_offers(service, bot):
                     InlineKeyboardButton("جهّز على اللابتوب", callback_data=f"mt5manual:p:{offer_id.hex}"),
                     InlineKeyboardButton("❌ رفض", callback_data=f"mt5manual:r:{offer_id.hex}"),
                 ]]) if manual else InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Accept", callback_data=f"mt5:a:{offer_id.hex}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"mt5:r:{offer_id.hex}"),
+                    InlineKeyboardButton("✅ Accept", callback_data=f"mt5demo:a:{offer_id.hex}"),
+                    InlineKeyboardButton("❌ Decline", callback_data=f"mt5demo:r:{offer_id.hex}"),
                 ]])
-                text = _manual_offer_text(offer["payload"], offer["expires_at"]) if manual else _offer_text(offer["payload"], offer["expires_at"])
+                text = _manual_offer_text(offer["payload"], offer["expires_at"]) if manual else _demo_offer_text(offer["payload"], offer["expires_at"])
                 message = await bot.send_message(chat_id, text, parse_mode=None, reply_markup=markup)
                 published = await store.publish_offer(service.pool, service.bot_id, offer_id, message.message_id, market_monitor.utc_now())
                 if not published:
@@ -619,8 +645,11 @@ async def send_results(service, bot):
         return True
     manual = _manual_enabled(service)
     store = manual_ticket_store if manual else trade_store
-    for offer in await store.list_notifications(service.pool, service.bot_id):
+    list_results = trade_store.list_demo_notifications if _demo_enabled(service) else store.list_notifications
+    for offer in await list_results(service.pool, service.bot_id):
         try:
+            if _demo_enabled(service) and offer.get("payload", {}).get("workflow") != "demo_execution":
+                continue
             if offer.get("status") in ("expired", "cancelled") and (
                 offer.get("decided_at") is None or offer.get("preparing_at" if manual else "executing_at") is not None
             ):
@@ -650,3 +679,4 @@ def register_handlers(application):
     # the callback itself still validates the exact action/UUID syntax.
     application.add_handler(CallbackQueryHandler(decision_callback, pattern=r"^mt5:"))
     application.add_handler(CallbackQueryHandler(manual_decision_callback, pattern=r"^mt5manual:"))
+    application.add_handler(CallbackQueryHandler(demo_decision_callback, pattern=r"^mt5demo:"))

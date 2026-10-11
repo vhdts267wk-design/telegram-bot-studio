@@ -661,7 +661,7 @@ async def send_news(bot, chat_id, briefing, may_send=None):
 
 async def _worker(application, service):
     while True:
-        await asyncio.sleep(5 if service.source == "mt5" else 60)
+        await asyncio.sleep(2 if mt5_notifications._demo_enabled(service) else 5 if service.source == "mt5" else 60)
         if not application.running:
             continue
         try:
@@ -680,7 +680,7 @@ async def _worker(application, service):
             if not await service.send_reviews(application.bot):
                 continue
             if service.trading_enabled or service.manual_tickets_enabled:
-                store = manual_ticket_store if service.manual_tickets_enabled else trade_store
+                store = trade_store if mt5_notifications._demo_enabled(service) else manual_ticket_store if service.manual_tickets_enabled else trade_store
                 await store.expire_offers(service.pool, service.bot_id, utc_now())
                 if not await mt5_notifications.send_results(service, application.bot):
                     continue
@@ -730,7 +730,8 @@ async def setup(application):
         await manual_ticket_store.initialize_schema(pool)
         service = MarketService(pool, application.bot.id)
         service.journal_enabled = True
-        # Every new trade remains a human click inside the native MT5 ticket.
+        # Legacy automatic execution stays disabled. The separate Demo approval
+        # workflow is explicitly gated and never permits a real account.
         service.trading_enabled = False
         application.bot_data[SERVICE_KEY] = service
         # Do not use Application.create_task for an endless worker: stop() waits
@@ -915,6 +916,17 @@ async def watch_command(update, context):
         **({"interval": market_store.MTF_DELIVERY_INTERVAL} if service.source == "mt5" else {}),
     )
     if service.source == "mt5":
+        if mt5_notifications._demo_enabled(service):
+            await message.reply_text(
+                "تم تفعيل إشعارات فرص Demo بحجم 0.01 lot فقط. تظهر أزرار Accept / Decline عند فرصة مؤهلة.\n"
+                "Accept يوافق على محاولة واحدة لفتح الصفقة التجريبية بسعر السوق مع SL وTP1 المقترحين؛ TP2 مرجع فقط. "
+                "تُفحص بيانات الأطر الخمسة والسعر والمخاطر مجدداً؛ تنتهي المهلة بعد إغلاق M1 ولا تُمدد بالموافقة. "
+                "انتظر إشعار النتيجة؛ لا تعني الموافقة التنفيذ، ولا تُعاد المحاولة تلقائياً.\n"
+                "الأداء غير مضمون؛ في الوضع التجريبي التكاليف تقديرية والأداء غير مثبت. "
+                "/unwatch يلغي الطلبات المعلقة ويوقف الإشعارات، ولا يغلق الصفقات المفتوحة.",
+                parse_mode=None,
+            )
+            return
         if mtf_runtime.signal_mode() == "experimental_demo":
             await message.reply_text(
                 "تم تفعيل متابعة إشارات Demo التجريبية — الأداء غير مثبت؛ التكاليف افتراضات تقديرية غير موثّقة.\n"
@@ -963,14 +975,14 @@ async def unwatch_command(update, context):
     await market_store.disable_subscription(
         service.pool, service.bot_id, update.effective_chat.id
     )
-    if service.trading_enabled:
+    if service.trading_enabled or mt5_notifications._demo_enabled(service):
         await trade_store.cancel_offers(service.pool, service.bot_id, update.effective_chat.id, utc_now())
     if service.manual_tickets_enabled:
         await manual_ticket_store.cancel_offers(service.pool, service.bot_id, update.effective_chat.id, utc_now())
     text = "تم إيقاف التقارير التلقائية. /watch لإعادة التفعيل."
-    if service.trading_enabled:
+    if service.trading_enabled or mt5_notifications._demo_enabled(service):
         text += "\nأُلغيت طلبات MT5 المعلقة. الطلب الذي بدأ تنفيذه والصفقات المفتوحة يجب متابعتها داخل MT5؛ سيصلك إشعار نتيجة التنفيذ."
-    if service.manual_tickets_enabled:
+    if mt5_notifications._manual_enabled(service):
         text += "\nأُلغيت طلبات تجهيز MT5 المعلقة. راجع وأغلق بنفسك أي نافذة صفقة سبق تجهيزها على اللابتوب؛ /unwatch لا يغلقها."
     await message.reply_text(text)
 

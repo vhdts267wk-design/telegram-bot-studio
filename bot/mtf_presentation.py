@@ -163,7 +163,9 @@ def format_proposal(result, *, symbol="XAUUSD", execution_enabled=False, manual_
             for metric in result.get("evidence_metrics", []):
                 lines.append(f"اختبار خارج العينة ({metric['scenario']}): {metric['wins']}/{metric['trades']} نجاح؛ النسبة الملاحظة {metric['win_rate']:.1%}، الحد الأدنى لفاصل الثقة 95%: {metric['lower_95']:.1%}.")
         lines.extend([
-            f"التنفيذ بموافقتك اليدوية لكل صفقة: وافق على التجهيز خلال {window} من إغلاق M1؛ تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك. إن فاتت النافذة انتظر إشارة جديدة.",
+            (f"Accept / Decline في إشعار الفرصة: Accept يطلب محاولة واحدة لفتح صفقة Demo بحجم 0.01 مع SL وTP1 خلال {window} من إغلاق M1؛ TP2 مرجع فقط. انتظر تأكيد MT5، ولا تُعاد محاولة التنفيذ تلقائياً."
+             if mtf_runtime.demo_orders_enabled() else
+             f"التنفيذ بموافقتك اليدوية لكل صفقة: وافق على التجهيز خلال {window} من إغلاق M1؛ تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك. إن فاتت النافذة انتظر إشارة جديدة."),
             "الأداء غير مثبت؛ اجتياز الشروط لا يثبت احتمال نجاح هذه الصفقة ولا يضمن الربح." if experimental else "النتيجة تقدير تاريخي مشروط بنموذج التنفيذ والتكاليف؛ ليست احتمالاً مثبتاً لهذه الصفقة أو ضماناً للربح.",
         ])
         return "\n".join(lines)

@@ -98,7 +98,8 @@ def build_chart_overlay(offer, device, feed, now):
         if str(UUID(str(offer["device_id"]))) != device_id or feed.get("device_id") != device_id:
             return None
         status = offer.get("status")
-        if type(status) is not str or status not in VISIBLE_STATUSES:
+        demo = offer.get("payload", {}).get("workflow") == "demo_execution"
+        if type(status) is not str or status not in ({"offered"} if demo else VISIBLE_STATUSES):
             return None
         created, published, expiry = (_utc(offer[key]) for key in ("created_at", "published_at", "expires_at"))
         if (
@@ -124,7 +125,7 @@ def build_chart_overlay(offer, device, feed, now):
             return None
         symbol = device["symbol"]
         if (
-            payload.get("workflow") != "manual_ticket" or payload.get("state") != "signal"
+            payload.get("workflow") not in ({"demo_execution"} if demo else {"manual_ticket"}) or payload.get("state") != "signal"
             or type(symbol) is not str or not symbol or payload.get("symbol") != symbol or feed.get("symbol") != symbol
             or device["account_mode"] != "demo" or payload.get("account_mode") != "demo"
             or _positive(device["volume"]) != Decimal("0.01") or _positive(payload["volume"]) != Decimal("0.01")

@@ -226,6 +226,12 @@ def _analysis_guidance(context) -> str:
 
 def _mt5_workflow_guidance(context) -> str:
     service = getattr(context, "bot_data", {}).get(market_monitor.SERVICE_KEY)
+    if market_monitor.mt5_notifications._demo_enabled(service):
+        return (
+            "على جهاز Demo المقترن بحجم 0.01 lot، Accept يطلب محاولة واحدة لفتح الصفقة "
+            "مع SL وTP1 المقترحين؛ Decline يرفضها. انتظر تأكيد MT5؛ لا تعني الموافقة التنفيذ "
+            "ولا تُعاد المحاولة تلقائياً. /unwatch يلغي الطلبات المعلقة ولا يغلق الصفقات المفتوحة."
+        )
     if getattr(service, "manual_tickets_enabled", False) is True:
         return (
             "على جهاز Demo المقترن بحجم 0.01 lot، زر «جهّز على اللابتوب» يفتح نافذة MT5 "
