@@ -99,6 +99,14 @@ and account-binding hash. It expires no later than the source feed/quote's
 It does not authorize a proposal, preparation, notification or order. The
 existing proposal validation and 18-field CSV remain unchanged.
 
+The Demo Accept helper samples guarded local display data before its network
+cycle and again after receiving chart levels. Network transit time therefore
+does not age the snapshot before it is first displayed. The 5-second feed
+schedule starts at collection, rather than after the upload finishes. Local
+readiness updates never renew the server proposal row or its original expiry.
+A single blocking request or broker outage can still exceed the unchanged
+10-second freshness limit; the panel then correctly stops showing LIVE.
+
 Each latest valid published proposal appears automatically, before a ticket
 preparation request: shaded Entry Zone, gold reference Entry, green TP and red
 SL, with direction and prices. The reference zone is entry plus/minus 0.1 times

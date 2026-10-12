@@ -471,7 +471,8 @@ class ChartExporter:
         except (OverlayError, OSError):
             pass  # A locked prior sidecar still expires within its source deadline.
 
-    def _publish_readiness(self, feed, observed_at):
+    def refresh_readiness(self, feed, observed_at):
+        """Refresh local telemetry without renewing any server proposal row."""
         try:
             if feed is None:
                 self._clear_readiness()
@@ -496,7 +497,7 @@ class ChartExporter:
         self._clear_levels(observed_at)
 
     def publish(self, value, *, execution, quote, observed_at, feed=None):
-        self._publish_readiness(feed, observed_at)
+        self.refresh_readiness(feed, observed_at)
         if value is None:
             self._clear_levels(observed_at)
             return

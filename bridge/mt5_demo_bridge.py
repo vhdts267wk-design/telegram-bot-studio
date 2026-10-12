@@ -312,8 +312,17 @@ def flush_results(settings, ledger, post=api_post):
     trade.flush_results(settings, ledger, post)
 
 
-def refresh_chart(settings, device_id, exporter, feed, *, post=api_post, clock=trade.now_utc):
-    manual.refresh_chart(settings, device_id, exporter, feed, post=post, clock=clock)
+def refresh_chart(settings, device_id, exporter, feed, *, post=api_post, clock=trade.now_utc, fresh_feed=None):
+    manual.refresh_chart(settings, device_id, exporter, feed, post=post, clock=clock, fresh_feed=fresh_feed)
+
+
+def capture_feed(mt5, settings, ledger, clock):
+    """Read one current local snapshot, bound to the verified Demo account."""
+    account_guard(mt5, settings, ledger, require_empty=False)
+    payload = market.build_payload(mt5, settings.market, clock())
+    payload.update(device_id=ledger.device_id, execution=trade.execution_metadata(mt5.symbol_info(settings.market.symbol)))
+    account_guard(mt5, settings, ledger, require_empty=False)
+    return payload
 
 
 def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.sleep, exporter_factory=None):
@@ -340,25 +349,38 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
             print("In your private bot chat, send: /connect_mt5 " + code, flush=True)
         next_feed, latest_feed = 0.0, None
         outage_reported = False
+        chart_outage_reported = False
         while trade.terminal_is_running(settings.market.terminal):
             try:
                 account_guard(mt5, settings, ledger, require_empty=False)
                 flush_results(settings, ledger, post)
-                if time.monotonic() >= next_feed:
-                    payload = market.build_payload(mt5, settings.market, clock())
-                    account_guard(mt5, settings, ledger, require_empty=False)
-                    payload.update(device_id=ledger.device_id, execution=trade.execution_metadata(mt5.symbol_info(settings.market.symbol)))
+                cycle_started = time.monotonic()
+                payload = capture_feed(mt5, settings, ledger, clock)
+                if latest_feed is not None:
+                    # Keep local counts current before blocking HTTP, without
+                    # extending an existing proposal or waiting-row deadline.
+                    exporter.refresh_readiness(payload, clock())
+                if cycle_started >= next_feed:
                     post(settings, "market", payload)
                     newly_available = latest_feed is None or outage_reported
-                    latest_feed, next_feed = payload, time.monotonic() + FEED_SECONDS
+                    latest_feed, next_feed = payload, cycle_started + FEED_SECONDS
                     if newly_available:
                         print("Fresh MT5 feed ready.", flush=True)
                     outage_reported = False
                 if latest_feed is not None:
                     try:
-                        refresh_chart(settings, ledger.device_id, exporter, latest_feed, post=post, clock=clock)
+                        refresh_chart(settings, ledger.device_id, exporter, latest_feed, post=post, clock=clock,
+                                      fresh_feed=lambda: capture_feed(mt5, settings, ledger, clock))
+                        if chart_outage_reported:
+                            print("MT5 chart display ready.", flush=True)
+                        chart_outage_reported = False
+                    except (trade.GuardError, market.MarketDataError):
+                        raise  # A failed fresh account/feed check must not reach the claim poll.
                     except Exception:
                         exporter.clear(clock())
+                        if not chart_outage_reported:
+                            print("MT5 chart display unavailable.", file=sys.stderr, flush=True)
+                        chart_outage_reported = True
                     reply = post(settings, "poll", {"device_id": ledger.device_id})
                     if type(reply) is not dict or set(reply) != {"trade"}:
                         raise trade.GuardError("Invalid Demo execution queue response.")

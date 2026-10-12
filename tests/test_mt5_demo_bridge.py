@@ -18,6 +18,7 @@ from bridge import mt5_demo_bridge as demo
 from bridge import mt5_trade_bridge as trade
 from tests import test_mt5_manual_bridge as fixtures
 from tests import test_multi_timeframe as candle_fixtures
+from tests import test_mt5_chart_overlay as overlay_fixtures
 
 
 NOW = fixtures.NOW
@@ -427,9 +428,10 @@ class DemoBridgeTests(unittest.TestCase):
             if route == "chart": return {"proposal": None}
             if route == "poll": return {"trade": self.offer if len([c for c in calls if c[0] == "poll"]) == 1 else None}
             return {}
-        sleeps = Mock()
+        elapsed = [0]
+        sleeps = Mock(side_effect=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds))
         output = io.StringIO()
-        with patch.object(trade, "terminal_is_running", side_effect=[True, True, True, False]), patch.object(demo.time, "monotonic", side_effect=[0, 0, 1]), patch.object(demo.manual.native, "NativeTicketAdapter") as native, redirect_stdout(output):
+        with patch.object(trade, "terminal_is_running", side_effect=[True, True, True, False]), patch.object(demo.time, "monotonic", side_effect=lambda: elapsed[0]), patch.object(demo.manual.native, "NativeTicketAdapter") as native, redirect_stdout(output):
             result = demo.run_bridge(self.mt5, self.settings, post=posted, sleep=sleeps, clock=lambda: NOW, exporter_factory=lambda *a: exporter)
         self.assertEqual(result, 0)
         self.assertEqual([c[0] for c in calls].count("market"), 1)
@@ -449,6 +451,7 @@ class DemoBridgeTests(unittest.TestCase):
         for failure, outage_text in ((demo.market.MarketDataError("synthetic outage"), "MT5 feed unavailable"),
                                      (RuntimeError("private transport detail"), "Demo connection unavailable")):
             exporter, output, errors = Mock(), io.StringIO(), io.StringIO()
+            elapsed = [0]
             uploads = [0]
             polls = [0]
             def posted(settings, route, payload):
@@ -461,14 +464,186 @@ class DemoBridgeTests(unittest.TestCase):
                     polls[0] += 1
                     return {"trade": None}
                 return {}
-            with self.subTest(failure=type(failure).__name__), patch.object(trade, "terminal_is_running", side_effect=[True, True, True, True, False]), patch.object(demo.time, "monotonic", side_effect=[0, 0, 5, 5, 10, 10]), redirect_stdout(output), redirect_stderr(errors):
-                result = demo.run_bridge(self.mt5, self.settings, post=posted, sleep=Mock(), clock=lambda: NOW, exporter_factory=lambda *a: exporter)
+            with self.subTest(failure=type(failure).__name__), patch.object(trade, "terminal_is_running", side_effect=[True, True, True, True, False]), patch.object(demo.time, "monotonic", side_effect=lambda: elapsed[0]), redirect_stdout(output), redirect_stderr(errors):
+                result = demo.run_bridge(self.mt5, self.settings, post=posted,
+                                         sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + 5),
+                                         clock=lambda: NOW, exporter_factory=lambda *a: exporter)
             self.assertEqual(result, 0)
             self.assertEqual(output.getvalue().count("Fresh MT5 feed ready."), 2)
             self.assertEqual(errors.getvalue().count(outage_text), 1)
             self.assertNotIn("private transport detail", errors.getvalue())
             self.assertEqual(polls[0], 2)  # The failed upload never claims work.
             self.mt5.order_send.assert_not_called()
+
+    def test_successful_slow_transport_keeps_real_readiness_fresh_without_renewing_main_row(self):
+        common = self.fixture.fixture.base / "display-common"
+        data = self.fixture.fixture.base / ("A" * 32)
+        common.mkdir()
+        data.mkdir()
+        exporter = demo.chart.ChartExporter(common, data, symbol=self.settings.market.symbol,
+                                            broker_offset_minutes=self.settings.market.broker_utc_offset_minutes,
+                                            account=self.account, nonce="12" * 16)
+        elapsed = [0.0]
+        uploads, samples, chart_feeds, previous_main = [], [], [], []
+
+        def clock():
+            return NOW + timedelta(seconds=elapsed[0])
+
+        def check_readiness():
+            if not exporter.readiness_path.exists():
+                self.assertFalse(samples, "Readiness disappeared after a successful fresh update")
+                return  # Startup, before the first chart response.
+            fields = exporter.readiness_path.read_text(encoding="ascii").split(";")
+            self.assertEqual(len(fields), 10)
+            stamp = clock().timestamp()
+            self.assertLessEqual(int(fields[1]), stamp)
+            self.assertLess(stamp, int(fields[2]), f"Readiness expired at fake time {elapsed[0]}")
+            self.assertEqual(fields[3:7], ["64"] * 4)
+            samples.append(elapsed[0])
+
+        def advance(seconds):
+            target = elapsed[0] + seconds
+            while elapsed[0] + 0.25 < target:
+                elapsed[0] += 0.25
+                check_readiness()
+            elapsed[0] = target
+
+        def collect(_mt5, settings, observed):
+            feed = overlay_fixtures.readiness_feed(observed)
+            feed["symbol"] = settings.symbol
+            feed["broker_utc_offset_minutes"] = settings.broker_utc_offset_minutes
+            return feed
+
+        def posted(settings, route, payload):
+            if route == "register":
+                return {"paired": True}
+            if route == "market":
+                uploads.append((elapsed[0], trade.utc_date(payload["as_of"])))
+                before = exporter.path.read_bytes()
+                before_mtime = exporter.path.stat().st_mtime_ns
+                if previous_main:
+                    self.assertEqual(before, previous_main[-1][0])
+                    self.assertEqual(before_mtime, previous_main[-1][1])
+                advance(4)
+                self.assertEqual(exporter.path.read_bytes(), before)
+                self.assertEqual(exporter.path.stat().st_mtime_ns, before_mtime)
+                return {}
+            if route == "chart":
+                advance(3)
+                chart_feeds.append(elapsed[0])
+                return {"proposal": None}
+            if route == "poll":
+                check_readiness()
+                fields = exporter.path.read_text(encoding="ascii").split(";")
+                self.assertEqual(fields[1], "waiting")
+                self.assertEqual(int(fields[11]), int(clock().timestamp()))
+                self.assertEqual(int(fields[12]) - int(fields[11]), 25)
+                previous_main.append((exporter.path.read_bytes(), exporter.path.stat().st_mtime_ns))
+                advance(2)
+                return {"trade": None}
+            self.fail("Unexpected transport route")
+
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(trade, "terminal_is_running", side_effect=[True] * 4 + [False]), patch.object(
+            demo.time, "monotonic", side_effect=lambda: elapsed[0]
+        ), patch.object(demo.market, "build_payload", side_effect=collect), redirect_stdout(output), redirect_stderr(errors):
+            result = demo.run_bridge(self.mt5, self.settings, post=posted, clock=clock, sleep=advance,
+                                     exporter_factory=lambda *args: exporter)
+        self.assertEqual(result, 0, errors.getvalue())
+        self.assertEqual([stamp for stamp, _ in uploads], [0, 10, 20])
+        self.assertEqual([stamp for _, stamp in uploads], [NOW + timedelta(seconds=t) for t in (0, 10, 20)])
+        self.assertEqual(chart_feeds, [7, 17, 27])
+        self.assertGreater(len(samples), 60)
+        self.assertNotIn("unavailable", errors.getvalue())
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_account_change_during_chart_response_stops_before_claim_poll(self):
+        exporter, calls, errors = Mock(), [], io.StringIO()
+        def posted(settings, route, payload):
+            calls.append(route)
+            if route == "register": return {"paired": True}
+            if route == "chart":
+                self.account.login += 1
+                return {"proposal": None}
+            if route == "poll": self.fail("A failed fresh account check reached the claim poll")
+            return {}
+        with patch.object(trade, "terminal_is_running", side_effect=[True, True, False]), patch.object(
+            demo.time, "monotonic", return_value=0
+        ), redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            result = demo.run_bridge(self.mt5, self.settings, post=posted, clock=lambda: NOW,
+                                     sleep=Mock(), exporter_factory=lambda *args: exporter)
+        self.assertEqual(result, 1)
+        self.assertEqual(calls, ["register", "market", "chart"])
+        exporter.publish.assert_not_called()
+        self.assertIn("Demo helper stopped:", errors.getvalue())
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_fresh_market_data_failure_after_chart_response_never_claims_work(self):
+        exporter, calls = Mock(), []
+        feed = demo.market.build_payload(self.mt5, self.settings.market, NOW)
+        def posted(settings, route, payload):
+            calls.append(route)
+            if route == "register": return {"paired": True}
+            if route == "chart": return {"proposal": None}
+            if route == "poll": self.fail("A failed fresh market check reached the claim poll")
+            return {}
+        with patch.object(trade, "terminal_is_running", side_effect=[True, True, False]), patch.object(
+            demo.time, "monotonic", return_value=0
+        ), patch.object(demo.market, "build_payload", side_effect=[feed, demo.market.MarketDataError("Synthetic stale quote")]), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = demo.run_bridge(self.mt5, self.settings, post=posted, clock=lambda: NOW,
+                                     sleep=Mock(), exporter_factory=lambda *args: exporter)
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["register", "market", "chart"])
+        exporter.publish.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_feed_refresh_deadline_includes_time_spent_uploading(self):
+        elapsed, uploads, exporter = [0.0], [], Mock()
+        def clock(): return NOW + timedelta(seconds=elapsed[0])
+        def collect(_mt5, settings, observed):
+            feed = overlay_fixtures.readiness_feed(observed)
+            feed.update(symbol=settings.symbol, broker_utc_offset_minutes=settings.broker_utc_offset_minutes)
+            return feed
+        def posted(settings, route, payload):
+            if route == "register": return {"paired": True}
+            if route == "market":
+                uploads.append(elapsed[0])
+                elapsed[0] += 4
+            if route == "chart": return {"proposal": None}
+            if route == "poll": return {"trade": None}
+            return {}
+        with patch.object(trade, "terminal_is_running", side_effect=[True] * 4 + [False]), patch.object(
+            demo.time, "monotonic", side_effect=lambda: elapsed[0]
+        ), patch.object(demo.market, "build_payload", side_effect=collect), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = demo.run_bridge(self.mt5, self.settings, post=posted, clock=clock,
+                                     sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+                                     exporter_factory=lambda *args: exporter)
+        self.assertEqual(result, 0)
+        self.assertEqual(uploads, [0, 5, 10])
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_account_change_during_execution_metadata_capture_never_exports_or_uploads(self):
+        exporter, post = Mock(), Mock(return_value={"paired": True})
+        original_metadata = trade.execution_metadata
+        def changed(symbol):
+            metadata = original_metadata(symbol)
+            self.account.server = "synthetic-switched-server"
+            return metadata
+        with patch.object(trade, "terminal_is_running", side_effect=[True, True, False]), patch.object(
+            demo.time, "monotonic", return_value=0
+        ), patch.object(trade, "execution_metadata", side_effect=changed), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = demo.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
+                                     sleep=Mock(), exporter_factory=lambda *args: exporter)
+        self.assertEqual(result, 1)
+        self.assertEqual([call.args[1] for call in post.call_args_list], ["register"])
+        exporter.refresh_readiness.assert_not_called()
+        exporter.publish.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
 
 
 if __name__ == "__main__":

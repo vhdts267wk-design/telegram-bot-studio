@@ -27,6 +27,13 @@ Its deadline cannot exceed ten seconds after the captured feed or quote. Missing
 invalid or stale readiness is shown as unavailable. The original 18-field
 proposal CSV, server API, strategy fingerprint and execution rules are unchanged.
 
+Local display samples are collected before the network cycle and again after
+the chart response, with Demo/account checks around each collection. Feed
+uploads are scheduled from collection time, rather than upload completion.
+Refreshing readiness alone never extends the proposal file's expiry. Slow
+requests or unavailable broker quotes can still exceed the unchanged ten-second
+freshness limit; LIVE then disappears until verified fresh data returns.
+
 The server opt-in is `MT5_DEMO_ORDERS_ENABLED=true`, together with
 `MARKET_SOURCE=mt5`, `MT5_MANUAL_TICKETS_ENABLED=true`, and the existing private
 `MT5_MANUAL_BRIDGE_KEY`. Both workflows are disabled in a clean example

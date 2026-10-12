@@ -455,6 +455,22 @@ class ExportTests(unittest.TestCase):
         self.assertFalse(self.exporter.readiness_path.exists())
         self.assertEqual(self.exporter.path.read_text(encoding="ascii").split(";")[1], "waiting")
 
+    def test_fresh_local_readiness_never_renews_waiting_or_expired_active_row(self):
+        for value in (None, proposal()):
+            with self.subTest(active=value is not None):
+                self.exporter.publish(value, execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=readiness_feed())
+                original = self.exporter.path.read_bytes()
+                later = NOW + timedelta(seconds=26)
+                self.exporter.refresh_readiness(readiness_feed(later), later)
+                self.assertEqual(self.exporter.path.read_bytes(), original)
+                self.assertLess(int(original.decode("ascii").split(";")[12]), int(later.timestamp()))
+                fields = self.exporter.readiness_path.read_text(encoding="ascii").split(";")
+                self.assertEqual(int(fields[2]), int(later.timestamp()) + 10)
+                # Re-exporting the same source after its deadline cannot keep it LIVE.
+                self.exporter.refresh_readiness(readiness_feed(later), later + timedelta(seconds=10))
+                self.assertFalse(self.exporter.readiness_path.exists())
+                self.assertEqual(self.exporter.path.read_bytes(), original)
+
     def test_invalid_readiness_destination_and_locked_clear_do_not_block_levels(self):
         self.exporter.readiness_path.mkdir()
         self.exporter.publish(proposal(), execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=readiness_feed())
