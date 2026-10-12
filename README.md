@@ -13,7 +13,7 @@ Docker, and Railway.
 - Persistent chat menu buttons after `/start`
 - `/start`, `/help`, `/about`, and `/ping` commands
 - `/gold`, `/market`, `/signals`, `/reviews` and `/news` work without OpenAI or screenshots
-- `/market` reads completed MT5 M1/M5/M15/H1/H4 candles; `/news` remains a separate request
+- `/market` reads completed MT5 M1/M5/M15/H1 candles; `/news` remains a separate request
 - Empirically gated **Demo MT5 proposals at 0.01 lot**, with a native ticket draft and the final Buy/Sell click made by the human
 - Echo replies for normal text messages
 - Fallback handler for unknown commands
@@ -52,7 +52,7 @@ The bot shows a persistent reply keyboard after `/start` with these buttons:
 | `Help`  | Show available commands          |
 | `About` | Show short bot information       |
 | `Ping`  | Check whether the bot is running |
-| `Market` | XAUUSD H4 overall trend, H1 near trend, M15 confirmation and M5/M1 entry timing |
+| `Market` | XAUUSD H1 overall trend, M15 confirmation and M5/M1 entry timing |
 | `News` | Cited political and economic news |
 | `Signals` | A qualified manual Demo proposal or an explicit waiting reason |
 
@@ -69,7 +69,7 @@ Telegram bots cannot display custom buttons before a user starts or messages the
 | `/gold`  | Market report when connected; optional chart-photo guidance otherwise |
 | `/market` | XAUUSD data without screenshots |
 | `/news` | Cited political and macroeconomic developments |
-| `/signals` | Inspect a qualified five-timeframe proposal or its blocking reason; no order is sent |
+| `/signals` | Inspect a qualified four-timeframe proposal or its blocking reason; no order is sent |
 | `/reviews` | Legacy reference-paper observation records; these are not the MTF qualification study |
 | `/watch` | Monitor quietly and notify only about a new eligible opportunity |
 | `/unwatch` | Stop reports and cancel pending preparation requests; close any prepared window yourself |
@@ -107,24 +107,24 @@ another chart tab is selected. Waiting updates do not trigger alerts. Its
 expiry, device binding and closed-M1/fresh-feed checks remain in force. A
 preparation request only fills a native Demo ticket; Buy/Sell remains manual.
 
-The current MT5 strategy is `mtf-ema-pullback-60m-v2` (version 2, policy
-`mtf-manual-demo-cost-risk-v2`): **H4 overall trend → H1 near trend → M15
+The current MT5 strategy is `mtf-ema-pullback-60m-v4` (version 4, policy
+`mtf-manual-demo-cost-risk-v4`): **H1 overall trend → M15
 confirmation → M5 pullback/recovery and M1 entry timing**.
 It uses EMA9/EMA21 and ATR14 from actual completed broker candles. Each stream
 contains at most 64 actual bars and needs a contiguous suffix of at least 22;
-  any gap resets indicator warmup. With H4 this means about 88 trading hours of
-  continuous history after a gap, including a weekend closure; the bot waits
-  throughout that warmup. Missing bars are never filled, and no forming candle
-  or later H4/H1/M15/M5 close can confirm an earlier M1 decision. H1/H4
+any gap resets indicator warmup. H4 is not read or required; H1 still needs
+22 contiguous completed bars after its latest gap. Missing bars are never
+filled, and no forming candle or later H1/M15/M5 close can confirm an earlier
+M1 decision. H1
 bars use the explicitly verified broker UTC offset to identify their boundaries.
 
-The five-frame context reports each completed stream as BUY, SELL or NEUTRAL.
-H1 or H4 opposing the M15 direction produces `higher_timeframe_conflict` and
-waits with reduced qualitative confidence; neutral H1/H4 also waits. A short
+The four-frame context reports each completed stream as BUY, SELL or NEUTRAL.
+H1 opposing the M15 direction produces `higher_timeframe_conflict` and
+waits with reduced qualitative confidence; neutral H1 also waits. A short
 upward move against a downward higher trend cannot become a strong automatic
 BUY suggestion. Alignment and confidence describe agreement among frames;
 they are not a win probability. Support and resistance are the low/high range
-of the latest 20 contiguous completed H4 bars, retained only on the appropriate
+of the latest 20 contiguous completed H1 bars, retained only on the appropriate
 side of the current quote midpoint. These are observed ranges, not confirmed
 pivots or guaranteed turning points.
 
@@ -147,13 +147,13 @@ raw OOS trade count; missing or reduced effective sample size blocks
 qualification. Nonoverlap alone does not establish independence. A historical
 confidence bound is neither a probability for the next trade nor a guarantee.
 Feed-provided reports, AI confidence and provisional research cannot qualify.
-The five-frame change invalidates evidence and pending proposals from the
-older three-frame identities; qualified mode needs a newly reviewed artifact
+The four-frame change invalidates evidence and pending proposals from the
+older three-frame and five-frame identities; qualified mode needs a newly reviewed artifact
 matching the current implementation and policy.
 
 An explicit `MT5_SIGNAL_MODE=experimental_demo` opt-in enables a separate Demo
-research profile, `mtf-ema-pullback-60m-demo-v3` (version 3, policy
-`mtf-manual-demo-estimated-cost-risk-v3`). Its messages and chart labels
+research profile, `mtf-ema-pullback-60m-demo-v5` (version 5, policy
+`mtf-manual-demo-estimated-cost-risk-v5`). Its messages and chart labels
 say that performance is unproven and costs are estimates; it carries no
 qualification ID or certified win-rate claim. The M5 pullback may occur in any
 of the three preceding completed candles, followed by the latest completed
@@ -200,7 +200,7 @@ checks. Tick activity must be at least half the preceding 20-bar median; it is
 a price-update proxy, not verified traded volume or market depth.
 
 Historical qualification requires same-broker UTC Bid/Ask tick history,
-completed M1/M5/M15/H1/H4 history, file fingerprints, verified timestamp/DST provenance,
+completed M1/M5/M15/H1 history, file fingerprints, verified timestamp/DST provenance,
 chronological development/validation/untouched OOS splits, and commission,
 slippage, financing and 0.01-lot contract/cash-conversion assumptions covering
 the tested period. Record historical tick size, point, digits and stop/margin
@@ -260,7 +260,7 @@ before journal persistence can leave that signal without a review record.
 
 The current [Windows manual helper](bridge/MANUAL-TICKETS.md) uses an already
 running connected MT5 terminal, reads the actual account and broker settings,
-and uploads the five closed candle streams. Install its Windows dependencies
+and uploads the four closed candle streams. Install its Windows dependencies
 separately from server requirements. Use `MARKET_SOURCE=mt5`,
 `MT5_MANUAL_TICKETS_ENABLED=true`, `MT5_TRADING_ENABLED=false` and a distinct
 private `MT5_MANUAL_BRIDGE_KEY` of at least 32 characters. PostgreSQL is required

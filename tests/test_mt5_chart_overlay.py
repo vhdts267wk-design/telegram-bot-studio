@@ -27,24 +27,25 @@ def proposal():
         "stop": 2490.0, "target": 2520.0, "price_digits": 2,
         "execution": deepcopy(EXECUTION), "bar_time": (NOW - timedelta(minutes=1)).isoformat(),
         "expires_at": (NOW + timedelta(minutes=4)).isoformat(),
-        "strategy_id": "mtf-ema-pullback-60m-v2", "strategy_version": 2,
-        "policy_id": "mtf-manual-demo-cost-risk-v2", "horizon_seconds": 3600,
+        "strategy_id": "mtf-ema-pullback-60m-v4", "strategy_version": 4,
+        "policy_id": "mtf-manual-demo-cost-risk-v4", "horizon_seconds": 3600,
         "strategy_fingerprint": "a" * 64, "qualification_id": "b" * 64,
         "direction_bar_time": (NOW - timedelta(minutes=15)).isoformat(),
         "confirmation_bar_time": (NOW - timedelta(minutes=5)).isoformat(),
         "broker_utc_offset_minutes": 180,
         "context_bar_times": {frame: datetime.fromtimestamp(chart.latest_closed_reference(
-            NOW.timestamp(), seconds, 180), timezone.utc).isoformat() for frame, seconds in (("H1", 3600), ("H4", 14400))},
+            NOW.timestamp(), seconds, 180), timezone.utc).isoformat() for frame, seconds in (("H1", 3600),)},
         "timeframe_context": {"trends": {frame: "BUY" for frame in chart.FRAME_SECONDS}, "alignment": "aligned",
-                              "confidence": "aligned", "counter_trend": False, "support": 2490.0, "resistance": 2520.0},
+                              "confidence": "aligned", "counter_trend": False, "levels_timeframe": "H1",
+                              "support": 2490.0, "resistance": 2520.0},
     }
 
 
 def experimental_proposal():
     value = proposal()
     value.pop("qualification_id")
-    value.update(strategy_id="mtf-ema-pullback-60m-demo-v3", strategy_version=3,
-                 policy_id="mtf-manual-demo-estimated-cost-risk-v3", signal_mode="experimental_demo",
+    value.update(strategy_id="mtf-ema-pullback-60m-demo-v5", strategy_version=5,
+                 policy_id="mtf-manual-demo-estimated-cost-risk-v5", signal_mode="experimental_demo",
                  provisional=True, entry_window_seconds=30, expires_at=(NOW + timedelta(seconds=30)).isoformat(),
                  cost_assumptions={"verified": False, "method": "spread_tick_floor_v1", "commission_round_turn": 0.2,
                                    "slippage_price": 0.1, "spread_price": 0.2, "tick_size": 0.01})
@@ -62,7 +63,7 @@ class ValidationTests(unittest.TestCase):
         later = NOW + timedelta(seconds=20)
         self.assertTrue(self.validate(value, quote=dict(QUOTE, time=later.isoformat()), now=later).experimental)
         self.assertFalse(self.validate().experimental)
-        for field, changed in (("strategy_id", "mtf-ema-pullback-60m-v2"), ("provisional", False),
+        for field, changed in (("strategy_id", "mtf-ema-pullback-60m-v4"), ("provisional", False),
                                ("strategy_version", 1), ("entry_window_seconds", 10),
                                ("qualification_id", "b" * 64), ("cost_assumptions", None),
                                ("expires_at", (NOW + timedelta(seconds=31)).isoformat())):
@@ -115,10 +116,10 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(chart.OverlayError):
             self.validate(changed)
 
-    def test_five_frame_context_and_offset_causal_higher_references_are_required(self):
+    def test_four_frame_context_and_offset_causal_h1_reference_are_required(self):
         mutations = [
             lambda value: value.pop("context_bar_times"),
-            lambda value: value["context_bar_times"].pop("H4"),
+            lambda value: value["context_bar_times"].pop("H1"),
             lambda value: value["context_bar_times"].update(H1=NOW.isoformat()),
             lambda value: value["context_bar_times"].update(H4=NOW.replace(hour=8, minute=0).isoformat()),
             lambda value: value.update(broker_utc_offset_minutes=0),
@@ -126,6 +127,8 @@ class ValidationTests(unittest.TestCase):
             lambda value: value["timeframe_context"]["trends"].pop("H1"),
             lambda value: value["timeframe_context"]["trends"].update(H4="SELL"),
             lambda value: value["timeframe_context"]["trends"].update(H1="NEUTRAL"),
+            lambda value: value["timeframe_context"].pop("levels_timeframe"),
+            lambda value: value["timeframe_context"].update(levels_timeframe="H4"),
             lambda value: value["timeframe_context"].update(alignment="counter_trend", confidence="reduced", counter_trend=True),
             lambda value: value["timeframe_context"].update(support=float("nan")),
             lambda value: value["timeframe_context"].update(resistance=True),
@@ -136,10 +139,40 @@ class ValidationTests(unittest.TestCase):
             mutate(value)
             with self.subTest(mutation=mutate), self.assertRaises(chart.OverlayError):
                 self.validate(value)
-        # The configured +03:00 broker's last completed H4 began at 05:00 UTC,
-        # whereas flooring UTC directly would incorrectly select 08:00 UTC.
-        self.assertEqual(chart.utc(proposal()["context_bar_times"]["H4"]).hour, 5)
+        self.assertEqual(set(proposal()["context_bar_times"]), {"H1"})
+        self.assertEqual(chart.utc(proposal()["context_bar_times"]["H1"]).hour, 11)
         self.validate()
+
+    def test_old_five_frame_strategy_profiles_are_rejected_even_with_current_context(self):
+        for experimental in (False, True):
+            value = experimental_proposal() if experimental else proposal()
+            value.update(strategy_id="mtf-ema-pullback-60m-demo-v3" if experimental else "mtf-ema-pullback-60m-v2",
+                         strategy_version=3 if experimental else 2,
+                         policy_id="mtf-manual-demo-estimated-cost-risk-v3" if experimental else "mtf-manual-demo-cost-risk-v2")
+            with self.subTest(experimental=experimental), self.assertRaises(chart.OverlayError):
+                self.validate(value)
+
+    def test_local_context_uses_only_four_histories_and_h1_levels(self):
+        frames = {}
+        for frame, seconds in chart.FRAME_SECONDS.items():
+            last = chart.latest_closed_reference(NOW.timestamp(), seconds, 180)
+            frames[frame] = [
+                {"time": datetime.fromtimestamp(last - (63 - index) * seconds, timezone.utc).isoformat(),
+                 "open": 2493.7 + index * .1, "high": 2494.2 + index * .1,
+                 "low": 2493.2 + index * .1, "close": 2493.7 + index * .1, "tick_volume": 100}
+                for index in range(64)
+            ]
+        feed = {"timeframes": frames, "quote": deepcopy(QUOTE), "broker_utc_offset_minutes": 180}
+        result = chart.current_timeframe_context(feed, observed_at=NOW, broker_offset_minutes=180)
+        self.assertEqual(set(result["trends"]), {"H1", "M15", "M5", "M1"})
+        self.assertEqual(result["alignment"], "aligned")
+        self.assertEqual(result["levels_timeframe"], "H1")
+        self.assertEqual(result["support"], min(row["low"] for row in frames["H1"][-20:]))
+        self.assertEqual(result["resistance"], max(row["high"] for row in frames["H1"][-20:]))
+        # Reject an old five-frame envelope rather than depending on its H4 history.
+        frames["H4"] = []
+        with self.assertRaises(chart.OverlayError):
+            chart.current_timeframe_context(feed, observed_at=NOW, broker_offset_minutes=180)
 
     def test_original_reference_bars_remain_fixed_until_the_original_expiry(self):
         later = NOW + timedelta(minutes=2)

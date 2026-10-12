@@ -38,7 +38,7 @@ class MtfPresentationTests(unittest.TestCase):
             result = self.qualified()
             original = deepcopy(result)
             text = presentation.format_proposal(result, symbol="XAUUSD", manual_ticket_enabled=True)
-            for marker in ("شراء BUY", "XAUUSD", "M15", "M5", "M1", "H1", "H4", "شموع مكتملة",
+            for marker in ("شراء BUY", "XAUUSD", "M15", "M5", "M1", "H1", "شموع مكتملة",
                            "SL:", "TP1:", "TP2:", "180/200", "95%", "60 دقيقة",
                            "موافقتك اليدوية لكل صفقة", "بنفسك", "الوقف والهدف ثابتين",
                            "ليست احتمالاً مثبتاً لهذه الصفقة", "التكاليف",
@@ -94,10 +94,10 @@ class MtfPresentationTests(unittest.TestCase):
                 self.assertIn(explanation, text)
                 self.assert_no_trade(text)
 
-    def test_chart_observations_are_closed_causal_and_identify_all_five_roles(self):
+    def test_chart_observations_are_closed_causal_and_identify_all_four_roles(self):
         with fixtures.pinned_synthetic_evidence(self.feed, self.now):
             text = presentation.format_analysis(self.feed, mtf_runtime.blocked(), self.now, include_proposal=False)
-            for marker in ("H4 — الاتجاه العام: ميل صاعد", "H1 — الاتجاه القريب: ميل صاعد",
+            for marker in ("H1 — الاتجاه العام: ميل صاعد",
                            "M15 — تأكيد الاتجاه: ميل صاعد", "M5 — إشارة الدخول: ميل صاعد",
                            "M1 — توقيت الدخول: ميل صاعد", "آخر إغلاق", "UTC", "عمق السوق غير متاحين"):
                 self.assertIn(marker, text)
@@ -186,7 +186,7 @@ class MtfPresentationTests(unittest.TestCase):
 
     def test_higher_frame_conflict_waits_with_reduced_qualitative_confidence(self):
         sell_feed = candle_fixtures.MultiTimeframeTests().feed(sell=True)
-        for frame in ("H1", "H4"):
+        for frame in ("H1",):
             with self.subTest(frame=frame):
                 feed = deepcopy(self.feed)
                 feed["timeframes"][frame] = deepcopy(sell_feed["timeframes"][frame])
@@ -198,7 +198,7 @@ class MtfPresentationTests(unittest.TestCase):
                 self.assert_no_trade(text)
 
     def test_neutral_higher_frame_waits_without_recommending_buy_or_sell(self):
-        for frame in ("H1", "H4"):
+        for frame in ("H1",):
             with self.subTest(frame=frame):
                 feed = deepcopy(self.feed)
                 for bar in feed["timeframes"][frame]:
@@ -210,29 +210,29 @@ class MtfPresentationTests(unittest.TestCase):
                 self.assertIn("ننتظر اتجاهاً أوضح", text)
                 self.assert_no_trade(text)
 
-    def test_h4_observed_support_and_resistance_are_closed_range_not_probability(self):
+    def test_h1_observed_support_and_resistance_are_closed_range_not_probability(self):
         result = multi_timeframe.analyze_multi_timeframe(self.feed, self.now)
         text = presentation.format_analysis(self.feed, result, self.now, include_proposal=False)
         context = result["timeframe_context"]
-        self.assertEqual(context["support"], min(bar["low"] for bar in self.feed["timeframes"]["H4"][-20:]))
+        self.assertEqual(context["support"], min(bar["low"] for bar in self.feed["timeframes"]["H1"][-20:]))
         for name in ("support", "resistance"):
             if context[name] is not None:
                 self.assertIn(f"{context[name]:.3f}", text)
-        self.assertIn("H4 من شموع مكتملة", text)
+        self.assertIn("H1 من شموع مكتملة", text)
         self.assertIn("ليست نسبة نجاح", text)
         self.assert_no_trade(text)
 
-    def test_broker_offset_allows_closed_h4_boundaries_outside_utc_four_hour_grid(self):
+    def test_broker_offset_retains_closed_h1_observations(self):
         feed = candle_fixtures.MultiTimeframeTests().feed(broker_offset=60)
         result = multi_timeframe.analyze_multi_timeframe(feed, self.now)
         text = presentation.format_analysis(feed, result, self.now, include_proposal=False)
-        self.assertIn("H4 — الاتجاه العام: ميل صاعد", text)
-        self.assertIn("H4 من شموع مكتملة", text)
+        self.assertIn("H1 — الاتجاه العام: ميل صاعد", text)
+        self.assertIn("H1 من شموع مكتملة", text)
 
     def test_forming_or_missing_higher_frame_cannot_display_actionable_proposal(self):
         with fixtures.pinned_synthetic_evidence(self.feed, self.now):
             result = self.qualified()
-            for frame in ("H1", "H4"):
+            for frame in ("H1",):
                 for failure in ("forming", "missing"):
                     with self.subTest(frame=frame, failure=failure):
                         feed = deepcopy(self.feed)

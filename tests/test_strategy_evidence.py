@@ -62,7 +62,7 @@ def report(*, wins=180, total=200):
                        "sha256": "d" * 64} for name, kind, timeframe in
                       (("M1", "candles", "M1"), ("M5", "candles", "M5"),
                        ("M15", "candles", "M15"), ("H1", "candles", "H1"),
-                       ("H4", "candles", "H4"), ("ticks", "ticks", None))],
+                       ("ticks", "ticks", None))],
             "cost_scenarios": [cost],
             "execution_specs": {"tick_size": .01, "point": .01, "digits": 2, "stops_level": 0,
                                 "verified": True, "evidence_sha256": "b" * 64,
@@ -116,6 +116,19 @@ class StrategyEvidenceTests(unittest.TestCase):
         for key, changed in changes:
             value = report(); value[key] = changed
             self.assertFalse(self.assess(value).qualified)
+
+    def test_new_evidence_needs_four_frames_and_old_five_frame_strategy_is_not_reused(self):
+        value = report()
+        self.assertEqual({item["timeframe"] for item in value["dataset"]["files"] if item["kind"] == "candles"},
+                         {"H1", "M15", "M5", "M1"})
+        self.assertTrue(self.assess(value).qualified)
+        value["strategy"]["strategy_id"] = "mtf-ema-pullback-60m-v2"
+        self.assertFalse(self.assess(value).qualified)
+        value = report()
+        for item in value["dataset"]["files"]:
+            if item["timeframe"] == "H1":
+                item.update(name="H4", timeframe="H4")
+        self.assertFalse(self.assess(value).qualified)
 
     def test_dataset_and_cost_provenance_cannot_be_assumed(self):
         for key, changed in (("provenance_verified", False), ("price_basis", "candles_only"),

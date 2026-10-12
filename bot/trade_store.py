@@ -446,7 +446,7 @@ async def complete_offer(pool, bot_id, device_id, offer_id, claim_id, result, no
 
 
 async def claim_demo_offer(pool, bot_id, device_id, now, *, qualified):
-    """Claim one current five-frame Demo approval under an exclusive device lock."""
+    """Claim one current four-frame Demo approval under an exclusive device lock."""
     from bot import mtf_runtime
     if not mtf_runtime.demo_orders_enabled() or not mtf_runtime.eligible_result(qualified, _utc(now)):
         return None

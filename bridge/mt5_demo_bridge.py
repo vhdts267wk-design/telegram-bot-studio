@@ -166,7 +166,7 @@ def prepare_order(mt5, settings, ledger, offer, clock=trade.now_utc):
     adapted = adapted_offer(offer, settings, clock())
     account_guard(mt5, settings, ledger)
     validation_settings = manual.Settings(settings.market, settings.state_directory, "demo", trade.DEMO_VOLUME, True)
-    # The unchanged modern validator reads all five closed histories and checks
+    # The modern validator reads all four closed histories and checks
     # provenance, fixed levels, costs, cash risk, reward/risk and free margin.
     manual.prepare_draft(mt5, validation_settings, ledger, adapted, clock())
     account_guard(mt5, settings, ledger)  # Recheck after slow history/risk reads.

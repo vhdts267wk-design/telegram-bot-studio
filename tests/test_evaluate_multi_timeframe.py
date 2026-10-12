@@ -2,6 +2,8 @@
 
 from datetime import datetime, timedelta, timezone
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from tools import evaluate_multi_timeframe as evaluate
 
@@ -26,6 +28,18 @@ def ticks(points):
 
 
 class EvaluatorTests(unittest.TestCase):
+    def test_offline_loader_requires_no_h4_file_for_new_four_frame_profile(self):
+        manifest = {"files": [{"name": frame, "kind": "candles", "timeframe": frame,
+                                "path": frame + ".jsonl", "sha256": "a" * 64}
+                               for frame in ("M1", "M5", "M15", "H1")]}
+        bar = {"time": NOW.isoformat(), "open": 100, "high": 101, "low": 99, "close": 100, "tick_volume": 20}
+        with patch.object(evaluate, "file_hash", return_value="a" * 64), patch.object(evaluate, "rows", return_value=[bar]):
+            candles, ticks, fingerprints = evaluate.load_data(manifest, Path("."))
+        self.assertEqual(set(candles), {"M1", "M5", "M15", "H1"})
+        self.assertTrue(all(len(bars) == 1 for bars in candles.values()))
+        self.assertEqual(len(fingerprints), 4)
+        self.assertEqual(len(ticks), 0)
+
     def test_next_tick_and_first_stop_precede_later_target(self):
         series = ticks([(0, 100, 100.1), (1, 100, 100.1), (2, 94.9, 95), (3, 111, 111.1)])
         result = tick_outcome(series, CANDIDATE)
