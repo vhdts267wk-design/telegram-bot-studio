@@ -14,6 +14,19 @@ qualified and v5 experimental identities reject older five-frame proposals
 and qualification artifacts. H1 levels use its last 20 completed bars and carry
 `levels_timeframe: H1` in the context contract.
 
+Use display indicator 2.13 for the four-frame panel. It shows the live connection,
+H1/M15/M5/M1 closed-candle readiness and the specific warmup count, plus only
+those four chart-view buttons. A full 22/22 readiness tile means history is
+available, not that a signal or order has been approved. Telegram Accept remains
+the sole owner approval for a Demo attempt; the panel cannot submit one.
+
+The local helper writes a separate expiring `readiness_<terminal-key>.csv`
+snapshot beside the existing proposal file. This display-only snapshot uses the
+same terminal/account binding and four actual contiguous closed-bar counts.
+Its deadline cannot exceed ten seconds after the captured feed or quote. Missing,
+invalid or stale readiness is shown as unavailable. The original 18-field
+proposal CSV, server API, strategy fingerprint and execution rules are unchanged.
+
 The server opt-in is `MT5_DEMO_ORDERS_ENABLED=true`, together with
 `MARKET_SOURCE=mt5`, `MT5_MANUAL_TICKETS_ENABLED=true`, and the existing private
 `MT5_MANUAL_BRIDGE_KEY`. Both workflows are disabled in a clean example

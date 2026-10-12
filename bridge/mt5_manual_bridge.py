@@ -425,7 +425,7 @@ def refresh_chart(settings, device_id, exporter, feed, *, post=api_post, clock=t
     reply = post(settings, "chart", {"device_id": device_id})
     if type(reply) is not dict or set(reply) != {"proposal"}:
         raise chart.OverlayError("Invalid chart response")
-    exporter.publish(reply["proposal"], execution=feed.get("execution"), quote=feed.get("quote"), observed_at=clock())
+    exporter.publish(reply["proposal"], execution=feed.get("execution"), quote=feed.get("quote"), observed_at=clock(), feed=feed)
 
 
 def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.sleep, adapter_factory=None, exporter_factory=None):

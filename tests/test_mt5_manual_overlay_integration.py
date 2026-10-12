@@ -65,6 +65,7 @@ class HelperOverlayTests(unittest.TestCase):
             self.assertIsNone(call.args[0])
             self.assertEqual(call.kwargs["execution"], trade.execution_metadata(self.fixture.symbol))
             self.assertEqual(call.kwargs["quote"]["bid"], 2500)
+            self.assertEqual(call.kwargs["feed"]["quote"]["bid"], 2500)
         self.assertEqual(self.exporter.clear.call_count, 2)  # Startup and shutdown.
         self.assertEqual(trade.FEED_SECONDS, 60)  # Automatic/global cadence is unchanged.
 
@@ -114,7 +115,7 @@ class HelperOverlayTests(unittest.TestCase):
         feed = {"execution": {"digits": 2}, "quote": {"time": "synthetic"}}
         manual.refresh_chart(self.settings, "local-device", self.exporter, feed, post=post, clock=lambda: fixtures.NOW)
         post.assert_called_once_with(self.settings, "chart", {"device_id": "local-device"})
-        self.exporter.publish.assert_called_once_with(None, execution=feed["execution"], quote=feed["quote"], observed_at=fixtures.NOW)
+        self.exporter.publish.assert_called_once_with(None, execution=feed["execution"], quote=feed["quote"], observed_at=fixtures.NOW, feed=feed)
         self.adapter.prepare.assert_not_called()
         post.return_value = {"proposal": None, "claim_id": "forbidden"}
         with self.assertRaises(chart.OverlayError):
