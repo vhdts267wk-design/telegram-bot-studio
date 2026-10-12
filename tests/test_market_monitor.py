@@ -69,7 +69,7 @@ class BrokerFeedTests(unittest.TestCase):
         self.assertIsInstance(result["candles"][0]["close"], float)
         self.assertEqual(result["quote"]["time"], original["quote"]["time"])
         self.assertEqual(original["candles"][0]["close"], 1995.4)
-        self.assertEqual(set(result["timeframes"]), {"M15", "M5", "M1", "H1", "H4"})
+        self.assertEqual(set(result["timeframes"]), {"M15", "M5", "M1", "H1"})
         self.assertEqual(result["risk_context"], original["risk_context"])
 
     def test_rejects_bad_shapes_values_times_ranges_and_tick_counts(self):
@@ -446,7 +446,7 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
             await monitor.market_command(update, context)
         message.reply_text.assert_awaited_once()
         text = message.reply_text.await_args.args[0]
-        self.assertIn("M1 / M5 / M15 / H1 / H4", text)
+        self.assertIn("M1 / M5 / M15 / H1", text)
         self.assertIn("M15 — تأكيد الاتجاه: ميل", text)
         self.assertIn("M5 — إشارة الدخول: ميل", text)
         self.assertIn("M1 — توقيت الدخول: ميل", text)
@@ -493,7 +493,7 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
             await monitor.market_command(update, context)
         message.reply_text.assert_awaited_once()
         text = message.reply_text.await_args.args[0]
-        self.assertIn("M1 / M5 / M15 / H1 / H4", text)
+        self.assertIn("M1 / M5 / M15 / H1", text)
         self.assertIn("M1 — توقيت الدخول", text)
         self.assertEqual(text.count("لا توجد فرصة مؤكدة الشروط"), 1)
         self.assertEqual(text.count("السبب:"), 1)
@@ -518,7 +518,7 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
         ) as save, patch.object(monitor.trade_store, "create_offer", new_callable=AsyncMock) as offer:
             await monitor.market_command(update, context)
         text = message.reply_text.await_args.args[0]
-        self.assertIn("M1 / M5 / M15 / H1 / H4", text)
+        self.assertIn("M1 / M5 / M15 / H1", text)
         self.assertIn("M15 — تأكيد الاتجاه: ميل", text)
         self.assertIn("M5 — إشارة الدخول: ميل", text)
         self.assertIn("M1 — توقيت الدخول: ميل", text)

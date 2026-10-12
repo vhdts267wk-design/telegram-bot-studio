@@ -9,7 +9,7 @@ REASONS = {
     "evidence_unavailable": "لم تثبت الأدلة خارج العينة شرط 70% و200 صفقة بعد التكاليف.",
     "unverified_costs": "تكاليف العمولة والانزلاق غير موثّقة.",
     "costs_unverified": "تكاليف العمولة والانزلاق غير موثّقة.",
-    "missing_timeframes": "بيانات أحد الأطر M1 أو M5 أو M15 أو H1 أو H4 غير متاحة.",
+    "missing_timeframes": "بيانات أحد الأطر M1 أو M5 أو M15 أو H1 غير متاحة.",
     "insufficient_history": "نحتاج 22 شمعة مكتملة ومتّصلة بعد آخر فجوة في كل إطار.",
     "stale_quote": "السعر أقدم من 10 ثوانٍ.",
     "stale_snapshot": "تحديث الربط قديم.",
@@ -30,11 +30,11 @@ REASONS = {
     "broker_protection_distance": "الوقف أو الهدف لا يطابق قيود الوسيط.",
     "risk_pause": "الإشارات موقوفة مؤقتاً بسبب فلتر المخاطر.",
     "experimental_profile_invalid": "بيانات الإشارة التجريبية أو افتراضات تكاليفها غير صالحة للتحقق.",
-    "higher_timeframe_conflict": "إشارة الدخول تعاكس اتجاه H1 أو H4؛ ننتظر توافق الأطر. الثقة النوعية منخفضة، وليست نسبة نجاح أو إشارة شراء قوية.",
-    "higher_timeframe_neutral": "اتجاه H1 أو H4 محايد؛ ننتظر اتجاهاً أوضح قبل اقتراح الدخول.",
+    "higher_timeframe_conflict": "إشارة الدخول تعاكس اتجاه H1؛ ننتظر توافق الأطر. الثقة النوعية منخفضة، وليست نسبة نجاح أو إشارة شراء قوية.",
+    "higher_timeframe_neutral": "اتجاه H1 محايد؛ ننتظر اتجاهاً أوضح قبل اقتراح الدخول.",
 }
 HIGH_RISK = {"extreme_true_range", "low_tick_activity", "excessive_or_unknown_spread", "equity_risk_limit", "insufficient_reward_after_costs", "existing_exposure", "insufficient_free_margin"}
-FRAME_ROLES = (("H4", 14400, "الاتجاه العام"), ("H1", 3600, "الاتجاه القريب"),
+FRAME_ROLES = (("H1", 3600, "الاتجاه العام"),
                ("M15", 900, "تأكيد الاتجاه"), ("M5", 300, "إشارة الدخول"),
                ("M1", 60, "توقيت الدخول"))
 TREND_LABELS = {"BUY": "صاعد", "SELL": "هابط", "NEUTRAL": "محايد"}
@@ -52,7 +52,7 @@ def context_lines(result, digits=2):
         labels = {frame: TREND_LABELS[value] for frame, value in trends.items()}
         alignment = {"aligned": "متوافقة مع الدخول", "counter_trend": "معاكسة للدخول", "unconfirmed": "غير مؤكّدة"}[context["alignment"]]
         confidence = {"aligned": "مدعومة بتوافق الأطر", "reduced": "منخفضة بسبب التعارض", "unconfirmed": "غير مؤكّدة"}[context["confidence"]]
-        if type(context.get("counter_trend")) is not bool:
+        if type(context.get("counter_trend")) is not bool or context.get("levels_timeframe") != "H1":
             raise ValueError("Invalid alignment context")
         levels = []
         for key, name in (("support", "دعم"), ("resistance", "مقاومة")):
@@ -61,9 +61,9 @@ def context_lines(result, digits=2):
                 raise ValueError("Invalid observed level")
             levels.append(f"{name} {value:.{digits}f}" if value is not None else f"{name} غير متاح")
         return [
-            f"الأطر الكبيرة: H1 {labels['H1']} | H4 {labels['H4']} — {alignment}.",
+            f"الاتجاه العام: H1 {labels['H1']} — {alignment}.",
             f"الثقة النوعية: {confidence}؛ وصف لتوافق الأطر، وليست نسبة نجاح.",
-            "H4 من شموع مكتملة: " + " | ".join(levels) + ".",
+            "H1 من شموع مكتملة: " + " | ".join(levels) + ".",
         ]
     except (KeyError, TypeError, ValueError, OverflowError):
         return []
@@ -109,7 +109,7 @@ def status_text(result, *, include_context=True):
     elif type(result) is dict and result.get("state") == "warmup":
         detail = REASONS["insufficient_history"]
     else:
-        detail = "بيانات السوق أو المخاطر غير مكتملة أو شروط الأطر الخمسة غير متوافقة."
+        detail = "بيانات السوق أو المخاطر غير مكتملة أو شروط الأطر الأربعة غير متوافقة."
     text = title + "\nالسبب: " + detail
     summary = context_lines(result) if include_context else []
     if summary:
@@ -139,13 +139,13 @@ def format_proposal(result, *, symbol="XAUUSD", execution_enabled=False, manual_
         window = _window_text(result)
         lines = [
             f"إشارة Demo تجريبية — الأداء غير مثبت — {symbol} | {text}" if experimental else f"إشارة مؤهلة للاختبار التجريبي — {symbol} | {text}",
-            "H4 اتجاه عام → H1 اتجاه قريب → M15 تأكيد → M5/M1 دخول؛ شموع مكتملة.",
+            "H1 اتجاه عام → M15 تأكيد → M5/M1 دخول؛ شموع مكتملة.",
             *(context_lines(result, digits) if include_context else []),
             f"الدخول المقترح: {entry:.{digits}f}",
             f"منطقة الدخول: {low:.{digits}f} – {high:.{digits}f}",
             f"SL: {stop:.{digits}f} | TP1: {target:.{digits}f} | TP2: {target2:.{digits}f}",
             f"العائد إلى المخاطرة: {result['nominal_reward_risk']:.2f}:1؛ بعد التكاليف المقدّرة {result['effective_reward_risk']:.2f}:1.",
-            f"السبب: توافق H4 وH1 مع تأكيد M15، ارتداد M5 مؤكّد{' خلال آخر 3 شموع قبل شمعة التأكيد' if experimental else ''}، وكسر M1 بإغلاق متوافق، مع اجتياز فلاتر المخاطر والسبريد والنشاط؛ نافذة الدخول {window} من إغلاق M1.",
+            f"السبب: توافق H1 مع تأكيد M15، ارتداد M5 مؤكّد{' خلال آخر 3 شموع قبل شمعة التأكيد' if experimental else ''}، وكسر M1 بإغلاق متوافق، مع اجتياز فلاتر المخاطر والسبريد والنشاط؛ نافذة الدخول {window} من إغلاق M1.",
             f"الإلغاء: مرور {window} بعد إغلاق M1، انعكاس الاتجاه أو التأكيد، تدهور السبريد أو حداثة البيانات أو المخاطر، أو تجاوز انحراف السعر والسبريد معاً 0.1R. يبقى الوقف والهدف ثابتين.",
             "مدة تقييم النجاح: 60 دقيقة من الدخول؛ الهدف الأول قبل الوقف، مع احتساب التكاليف. انتهاء المدة دون الهدف يُحسب غير ناجح.",
         ]
@@ -175,7 +175,7 @@ def format_proposal(result, *, symbol="XAUUSD", execution_enabled=False, manual_
 
 
 def format_analysis(feed, result, now, *, received_at=None, include_proposal=True):
-    lines = ["تحليل شارت MT5 — M1 / M5 / M15 / H1 / H4"]
+    lines = ["تحليل شارت MT5 — M1 / M5 / M15 / H1"]
     try:
         clock = _time(now)
         if type(feed) is not dict or feed.get("source") != "MetaTrader 5":

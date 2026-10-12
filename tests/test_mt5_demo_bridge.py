@@ -44,7 +44,7 @@ class DemoBridgeTests(unittest.TestCase):
         eligible = candle_fixtures.MultiTimeframeTests().feed(now=NOW, broker_offset=0)
         self.fixture.rates = {
             minutes: [{**bar, "time": int(trade.utc_date(bar["time"]).timestamp())} for bar in eligible["timeframes"][frame]]
-            for frame, minutes in (("H4", 240), ("H1", 60), ("M15", 15), ("M5", 5), ("M1", 1))
+            for frame, minutes in (("H1", 60), ("M15", 15), ("M5", 5), ("M1", 1))
         }
         self.mt5.order_check.side_effect = None
         self.mt5.order_check.return_value = SimpleNamespace(retcode=0)
@@ -106,7 +106,7 @@ class DemoBridgeTests(unittest.TestCase):
         eligible = candle_fixtures.MultiTimeframeTests().feed(now=NOW, broker_offset=0, sell=True)
         self.fixture.rates = {
             minutes: [{**bar, "time": int(trade.utc_date(bar["time"]).timestamp())} for bar in eligible["timeframes"][frame]]
-            for frame, minutes in (("H4", 240), ("H1", 60), ("M15", 15), ("M5", 5), ("M1", 1))
+            for frame, minutes in (("H1", 60), ("M15", 15), ("M5", 5), ("M1", 1))
         }
         self.tick.bid, self.tick.ask = 1999.997, 1999.999
         offer = self.current_offer()
@@ -183,10 +183,25 @@ class DemoBridgeTests(unittest.TestCase):
         self.mt5.positions_get.return_value = (object(),)
         self.assertEqual(self.execute()["status"], "failed")
         self.mt5.positions_get.return_value = ()
-        self.fixture.rates[240] = self.fixture.rates[240][:-1]
+        self.fixture.rates[60] = self.fixture.rates[60][:-1]
         offer = deepcopy(self.offer)
         offer["id"] = str(uuid4())
         self.assertEqual(self.execute(offer)["status"], "failed")
+        self.mt5.order_send.assert_not_called()
+
+    def test_four_frame_execution_still_requires_22_closed_h1_bars_and_rejects_old_profiles(self):
+        self.fixture.rates[60] = self.fixture.rates[60][-21:]
+        offer = deepcopy(self.offer)
+        revised = demo.market.build_payload(self.mt5, self.settings.market, NOW)
+        offer["payload"]["closed_history_sha256"] = demo.closed_history_sha256(revised)
+        self.assertEqual(set(revised["timeframes"]), {"H1", "M15", "M5", "M1"})
+        self.assertEqual(self.execute(offer)["status"], "failed")
+        old = deepcopy(self.offer)
+        old["id"] = str(uuid4())
+        old["payload"].update(strategy_id="mtf-ema-pullback-60m-v2", strategy_version=2,
+                              policy_id="mtf-manual-demo-cost-risk-v2")
+        self.assertEqual(self.execute(old)["status"], "failed")
+        self.mt5.order_check.assert_not_called()
         self.mt5.order_send.assert_not_called()
 
     def test_risk_reward_margin_and_frozen_grid_are_not_bypassed(self):
@@ -424,7 +439,7 @@ class DemoBridgeTests(unittest.TestCase):
         self.mt5.order_send.assert_called_once()
         native.assert_not_called()
         feed = next(payload for route, payload in calls if route == "market")
-        self.assertEqual(set(feed["timeframes"]), {"M1", "M5", "M15", "H1", "H4"})
+        self.assertEqual(set(feed["timeframes"]), {"M1", "M5", "M15", "H1"})
         self.assertIn("execution", feed)
         self.assertEqual(feed["device_id"], self.ledger.device_id)
         self.assertIn("Demo approval helper ready.", output.getvalue())

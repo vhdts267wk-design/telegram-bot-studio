@@ -6,7 +6,7 @@ import json
 import math
 
 
-FRAMES = tuple(sorted(("M1", "M5", "M15", "H1", "H4")))
+FRAMES = tuple(sorted(("M1", "M5", "M15", "H1")))
 
 
 def closed_history_sha256(feed):

@@ -38,7 +38,7 @@ class ExperimentalMtfTests(unittest.TestCase):
             result = self.evaluate()
             self.assertEqual(result["state"], "signal", result)
             self.assertEqual((result["strategy_id"], result["strategy_version"], result["policy_id"]),
-                             (mtf.EXPERIMENTAL_STRATEGY_ID, 3, mtf.EXPERIMENTAL_POLICY_ID))
+                             (mtf.EXPERIMENTAL_STRATEGY_ID, 5, mtf.EXPERIMENTAL_POLICY_ID))
             self.assertTrue(result["provisional"])
             self.assertEqual(result["signal_mode"], "experimental_demo")
             self.assertEqual(result["entry_window_seconds"], 30)
@@ -68,7 +68,7 @@ class ExperimentalMtfTests(unittest.TestCase):
                 original = dict(self.evaluate(feed), workflow="manual_ticket")
                 self.assertEqual(original["state"], "signal", original)
                 self.assertTrue(mtf_runtime.eligible_payload(original, feed, self.now))
-                for frame in ("H1", "H4"):
+                for frame in ("H1",):
                     changed = deepcopy(feed)
                     changed["timeframes"][frame] = self.fixture.feed(sell=not sell)["timeframes"][frame]
                     result = self.evaluate(changed)
@@ -80,8 +80,8 @@ class ExperimentalMtfTests(unittest.TestCase):
                     del changed["timeframes"][frame]
                     self.assertFalse(mtf_runtime.eligible_payload(original, changed, self.now))
                 legacy = deepcopy(original)
-                legacy.update(strategy_id="mtf-ema-pullback-60m-demo-v2", strategy_version=2,
-                              policy_id="mtf-manual-demo-estimated-cost-risk-v2")
+                legacy.update(strategy_id="mtf-ema-pullback-60m-demo-v3", strategy_version=3,
+                              policy_id="mtf-manual-demo-estimated-cost-risk-v3")
                 self.assertFalse(mtf_runtime.eligible_result(legacy, self.now))
 
     def test_estimates_are_nonzero_copy_inputs_and_never_claim_verification(self):

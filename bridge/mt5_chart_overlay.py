@@ -31,7 +31,7 @@ EXPERIMENTAL_FIELDS = (FIELDS - {"qualification_id"}) | {
 COST_ASSUMPTION_FIELDS = frozenset({
     "verified", "method", "commission_round_turn", "slippage_price", "spread_price", "tick_size",
 })
-FRAME_SECONDS = {"H4": 14400, "H1": 3600, "M15": 900, "M5": 300, "M1": 60}
+FRAME_SECONDS = {"H1": 3600, "M15": 900, "M5": 300, "M1": 60}
 
 
 class OverlayError(ValueError):
@@ -95,15 +95,16 @@ def latest_closed_reference(boundary, seconds, broker_offset_minutes):
 
 
 def validate_timeframe_context(value, direction):
-    """Only a complete, aligned five-frame context can accompany an offer."""
+    """Only a complete, aligned four-frame context can accompany an offer."""
     if (type(value) is not dict or set(value) != {
-        "trends", "alignment", "confidence", "counter_trend", "support", "resistance",
+        "trends", "alignment", "confidence", "counter_trend", "support", "resistance", "levels_timeframe",
     } or type(value["trends"]) is not dict or set(value["trends"]) != set(FRAME_SECONDS)
+        or value["levels_timeframe"] != "H1"
         or direction not in ("BUY", "SELL")
         or any(type(trend) is not str or trend != direction for trend in value["trends"].values())
         or value["alignment"] != "aligned" or value["confidence"] != "aligned"
         or value["counter_trend"] is not False):
-        raise OverlayError("Incomplete or unaligned five-timeframe context")
+        raise OverlayError("Incomplete or unaligned four-timeframe context")
     support, resistance = value["support"], value["resistance"]
     for price in (support, resistance):
         if price is not None:
@@ -114,11 +115,11 @@ def validate_timeframe_context(value, direction):
 
 
 def validate_context_references(value, *, trigger, boundary, broker_offset_minutes):
-    """Require the last closed H1/H4 bar at both signal and current boundary."""
-    if type(value) is not dict or set(value) != {"H1", "H4"}:
+    """Require the last closed H1 bar at both signal and current boundary."""
+    if type(value) is not dict or set(value) != {"H1"}:
         raise OverlayError("Incomplete higher-timeframe references")
     result = {}
-    for frame in ("H1", "H4"):
+    for frame in ("H1",):
         if type(value[frame]) is not str:
             raise OverlayError("Invalid higher-timeframe reference format")
         reference = utc(value[frame])
@@ -132,7 +133,7 @@ def validate_context_references(value, *, trigger, boundary, broker_offset_minut
 
 
 def current_timeframe_context(feed, *, observed_at, broker_offset_minutes):
-    """Recompute the read-only five-frame trend contract from local closed bars.
+    """Recompute the read-only four-frame trend contract from local closed bars.
 
     This standalone bridge cannot import the server. These EMA/ATR operations
     match its declared strategy, and never prepare or submit a ticket.
@@ -140,7 +141,7 @@ def current_timeframe_context(feed, *, observed_at, broker_offset_minutes):
     now = utc(observed_at)
     offset = validate_broker_offset(broker_offset_minutes)
     if type(feed) is not dict or type(feed.get("timeframes")) is not dict or set(feed["timeframes"]) != set(FRAME_SECONDS):
-        raise OverlayError("Incomplete local five-timeframe history")
+        raise OverlayError("Incomplete local four-timeframe history")
     if validate_broker_offset(feed.get("broker_utc_offset_minutes")) != offset:
         raise OverlayError("Changed local context broker offset")
     fresh_quote(feed.get("quote"), now)
@@ -148,7 +149,7 @@ def current_timeframe_context(feed, *, observed_at, broker_offset_minutes):
     for frame, seconds in FRAME_SECONDS.items():
         rows = feed["timeframes"][frame]
         if type(rows) is not list or not 22 <= len(rows) <= 64:
-            raise OverlayError("Insufficient local five-timeframe history")
+            raise OverlayError("Insufficient local four-timeframe history")
         parsed = []
         for row in rows:
             if type(row) is not dict:
@@ -199,13 +200,13 @@ def current_timeframe_context(feed, *, observed_at, broker_offset_minutes):
                              else "SELL" if separation < 0 and slope < 0 and closes[-1] < fast[-1] else "NEUTRAL")
     direction = trends["M15"]
     aligned = direction != "NEUTRAL" and all(trend == direction for trend in trends.values())
-    counter = direction != "NEUTRAL" and any(trends[frame] not in (direction, "NEUTRAL") for frame in ("H1", "H4"))
+    counter = direction != "NEUTRAL" and trends["H1"] not in (direction, "NEUTRAL")
     midpoint = (positive(feed["quote"]["bid"]) + positive(feed["quote"]["ask"])) / 2
-    support = min(row["low"] for row in streams["H4"][-20:])
-    resistance = max(row["high"] for row in streams["H4"][-20:])
+    support = min(row["low"] for row in streams["H1"][-20:])
+    resistance = max(row["high"] for row in streams["H1"][-20:])
     return {"trends": trends, "alignment": "aligned" if aligned else "counter_trend" if counter else "unconfirmed",
             "confidence": "aligned" if aligned else "reduced" if counter else "unconfirmed", "counter_trend": counter,
-            "support": support if Decimal(str(support)) <= midpoint else None,
+            "levels_timeframe": "H1", "support": support if Decimal(str(support)) <= midpoint else None,
             "resistance": resistance if Decimal(str(resistance)) >= midpoint else None}
 
 
@@ -265,9 +266,9 @@ def validate_proposal(value, *, symbol, execution, quote, observed_at, broker_of
     ):
         raise OverlayError("Incompatible chart proposal")
     if (
-        value["strategy_id"] != ("mtf-ema-pullback-60m-demo-v3" if experimental else "mtf-ema-pullback-60m-v2")
-        or type(value["strategy_version"]) is not int or value["strategy_version"] != (3 if experimental else 2)
-        or value["policy_id"] != ("mtf-manual-demo-estimated-cost-risk-v3" if experimental else "mtf-manual-demo-cost-risk-v2")
+        value["strategy_id"] != ("mtf-ema-pullback-60m-demo-v5" if experimental else "mtf-ema-pullback-60m-v4")
+        or type(value["strategy_version"]) is not int or value["strategy_version"] != (5 if experimental else 4)
+        or value["policy_id"] != ("mtf-manual-demo-estimated-cost-risk-v5" if experimental else "mtf-manual-demo-cost-risk-v4")
         or type(value["horizon_seconds"]) is not int or value["horizon_seconds"] != 3600
         or type(value["strategy_fingerprint"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["strategy_fingerprint"]) is None
         or (not experimental and (type(value["qualification_id"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["qualification_id"]) is None))

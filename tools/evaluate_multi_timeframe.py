@@ -22,7 +22,7 @@ if __package__ in (None, ""):
 from bot import strategy_evidence as evidence
 
 
-TF_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600, "H4": 14400}
+TF_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "H1": 3600}
 
 
 def stamp(value):
@@ -279,7 +279,7 @@ def evaluate(manifest, candles, ticks, *, analyzer=None, exploratory_cost=None):
     if not costs:
         return [], ["No verified or explicitly declared cost model is available"], []
     if any(len(candles[tf]) < 22 for tf in TF_SECONDS):
-        return [], ["Fewer than22 completed bars for M1, M5, M15, H1 or H4"], []
+        return [], ["Fewer than22 completed bars for M1, M5, M15 or H1"], []
     for cost in costs:
         research = exploratory_cost is not None
         if research:
@@ -364,7 +364,7 @@ def evaluation_summary(assessment, report, provisional):
     text = evidence.arabic_summary(assessment)
     if not provisional:
         return text
-    lines = [text, "", "التقييم الاستكشافي: اتجاه H4 العام وH1 القريب، تأكيد M15، دخول M5/M1؛ التعارض ينتظر. الهدف الأساسي TP1 = 2R والوقف الأصلي، مدة نموذجية60 دقيقة.",
+    lines = [text, "", "التقييم الاستكشافي: اتجاه H1، تأكيد M15، دخول M5/M1؛ التعارض ينتظر. الهدف الأساسي TP1 = 2R والوقف الأصلي، مدة نموذجية60 دقيقة.",
              "الدخول بسعر افتتاح فترة M1 التالية مع سبريد افتراضي؛ وقت أول تيك وتأخر الدخول خلال10 ثوانٍ غير مثبتين بالشموع.",
              "التكاليف والنموذج المالي افتراضيان ومعلنان؛ ليست رسوماً تاريخية مثبتة أو رصيد الحساب الفعلي."]
     labels = {"development": "التطوير", "validation": "التحقق", "oos": "خارج العينة"}

@@ -7,6 +7,13 @@ primary TP attached in the initial order. The market fill can differ from the
 reference entry. TP2 remains informational; this helper does not split positions
 or manage an existing trade.
 
+The current strategy uses H1 for trend and observed support/resistance, M15 for
+confirmation, and M5/M1 for entry timing. H4 is not read, hashed or required.
+Each of the four streams still needs 22 contiguous completed bars. The v4
+qualified and v5 experimental identities reject older five-frame proposals
+and qualification artifacts. H1 levels use its last 20 completed bars and carry
+`levels_timeframe: H1` in the context contract.
+
 The server opt-in is `MT5_DEMO_ORDERS_ENABLED=true`, together with
 `MARKET_SOURCE=mt5`, `MT5_MANUAL_TICKETS_ENABLED=true`, and the existing private
 `MT5_MANUAL_BRIDGE_KEY`. Both workflows are disabled in a clean example
@@ -54,7 +61,7 @@ mismatched or incomplete release fails closed.
 
 Every approval is tied to the private owner, bot message, device and immutable
 proposal. Server publication, approval and claim recheck current eligibility.
-The helper rechecks five completed histories, their frozen SHA256, current
+The helper rechecks four completed histories, their frozen SHA256, current
 technical conditions, quote age, spread, price drift, broker stop rules, cash
 risk, free margin and account identity. Existing positions or pending orders
 block a new order. The original M1 deadline remains 10 seconds for qualified

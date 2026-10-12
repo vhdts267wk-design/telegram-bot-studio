@@ -14,7 +14,7 @@ The manually started helpers connect to the selected MetaTrader 5 desktop termin
 | Helper | Purpose | Orders |
 | --- | --- | --- |
 | `mt5_market_bridge.py` | Upload gold quotes and completed M15 candles | Read-only; never places, changes or closes orders |
-| `mt5_manual_bridge.py` | Upload M1/M5/M15/H1/H4 and prepare a native ticket for human review | Paired Demo 0.01 only; never submits an order |
+| `mt5_manual_bridge.py` | Upload M1/M5/M15/H1 and prepare a native ticket for human review | Paired Demo 0.01 only; never submits an order |
 | `start_mt5_bridge.ps1` / `mt5_trade_bridge.py` | Upload market data and process owner-approved Telegram requests | Demo account only, exactly 0.01 lot per accepted offer |
 
 The bot defaults to paper signals and `MT5_TRADING_ENABLED=false`. The Demo helper needs explicit enablement on the server and a local confirmation. This release does not support Real accounts or other lot sizes. Keep the SDK on Windows; Railway never connects directly to MT5 or sends an order.
@@ -23,16 +23,15 @@ For the current manual-ticket workflow, use [MANUAL-TICKETS.md](MANUAL-TICKETS.m
 
 ## Shared requirements
 
-The current manual strategy uses H4 for the overall trend, H1 for the near
-trend, M15 for confirmation and M5/M1 for entry timing. Every stream needs at
+The current manual strategy uses H1 for the overall trend, M15 for confirmation and M5/M1 for entry timing. Every stream needs at
 least 22 contiguous completed bars, with verified broker-offset boundaries.
-An H1/H4 conflict or neutral higher trend waits quietly; reduced qualitative
+An H1 conflict or neutral higher trend waits quietly; reduced qualitative
 confidence describes disagreement, not a probability of winning. Telegram
-opportunity messages include H1/H4 alignment and the range of the last 20
-completed H4 bars as observed support/resistance. On-demand commands explain
+opportunity messages include H1 alignment and the range of the last 20
+completed H1 bars as observed support/resistance. On-demand commands explain
 waiting reasons; automatic alerts remain limited to new eligible opportunities.
-The qualified `mtf-ema-pullback-60m-v2` and experimental Demo
-`mtf-ema-pullback-60m-demo-v3` profiles invalidate older three-frame proposals
+The qualified `mtf-ema-pullback-60m-v4` and experimental Demo
+`mtf-ema-pullback-60m-demo-v5` profiles invalidate older three-frame and five-frame proposals
 and evidence. Demo 0.01, expiry and final manual Buy/Sell requirements still apply.
 
 Use an awake Windows x64 computer or Windows VPS, the broker's MT5 desktop terminal, and compatible x64 Python. Open the **exact intended terminal yourself**, log in there and confirm that it is connected. Neither helper accepts an account password or changes the logged-in account. This is not a mobile or web MT5 connection.

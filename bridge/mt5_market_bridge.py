@@ -25,7 +25,7 @@ POLL_SECONDS = 60
 REQUEST_TIMEOUT = 15
 MAX_QUOTE_AGE_SECONDS = 10
 FUTURE_TOLERANCE_SECONDS = 5
-TIMEFRAMES = {"H4": 14400, "H1": 3600, "M15": 900, "M5": 300, "M1": 60}
+TIMEFRAMES = {"H1": 3600, "M15": 900, "M5": 300, "M1": 60}
 FIXED_VOLUME = 0.01
 TERMINAL_FAILURE_MESSAGES = {
     "terminal_unavailable": "The MT5 client connection is unavailable. Check that the selected terminal is open and connected.",
@@ -222,7 +222,7 @@ def latest_closed_bar(now_seconds, seconds, broker_utc_offset_minutes):
 
 
 def closed_candles(mt5, settings, label, seconds, now_seconds):
-    # All five frames share the same UTC snapshot boundary; index zero is
+    # All four frames share the same UTC snapshot boundary; index zero is
     # always the forming bar and is never requested.
     rates = mt5.copy_rates_from_pos(settings.symbol, getattr(mt5, "TIMEFRAME_" + label), 1, BAR_COUNT)
     if rates is None or not 1 <= len(rates) <= BAR_COUNT:

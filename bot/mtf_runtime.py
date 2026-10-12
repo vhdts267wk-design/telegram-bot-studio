@@ -123,7 +123,7 @@ def evaluate_feed(feed, now=None):
 
 
 def timeframe_context_valid(result, *, require_aligned=True):
-    """Validate qualitative five-frame context and causal higher references.
+    """Validate qualitative four-frame context and the causal H1 reference.
 
     This is a shape/provenance guard, never empirical qualification. A frozen
     payload must additionally be compared with freshly recomputed market data.
@@ -132,8 +132,9 @@ def timeframe_context_valid(result, *, require_aligned=True):
         offset = multi_timeframe.broker_utc_offset_minutes(result["broker_utc_offset_minutes"])
         context, references = result["timeframe_context"], result["context_bar_times"]
         if (type(context) is not dict or set(context) != {
-                "trends", "alignment", "confidence", "counter_trend", "support", "resistance"}
-                or type(references) is not dict or set(references) != {"H1", "H4"}):
+                "trends", "alignment", "confidence", "counter_trend", "support", "resistance", "levels_timeframe"}
+                or context.get("levels_timeframe") != "H1"
+                or type(references) is not dict or set(references) != {"H1"}):
             return False
         trends = context["trends"]
         if (type(trends) is not dict or set(trends) != set(multi_timeframe.TIMEFRAME_SECONDS)
@@ -142,7 +143,7 @@ def timeframe_context_valid(result, *, require_aligned=True):
             return False
         direction = trends["M15"]
         counter = direction != "NEUTRAL" and any(
-            trends[key] not in {direction, "NEUTRAL"} for key in ("H1", "H4")
+            trends[key] not in {direction, "NEUTRAL"} for key in ("H1",)
         )
         aligned = direction != "NEUTRAL" and all(value == direction for value in trends.values())
         if (context["counter_trend"] != counter
@@ -158,7 +159,7 @@ def timeframe_context_valid(result, *, require_aligned=True):
         if context["support"] is not None and context["resistance"] is not None and context["support"] > context["resistance"]:
             return False
         closed = multi_timeframe._utc(result["bar_time"]) + timedelta(seconds=60)
-        for key in ("H1", "H4"):
+        for key in ("H1",):
             stamp = multi_timeframe._utc(references[key])
             seconds = multi_timeframe.TIMEFRAME_SECONDS[key]
             if (type(references[key]) is not str or stamp.microsecond
