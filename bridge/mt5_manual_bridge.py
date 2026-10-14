@@ -420,12 +420,16 @@ def flush_results(settings, ledger, journal, post=api_post):
         journal.acknowledge(pending["offer_id"], pending["claim_id"])
 
 
-def refresh_chart(settings, device_id, exporter, feed, *, post=api_post, clock=trade.now_utc):
+def refresh_chart(settings, device_id, exporter, feed, *, post=api_post, clock=trade.now_utc, fresh_feed=None):
     """Read display levels separately from claiming a ticket preparation."""
     reply = post(settings, "chart", {"device_id": device_id})
     if type(reply) is not dict or set(reply) != {"proposal"}:
         raise chart.OverlayError("Invalid chart response")
-    exporter.publish(reply["proposal"], execution=feed.get("execution"), quote=feed.get("quote"), observed_at=clock())
+    if fresh_feed is not None:
+        # Network time must not consume the local snapshot's freshness window.
+        # The caller guards the account around this read-only SDK collection.
+        feed = fresh_feed()
+    exporter.publish(reply["proposal"], execution=feed.get("execution"), quote=feed.get("quote"), observed_at=clock(), feed=feed)
 
 
 def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.sleep, adapter_factory=None, exporter_factory=None):

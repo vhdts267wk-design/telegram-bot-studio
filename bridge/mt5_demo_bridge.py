@@ -312,8 +312,37 @@ def flush_results(settings, ledger, post=api_post):
     trade.flush_results(settings, ledger, post)
 
 
-def refresh_chart(settings, device_id, exporter, feed, *, post=api_post, clock=trade.now_utc):
-    manual.refresh_chart(settings, device_id, exporter, feed, post=post, clock=clock)
+def refresh_chart(settings, device_id, exporter, feed, *, post=api_post, clock=trade.now_utc, fresh_feed=None):
+    manual.refresh_chart(settings, device_id, exporter, feed, post=post, clock=clock, fresh_feed=fresh_feed)
+
+
+def capture_feed(mt5, settings, ledger, clock):
+    """Read one current local snapshot, bound to the verified Demo account."""
+    account_guard(mt5, settings, ledger, require_empty=False)
+    payload = market.build_payload(mt5, settings.market, clock())
+    payload.update(device_id=ledger.device_id, execution=trade.execution_metadata(mt5.symbol_info(settings.market.symbol)))
+    account_guard(mt5, settings, ledger, require_empty=False)
+    return payload
+
+
+def market_failure_reason(error):
+    """Return authored diagnostic codes only, never SDK exception details."""
+    if isinstance(error, market.MarketDataError) and error.reason_code in market.TERMINAL_FAILURE_MESSAGES:
+        return error.reason_code
+    return {
+        "A fresh broker quote is required.": "missing_quote",
+        "A fresh, valid broker quote is required.": "stale_quote",
+        "Load completed bars in every required timeframe.": "incomplete_history",
+        "Incomplete broker candle.": "incomplete_history",
+        "Invalid or unfinished broker candle.": "invalid_history",
+        "Required closed histories must be current.": "history_not_current",
+        "Current Demo risk data is required.": "risk_data_unavailable",
+        "Broker risk identity unavailable.": "risk_data_unavailable",
+        "Complete account exposure data is required.": "risk_data_unavailable",
+        "Broker cash-risk conversion unavailable.": "risk_data_unavailable",
+        "Account risk snapshot changed during collection.": "risk_data_unavailable",
+        "Complete broker risk data is required.": "risk_data_unavailable",
+    }.get(str(error), "invalid_local_data")
 
 
 def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.sleep, exporter_factory=None):
@@ -339,26 +368,41 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
         if registered.get("paired") is not True:
             print("In your private bot chat, send: /connect_mt5 " + code, flush=True)
         next_feed, latest_feed = 0.0, None
+        network_retry_after = 0.0
         outage_reported = False
+        chart_outage_reported = False
         while trade.terminal_is_running(settings.market.terminal):
             try:
                 account_guard(mt5, settings, ledger, require_empty=False)
                 flush_results(settings, ledger, post)
-                if time.monotonic() >= next_feed:
-                    payload = market.build_payload(mt5, settings.market, clock())
-                    account_guard(mt5, settings, ledger, require_empty=False)
-                    payload.update(device_id=ledger.device_id, execution=trade.execution_metadata(mt5.symbol_info(settings.market.symbol)))
+                cycle_started = time.monotonic()
+                payload = capture_feed(mt5, settings, ledger, clock)
+                if latest_feed is not None:
+                    # Keep local counts current before blocking HTTP, without
+                    # extending an existing proposal or waiting-row deadline.
+                    exporter.refresh_readiness(payload, clock())
+                if cycle_started >= max(next_feed, network_retry_after):
                     post(settings, "market", payload)
                     newly_available = latest_feed is None or outage_reported
-                    latest_feed, next_feed = payload, time.monotonic() + FEED_SECONDS
+                    latest_feed, next_feed = payload, cycle_started + FEED_SECONDS
+                    network_retry_after = 0.0
                     if newly_available:
                         print("Fresh MT5 feed ready.", flush=True)
                     outage_reported = False
                 if latest_feed is not None:
                     try:
-                        refresh_chart(settings, ledger.device_id, exporter, latest_feed, post=post, clock=clock)
+                        refresh_chart(settings, ledger.device_id, exporter, latest_feed, post=post, clock=clock,
+                                      fresh_feed=lambda: capture_feed(mt5, settings, ledger, clock))
+                        if chart_outage_reported:
+                            print("MT5 chart display ready.", flush=True)
+                        chart_outage_reported = False
+                    except (trade.GuardError, market.MarketDataError):
+                        raise  # A failed fresh account/feed check must not reach the claim poll.
                     except Exception:
                         exporter.clear(clock())
+                        if not chart_outage_reported:
+                            print("MT5 chart display unavailable.", file=sys.stderr, flush=True)
+                        chart_outage_reported = True
                     reply = post(settings, "poll", {"device_id": ledger.device_id})
                     if type(reply) is not dict or set(reply) != {"trade"}:
                         raise trade.GuardError("Invalid Demo execution queue response.")
@@ -368,15 +412,21 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
             except market.MarketDataError as error:
                 if error.reason_code == "terminal_installation_mismatch":
                     raise
-                latest_feed, next_feed = None, time.monotonic() + FEED_SECONDS
+                # The local SDK is already checked each loop. A fresh quote or
+                # completed bar may return on the next tick: do not add a five
+                # second upload wait after that local guard has recovered.
+                # Transport failures retain their separate backoff below.
+                latest_feed, next_feed = None, 0.0
                 exporter.clear(clock())
                 if not outage_reported:
-                    print("MT5 feed unavailable; Demo execution waits for fresh data.", file=sys.stderr, flush=True)
+                    print("MT5 feed unavailable; Demo execution waits for fresh data. Reason: " +
+                          market_failure_reason(error) + "; UTC: " + trade.iso_date(clock()), file=sys.stderr, flush=True)
                 outage_reported = True
             except trade.GuardError:
                 raise
             except Exception:
                 latest_feed, next_feed = None, time.monotonic() + FEED_SECONDS
+                network_retry_after = next_feed
                 try:
                     exporter.clear(clock())
                 except Exception:

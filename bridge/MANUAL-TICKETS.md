@@ -75,9 +75,11 @@ Press Ctrl+C to stop the foreground helper. It installs no background service or
 ## Proposal levels on the chart
 
 Compile `bridge/MT5BotLevels.mq5` in MetaEditor and copy the resulting
-`MT5BotLevels.ex5` into `MQL5/Indicators/MT5Bot` under this terminal's **File >
-Open Data Folder**. Refresh MT5's Navigator and attach **MT5BotLevels** to
-the intended **XAUUSD** chart on any timeframe. Use indicator **version 2.12**; old M15/CSV-v1
+`MT5BotLevels.ex5` into `MQL5/Indicators` under this terminal's **File >
+Open Data Folder**. For an existing installation, replace the source/binary in
+their current folder rather than creating a duplicate in a new subfolder.
+Refresh MT5's Navigator and reload **MT5BotLevels 2.13** on
+the intended **XAUUSD** chart on any timeframe. Use indicator **version 2.13**; old M15/CSV-v1
 snapshots are rejected. It is a display-only custom indicator and needs
 no DLLs, WebRequest permissions or algorithmic-trading setting. Keep the
 paired manual helper running.
@@ -86,6 +88,24 @@ Keep a separate **XAUUSD M1** chart open for native ticket preparation. The
 helper activates and verifies that M1 chart when you request preparation.
 
 CSV version 2 remains exactly 18 fields and retains its M1 signal timeframe. Its state is `active` for a qualified proposal, `experimental` for an explicit experimental Demo proposal, or `waiting`. Version 2.11 displays **Demo experimental**, **Estimated costs**, and **No certified win rate** on experimental levels, and overwrites those labels when the mode changes. Older version 2.00 indicators reject the experimental state and show no experimental levels until updated.
+
+Version 2.13 adds a four-frame readiness panel and removes the M30/H4 view
+buttons. H1/M15/M5/M1 tiles show closed contiguous history out of the required
+22 bars, with an explicit warmup message when a stream is short. The separate
+10-field `readiness_<terminal-data-folder-name>.csv` is display telemetry only:
+version, observed UTC, expiry UTC, H1/M15/M5/M1 counts, terminal marker, nonce
+and account-binding hash. It expires no later than the source feed/quote's
+10-second freshness limit. Missing or expired data cannot show live readiness.
+It does not authorize a proposal, preparation, notification or order. The
+existing proposal validation and 18-field CSV remain unchanged.
+
+The Demo Accept helper samples guarded local display data before its network
+cycle and again after receiving chart levels. Network transit time therefore
+does not age the snapshot before it is first displayed. The 5-second feed
+schedule starts at collection, rather than after the upload finishes. Local
+readiness updates never renew the server proposal row or its original expiry.
+A single blocking request or broker outage can still exceed the unchanged
+10-second freshness limit; the panel then correctly stops showing LIVE.
 
 Each latest valid published proposal appears automatically, before a ticket
 preparation request: shaded Entry Zone, gold reference Entry, green TP and red

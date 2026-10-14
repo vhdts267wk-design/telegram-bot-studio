@@ -21,10 +21,14 @@ class IndicatorContractTests(unittest.TestCase):
 
     def test_indicator_has_only_display_capabilities(self):
         self.assertIn("#property indicator_chart_window", self.source)
-        forbidden = r"\b(?:OrderSend|OrderSendAsync|OrderCheck|CTrade|WebRequest|SocketCreate|ShellExecuteW|FileWrite|FileDelete|FileMove|FileCopy|GlobalVariableSet|OBJ_BUTTON)\b|#(?:include|import)\b"
+        forbidden = r"\b(?:OrderSend|OrderSendAsync|OrderCheck|CTrade|WebRequest|SocketCreate|ShellExecuteW|FileWrite|FileDelete|FileMove|FileCopy|GlobalVariableSet|OBJ_BUTTON)\b|#import\b"
         self.assertIsNone(re.search(forbidden, self.source))
+        self.assertEqual(re.findall(r"#include\s+([^\r\n]+)", self.source), [r"<Canvas\Canvas.mqh>"])
         self.assertIn("FILE_READ|FILE_BIN|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE", self.source)
         self.assertNotIn("FILE_WRITE", self.source)
+        self.assertEqual(self.source.count("FileOpen("), 2)
+        self.assertIn("g_panel.CreateBitmapLabel(", self.source)
+        self.assertIn('ObjectSetString(0,name,OBJPROP_TOOLTIP,"\\n")', self.source)
         self.assertIn("EventSetTimer(1)", self.source)
         self.assertIn("EventKillTimer()", self.source)
 
@@ -32,14 +36,16 @@ class IndicatorContractTests(unittest.TestCase):
         self.assertIn('fields[1]!="experimental"', self.source)
         self.assertIn('p.experimental=(fields[1]=="experimental")', self.source)
         self.assertIn('Demo experimental | ', self.source)
-        self.assertIn('Estimated costs | No certified win rate | ', self.source)
+        self.assertIn('Estimated costs | No certified win rate', self.source)
+        self.assertIn('Performance unproven | No certified win rate', self.source)
         self.assertIn('p.experimental && (observed>bar+90 || valid_until>bar+90)', self.source)
         self.assertIn('ObjectSetString(0,name,OBJPROP_TEXT,text)', self.source)
 
     def test_chart_view_timeframe_is_independent_of_closed_m1_signal_validation(self):
         # A valid M1 opportunity must be visible while viewing XAUUSD M15/H1.
         # Changing the chart view never changes the incoming signal timeframe.
-        self.assertNotRegex(self.source, r"\b_Period\b|\bPERIOD_CURRENT\b")
+        parser = self.source.split("bool ReadProposal(", 1)[1].split("bool PrepareObject(", 1)[0]
+        self.assertNotRegex(parser, r"\b_Period\b|\bPERIOD_CURRENT\b")
         self.assertIn('if(_Symbol!="XAUUSD")', self.source)
         self.assertIn('fields[3]!="M1"', self.source)
         self.assertIn("iBarShift(_Symbol,PERIOD_M1,chart_bar,true)<1", self.source)
@@ -56,10 +62,84 @@ class IndicatorContractTests(unittest.TestCase):
         for guard in ("ACCOUNT_LOGIN", "ACCOUNT_SERVER", "ACCOUNT_TRADE_MODE_DEMO", "TERMINAL_CONNECTED"):
             self.assertEqual(notice.count(guard), 2)
         for detail in ("Demo experimental | ", "Entry ", "Zone ", "SL ", "TP ", "Expires UTC ",
-                       "Estimated costs | No certified win rate", "final manual MT5 decision is yours"):
+                       "Estimated costs | No certified win rate", "Telegram Accept requests one guarded Demo attempt",
+                       "wait for MT5 confirmation"):
             self.assertIn(detail, notice)
         self.assertLess(notice.index("ClaimOpportunityNotice(p)"), notice.index("Alert(notice)"))
-        self.assertNotRegex(self.source, r"\b(?:SendNotification|SendMail|ChartApplyTemplate|ChartSetSymbolPeriod)\b")
+        self.assertNotRegex(self.source, r"\b(?:SendNotification|SendMail|ChartApplyTemplate)\b")
+        self.assertNotIn("ReadReadiness", notice)
+        self.assertNotIn("g_waiting_snapshot", notice)
+
+    def test_four_frame_panel_has_only_view_actions_and_visible_version(self):
+        panel = self.source.split("bool DrawPanel(", 1)[1].split("void HandlePanelClick(", 1)[0]
+        click = self.source.split("void HandlePanelClick(", 1)[1].split("void ClearLevels()", 1)[0]
+        self.assertIn('#property version   "2.13"', self.source)
+        self.assertIn('PanelText(168,20,"2.13"', panel)
+        self.assertIn('INDICATOR_SHORTNAME,"MT5 Bot Panel 2.13"', self.source)
+        self.assertIn('"H1 / M15 / M5 / M1"', panel)
+        self.assertIn('string readiness_frames[]={"H1","M15","M5","M1"}', panel)
+        self.assertIn('string frames[]={"M1","M5","M15","H1"}', panel)
+        self.assertEqual(re.findall(r'hit.action=="(view_[^"]+)"', click), [
+            "view_M1", "view_M5", "view_M15", "view_H1",
+        ])
+        self.assertNotRegex(self.source, r"\bPERIOD_(?:M30|H4)\b|view_(?:M30|H4)")
+        self.assertEqual(self.source.count("ChartSetSymbolPeriod("), 1)
+        self.assertIn("ChartSetSymbolPeriod(0,_Symbol,period)", click)
+        self.assertIn('hit.action=="refresh") { UpdateOverlay(); return; }', click)
+        self.assertIn('"Refresh rereads the latest local update."', panel)
+        self.assertNotRegex(click, r"\b(?:ReadProposal|ReadReadiness|Alert|FileOpen|GlobalVariable\w+)\s*\(")
+
+    def test_existing_proposal_parser_is_unchanged_from_installed_canvas_version(self):
+        # Readiness must remain a presentation channel. Pin the full existing
+        # 2.12 parser, including byte limits, identity, TTL, price and M1 guards.
+        parser = "bool ReadProposal(" + self.source.split("bool ReadProposal(", 1)[1].split("bool PrepareObject(", 1)[0]
+        self.assertEqual(hashlib.sha256(parser.encode("utf-8")).hexdigest(),
+                         "c8c34f50fd4874ccd08df462782d3eb15d9e5219a6bfb22d268fbe6edd036181")
+
+    def test_readiness_has_strict_bounded_readonly_anonymous_contract(self):
+        reader = self.source.split("bool ReadReadiness(", 1)[1].split("// Presentation state", 1)[0]
+        self.assertIn("READINESS_FIELD_COUNT 10", self.source)
+        self.assertIn("READINESS_TTL_SECONDS 25", self.source)
+        self.assertIn("READINESS_MAX_BYTES   2048", self.source)
+        for text in (
+            "size>READINESS_MAX_BYTES", "FileSize(handle)==size && FileTell(handle)==size",
+            "copied!=size || !unchanged", 'bytes[i]<33 || bytes[i]>126 || bytes[i]==\'"\'',
+            "StringSplit(row,';',fields)!=READINESS_FIELD_COUNT", 'fields[0]!="1"',
+            "fields[7]!=g_terminal_key", "AccountBindingMatches(fields[8],fields[9])",
+            "ParseInteger(fields[1],observed)", "ParseInteger(fields[2],valid_until)",
+            "ParseInteger(fields[i+3],count)", "count<0 || count>64", "observed<946684800",
+            "observed>(long)now", "valid_until<=observed", "valid_until-observed>READINESS_TTL_SECONDS",
+            "(long)now-observed>READINESS_TTL_SECONDS", "(long)now>=valid_until", "MQL_TESTER",
+            'g_terminal_key==""', '_Symbol!="XAUUSD"',
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, reader)
+        for guard in ("g_account_changed", "ACCOUNT_LOGIN", "ACCOUNT_SERVER", "ACCOUNT_TRADE_MODE_DEMO", "TERMINAL_CONNECTED"):
+            self.assertEqual(reader.count(guard), 2)
+        self.assertIn('g_readiness_file="MT5Bot\\\\readiness_"+g_terminal_key+".csv"', self.source)
+        self.assertNotRegex(reader, r"\b(?:Proposal|Alert|NotifyOpportunity|GlobalVariable\w*|PanelText\w*|Print|FileWrite\w*|OrderSend\w*)\b")
+        self.assertNotIn("g_snapshot_", reader)
+
+    def test_readiness_cannot_mask_invalid_main_row_or_gate_active_proposal(self):
+        update = self.source.split("void UpdateOverlay()", 1)[1].split("int OnInit()", 1)[0]
+        panel = self.source.split("bool DrawPanel(", 1)[1].split("void HandlePanelClick(", 1)[0]
+        self.assertLess(update.index("g_waiting_snapshot=false"), update.index("MQL_TESTER"))
+        self.assertLess(update.index("ReadProposal(p,message)"), update.index("g_waiting_snapshot=(!accepted"))
+        self.assertIn('message=="No current proposal: waiting for market and risk conditions"', update)
+        self.assertIn("p.observed>0 && TimeGMT()<p.valid_until", update)
+        self.assertIn("if(!accepted) { ShowWaiting(message); return; }", update)
+        self.assertNotIn("ReadReadiness", update)
+        self.assertIn("bool telemetry=ReadReadiness(readiness) && main_fresh", panel)
+        self.assertIn("(active && now<g_panel_proposal.valid_until)", panel)
+        self.assertIn("(g_waiting_snapshot && now<g_snapshot_deadline)", panel)
+        self.assertIn("g_waiting_snapshot && main_fresh && telemetry && warmup_frame>=0", panel)
+        self.assertIn("string reason=message", panel)
+        self.assertIn('" warmup: "+IntegerToString(readiness.counts[warmup_frame])+"/22 closed candles"', panel)
+        self.assertIn("MathMin(22,readiness.counts[i])", panel)
+        self.assertIn('telemetry ? "LIVE"', panel)
+        self.assertIn('"All four frames ready. Waiting for market and risk conditions."', panel)
+        self.assertIn('"Ready candles do not guarantee a signal."', panel)
+        self.assertIn(' : "--/22"', panel)
 
     def test_notice_dedup_is_shared_atomic_anonymous_and_survives_waiting_or_reload(self):
         claim = self.source.split("bool ClaimOpportunityNotice(", 1)[1].split("void NotifyOpportunity(", 1)[0]

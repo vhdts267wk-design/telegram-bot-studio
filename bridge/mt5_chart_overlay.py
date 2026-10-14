@@ -247,6 +247,56 @@ def fresh_quote(value, now):
     return stamp
 
 
+def feed_readiness(feed, *, symbol, broker_offset_minutes, observed_at):
+    """Describe closed local history, without asserting strategy eligibility."""
+    now = utc(observed_at)
+    offset = validate_broker_offset(broker_offset_minutes)
+    if (type(feed) is not dict or feed.get("source") != "MetaTrader 5"
+        or type(feed.get("schema_version")) is not int or feed["schema_version"] != 2
+        or feed.get("symbol") != symbol
+        or validate_broker_offset(feed.get("broker_utc_offset_minutes")) != offset
+        or type(feed.get("timeframes")) is not dict
+        or set(feed["timeframes"]) != set(FRAME_SECONDS)):
+        raise OverlayError("Invalid local readiness feed")
+    captured = utc(feed.get("as_of"))
+    if not timedelta(0) <= now - captured < timedelta(seconds=10):
+        raise OverlayError("Stale local readiness feed")
+    quote_stamp = fresh_quote(feed.get("quote"), now)
+    metadata(feed.get("execution"))
+    counts = []
+    for frame, seconds in FRAME_SECONDS.items():
+        rows = feed["timeframes"][frame]
+        if type(rows) is not list or len(rows) > 64:
+            raise OverlayError("Invalid local readiness history")
+        stamps = []
+        for row in rows:
+            if type(row) is not dict:
+                raise OverlayError("Invalid local readiness candle")
+            stamp = utc(row.get("time"))
+            prices = {key: positive(row.get(key)) for key in ("open", "high", "low", "close")}
+            volume = row.get("tick_volume")
+            if (stamp.microsecond or (stamp.timestamp() + offset * 60) % seconds
+                or stamp + timedelta(seconds=seconds) > captured
+                or (stamps and stamp <= stamps[-1])
+                or prices["low"] > min(prices["open"], prices["close"])
+                or prices["high"] < max(prices["open"], prices["close"])
+                or prices["low"] > prices["high"]
+                or type(volume) is not int or not 0 <= volume <= 10**12):
+                raise OverlayError("Invalid local readiness candle")
+            stamps.append(stamp)
+        if stamps and stamps[-1].timestamp() != latest_closed_reference(captured.timestamp(), seconds, offset):
+            raise OverlayError("Stale local readiness history")
+        start = max(0, len(stamps) - 1)
+        while start > 0 and (stamps[start] - stamps[start - 1]).total_seconds() == seconds:
+            start -= 1
+        counts.append(len(stamps) - start)
+    deadline = min(captured + timedelta(seconds=10), quote_stamp + timedelta(seconds=10),
+                   now + timedelta(seconds=DISPLAY_TTL_SECONDS))
+    if int(deadline.timestamp()) <= int(now.timestamp()):
+        raise OverlayError("Local readiness freshness elapsed")
+    return counts, deadline
+
+
 def validate_proposal(value, *, symbol, execution, quote, observed_at, broker_offset_minutes=0):
     """Validate the separate chart DTO without fabricating a claim or draft."""
     now = utc(observed_at)
@@ -351,6 +401,7 @@ class ChartExporter:
             raise OverlayError("Chart directory escapes MT5 common Files")
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path = self.directory / ("levels_" + self.terminal_key + ".csv")
+        self.readiness_path = self.directory / ("readiness_" + self.terminal_key + ".csv")
         self._check_destination()
         self.nonce = nonce if nonce is not None else secrets.token_hex(16)
         if type(self.nonce) is not str or re.fullmatch(r"[0-9a-f]{32}", self.nonce) is None:
@@ -369,30 +420,33 @@ class ChartExporter:
         return cls(common, data, symbol=settings.symbol,
                    broker_offset_minutes=settings.broker_utc_offset_minutes, account=account)
 
-    def _check_destination(self):
+    def _check_destination(self, *, readiness=False):
+        path = self.readiness_path if readiness else self.path
         if not self.directory.resolve(strict=True).is_relative_to(self.common) or not self.directory.is_dir():
             raise OverlayError("Chart directory escapes MT5 common Files")
-        if self.path.is_symlink() or not self.path.resolve(strict=False).is_relative_to(self.common):
+        if path.is_symlink() or not path.resolve(strict=False).is_relative_to(self.common):
             raise OverlayError("Invalid chart export destination")
-        if self.path.exists() and not self.path.is_file():
+        if path.exists() and not path.is_file():
             raise OverlayError("Invalid chart export destination")
 
-    def _write(self, fields):
-        self._check_destination()
+    def _write(self, fields, *, readiness=False):
+        self._check_destination(readiness=readiness)
+        path = self.readiness_path if readiness else self.path
         row = ";".join(str(field) for field in fields)
         encoded = row.encode("ascii")
-        if len(fields) != 18 or len(encoded) > 2048 or any(char in row for char in '\r\n"'):
+        if len(fields) != (10 if readiness else 18) or len(encoded) > 2048 or any(char in row for char in '\r\n"'):
             raise OverlayError("Invalid chart row")
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile(mode="wb", dir=self.directory, prefix=".levels-", suffix=".tmp", delete=False) as stream:
+            with tempfile.NamedTemporaryFile(mode="wb", dir=self.directory,
+                                             prefix=".readiness-" if readiness else ".levels-", suffix=".tmp", delete=False) as stream:
                 temporary = Path(stream.name)
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
             for attempt in range(4):
                 try:
-                    os.replace(temporary, self.path)
+                    os.replace(temporary, path)
                     break
                 except OSError as error:
                     if not isinstance(error, PermissionError) and getattr(error, "winerror", None) not in (32, 33):
@@ -407,16 +461,45 @@ class ChartExporter:
                 except OSError:
                     pass
 
-    def clear(self, observed_at):
+    def _clear_readiness(self):
+        self._check_destination(readiness=True)
+        self.readiness_path.unlink(missing_ok=True)
+
+    def _invalidate_readiness(self):
+        try:
+            self._clear_readiness()
+        except (OverlayError, OSError):
+            pass  # A locked prior sidecar still expires within its source deadline.
+
+    def refresh_readiness(self, feed, observed_at):
+        """Refresh local telemetry without renewing any server proposal row."""
+        try:
+            if feed is None:
+                self._clear_readiness()
+                return
+            counts, deadline = feed_readiness(feed, symbol=self.symbol,
+                                              broker_offset_minutes=self.offset, observed_at=observed_at)
+            self._write([1, int(utc(observed_at).timestamp()), int(deadline.timestamp()), *counts,
+                         self.terminal_key, self.nonce, self.binding_hash], readiness=True)
+        except (OverlayError, OSError):
+            # Display diagnostics never change proposal/notification behavior.
+            self._invalidate_readiness()
+
+    def _clear_levels(self, observed_at):
         now = utc(observed_at)
         observed = int(now.timestamp())
         self._write([2, "waiting", self.symbol, "M1", "NONE", 0, 0, 0, 0, 0, 2,
                      observed, observed + DISPLAY_TTL_SECONDS, 0, self.offset,
                      self.terminal_key, self.nonce, self.binding_hash])
 
-    def publish(self, value, *, execution, quote, observed_at):
+    def clear(self, observed_at):
+        self._invalidate_readiness()
+        self._clear_levels(observed_at)
+
+    def publish(self, value, *, execution, quote, observed_at, feed=None):
+        self.refresh_readiness(feed, observed_at)
         if value is None:
-            self.clear(observed_at)
+            self._clear_levels(observed_at)
             return
         proposal = validate_proposal(value, symbol=self.symbol, execution=execution, quote=quote, observed_at=observed_at,
                                      broker_offset_minutes=self.offset)

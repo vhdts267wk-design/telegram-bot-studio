@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
+from datetime import timedelta
 import io
 import json
 from unittest.mock import Mock, patch
@@ -11,6 +12,7 @@ from bridge import mt5_chart_overlay as chart
 from bridge import mt5_manual_bridge as manual
 from bridge import mt5_trade_bridge as trade
 from tests import test_mt5_trade_bridge as fixtures
+from tests import test_mt5_chart_overlay as overlay_fixtures
 
 
 class HelperOverlayTests(unittest.TestCase):
@@ -65,6 +67,7 @@ class HelperOverlayTests(unittest.TestCase):
             self.assertIsNone(call.args[0])
             self.assertEqual(call.kwargs["execution"], trade.execution_metadata(self.fixture.symbol))
             self.assertEqual(call.kwargs["quote"]["bid"], 2500)
+            self.assertEqual(call.kwargs["feed"]["quote"]["bid"], 2500)
         self.assertEqual(self.exporter.clear.call_count, 2)  # Startup and shutdown.
         self.assertEqual(trade.FEED_SECONDS, 60)  # Automatic/global cadence is unchanged.
 
@@ -114,7 +117,7 @@ class HelperOverlayTests(unittest.TestCase):
         feed = {"execution": {"digits": 2}, "quote": {"time": "synthetic"}}
         manual.refresh_chart(self.settings, "local-device", self.exporter, feed, post=post, clock=lambda: fixtures.NOW)
         post.assert_called_once_with(self.settings, "chart", {"device_id": "local-device"})
-        self.exporter.publish.assert_called_once_with(None, execution=feed["execution"], quote=feed["quote"], observed_at=fixtures.NOW)
+        self.exporter.publish.assert_called_once_with(None, execution=feed["execution"], quote=feed["quote"], observed_at=fixtures.NOW, feed=feed)
         self.adapter.prepare.assert_not_called()
         post.return_value = {"proposal": None, "claim_id": "forbidden"}
         with self.assertRaises(chart.OverlayError):
@@ -133,6 +136,79 @@ class HelperOverlayTests(unittest.TestCase):
         self.assertTrue(request.full_url.endswith("/api/mt5/manual/chart"))
         self.assertEqual(request.get_header("Authorization"), "Bearer " + self.settings.market.key)
         self.assertEqual(json.loads(request.data), {"device_id": "synthetic"})
+
+    def test_delayed_chart_response_uses_new_snapshot_only_after_strict_response_validation(self):
+        events = []
+        elapsed = [0]
+        cached = {"execution": {"digits": 1}, "quote": {"time": "old"}}
+        fresh = {"execution": {"digits": 3}, "quote": {"time": "new"}}
+
+        def post(*args):
+            events.append("chart response")
+            elapsed[0] += 12
+            return {"proposal": None}
+
+        def capture():
+            events.append("fresh local capture")
+            return fresh
+
+        manual.refresh_chart(self.settings, "local-device", self.exporter, cached,
+                             post=post, fresh_feed=capture,
+                             clock=lambda: fixtures.NOW + timedelta(seconds=elapsed[0]))
+        self.assertEqual(events, ["chart response", "fresh local capture"])
+        self.exporter.publish.assert_called_once_with(
+            None, execution=fresh["execution"], quote=fresh["quote"], feed=fresh,
+            observed_at=fixtures.NOW + timedelta(seconds=12))
+        self.assertEqual(cached, {"execution": {"digits": 1}, "quote": {"time": "old"}})
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+        capture = Mock(return_value=fresh)
+        for reply in ({"proposal": None, "claim_id": "forbidden"}, {}, []):
+            with self.subTest(reply=reply), self.assertRaises(chart.OverlayError):
+                manual.refresh_chart(self.settings, "local-device", self.exporter, cached,
+                                     post=Mock(return_value=reply), fresh_feed=capture)
+        capture.assert_not_called()
+        self.assertEqual(self.exporter.publish.call_count, 1)
+
+    def test_fresh_capture_failure_propagates_without_export_or_order_operations(self):
+        for error in (trade.GuardError("Synthetic account changed"),
+                      manual.market.MarketDataError("Synthetic quote unavailable")):
+            with self.subTest(error=type(error).__name__), self.assertRaises(type(error)):
+                manual.refresh_chart(self.settings, "local-device", self.exporter, {},
+                                     post=Mock(return_value={"proposal": None}),
+                                     fresh_feed=Mock(side_effect=error))
+        self.exporter.publish.assert_not_called()
+        self.adapter.prepare.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_fresh_snapshot_cannot_extend_original_proposal_expiry(self):
+        holder = overlay_fixtures.ExportTests(methodName="test_active_row_has_exact_18_fields_safe_path_and_unchanged_prices")
+        holder.setUp()
+        self.addCleanup(holder.doCleanups)
+        proposal = overlay_fixtures.proposal()
+        original_expiry = overlay_fixtures.NOW + timedelta(seconds=8)
+        proposal["expires_at"] = original_expiry.isoformat()
+        original = deepcopy(proposal)
+        observed = overlay_fixtures.NOW + timedelta(seconds=3)
+        fresh = overlay_fixtures.readiness_feed(observed)
+        manual.refresh_chart(self.settings, "local-device", holder.exporter, {},
+                             post=Mock(return_value={"proposal": proposal}),
+                             fresh_feed=lambda: fresh, clock=lambda: observed)
+        fields = holder.exporter.path.read_text(encoding="ascii").split(";")
+        self.assertEqual(int(fields[12]), int(original_expiry.timestamp()))
+        saved = holder.exporter.path.read_bytes()
+        observed = original_expiry + timedelta(seconds=1)
+        fresh = overlay_fixtures.readiness_feed(observed)
+        with self.assertRaises(chart.OverlayError):
+            manual.refresh_chart(self.settings, "local-device", holder.exporter, {},
+                                 post=Mock(return_value={"proposal": proposal}),
+                                 fresh_feed=lambda: fresh, clock=lambda: observed)
+        self.assertEqual(holder.exporter.path.read_bytes(), saved)
+        self.assertEqual(proposal, original)
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -52,6 +52,87 @@ def experimental_proposal():
     return value
 
 
+def readiness_feed(captured=NOW):
+    frames = {}
+    for frame, seconds in chart.FRAME_SECONDS.items():
+        latest = chart.latest_closed_reference(captured.timestamp(), seconds, 180)
+        frames[frame] = [{"time": datetime.fromtimestamp(latest - (63 - index) * seconds, timezone.utc).isoformat(),
+                          "open": 2500.0, "high": 2501.0, "low": 2499.0, "close": 2500.5,
+                          "tick_volume": 100} for index in range(64)]
+    return {"source": "MetaTrader 5", "schema_version": 2, "symbol": "XAUUSD", "as_of": captured.isoformat(),
+            "broker_utc_offset_minutes": 180, "execution": deepcopy(EXECUTION),
+            "quote": dict(QUOTE, time=captured.isoformat()), "timeframes": frames}
+
+
+class ReadinessValidationTests(unittest.TestCase):
+    def validate(self, feed, *, now=NOW):
+        return chart.feed_readiness(feed, symbol="XAUUSD", broker_offset_minutes=180, observed_at=now)
+
+    def test_counts_are_actual_closed_contiguous_suffixes_and_empty_frame_is_zero(self):
+        feed = readiness_feed()
+        for row in feed["timeframes"]["H1"][:-10]:
+            row["time"] = (chart.utc(row["time"]) - timedelta(hours=1)).isoformat()
+        feed["timeframes"]["M15"] = []
+        counts, deadline = self.validate(feed)
+        self.assertEqual(counts, [10, 0, 64, 64])
+        self.assertEqual(deadline, NOW + timedelta(seconds=10))
+
+    def test_capture_boundary_rather_than_later_receipt_defines_closed_history(self):
+        feed = readiness_feed(NOW - timedelta(seconds=5))
+        self.assertEqual(self.validate(feed)[0], [64] * 4)
+        # A candle closed after capture is lookahead even though receipt is later.
+        feed["timeframes"]["M1"][-1] = readiness_feed()["timeframes"]["M1"][-1]
+        with self.assertRaises(chart.OverlayError):
+            self.validate(feed)
+
+    def test_source_quote_and_capture_bound_expiry_without_receipt_renewal(self):
+        feed = readiness_feed(NOW - timedelta(seconds=4))
+        feed["quote"]["time"] = (NOW - timedelta(seconds=3)).isoformat()
+        self.assertEqual(self.validate(feed)[1], NOW + timedelta(seconds=6))
+        self.assertEqual(self.validate(feed, now=NOW + timedelta(seconds=2))[1], NOW + timedelta(seconds=6))
+        feed = readiness_feed()
+        feed["quote"]["time"] = (NOW + timedelta(seconds=5)).isoformat()
+        self.assertEqual(self.validate(feed)[1], NOW + timedelta(seconds=10))
+
+    def test_future_or_stale_capture_quote_and_naive_timestamps_fail_closed(self):
+        for field, offset in (("as_of", 0.001), ("as_of", -10), ("quote", -10), ("quote", 5.001)):
+            feed = readiness_feed()
+            stamp = (NOW + timedelta(seconds=offset)).isoformat()
+            if field == "quote":
+                feed["quote"]["time"] = stamp
+            else:
+                feed[field] = stamp
+            with self.subTest(field=field, offset=offset), self.assertRaises(chart.OverlayError):
+                self.validate(feed)
+        feed = readiness_feed()
+        feed["as_of"] = NOW.replace(tzinfo=None).isoformat()
+        with self.assertRaises(chart.OverlayError):
+            self.validate(feed)
+
+    def test_malformed_feed_or_history_never_becomes_readiness(self):
+        mutations = [
+            lambda f: f.update(source="reference"),
+            lambda f: f.update(schema_version=True),
+            lambda f: f.update(symbol="GOLD"),
+            lambda f: f.update(broker_utc_offset_minutes=0),
+            lambda f: f["timeframes"].update(H4=[]),
+            lambda f: f["timeframes"].update(M1=f["timeframes"]["M1"] * 2),
+            lambda f: f["timeframes"]["M1"][-1].update(time=f["timeframes"]["M1"][-2]["time"]),
+            lambda f: f["timeframes"]["M1"][-1].update(time=(NOW - timedelta(seconds=59)).isoformat()),
+            lambda f: f["timeframes"]["H1"].pop(),
+            lambda f: f["timeframes"]["M5"][-1].update(tick_volume=True),
+            lambda f: f["timeframes"]["M15"][-1].update(high=2498.0),
+            lambda f: f["timeframes"]["M1"][-1].update(close=float("nan")),
+            lambda f: f["quote"].update(bid=2501.0),
+            lambda f: f["execution"].update(tick_size=0),
+        ]
+        for index, mutate in enumerate(mutations):
+            feed = readiness_feed()
+            mutate(feed)
+            with self.subTest(index=index), self.assertRaises(chart.OverlayError):
+                self.validate(feed)
+
+
 class ValidationTests(unittest.TestCase):
     def validate(self, value=None, *, execution=None, quote=None, now=NOW):
         return chart.validate_proposal(value if value is not None else proposal(), symbol="XAUUSD",
@@ -318,6 +399,86 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(fields[5:10], ["0"] * 5)
         self.assertEqual(int(fields[12]), int(NOW.timestamp()) + 25)
         self.assertEqual(fields[13], "0")
+
+    def test_null_proposal_writes_bound_readiness_without_inventing_active_levels(self):
+        feed = readiness_feed()
+        feed["timeframes"]["H1"] = feed["timeframes"]["H1"][-10:]
+        self.exporter.publish(None, execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=feed)
+        raw = self.exporter.readiness_path.read_bytes()
+        self.assertLessEqual(len(raw), 2048)
+        self.assertFalse(any(char in raw for char in (b"\r", b"\n", b'"')))
+        fields = raw.decode("ascii").split(";")
+        self.assertEqual(len(fields), 10)
+        self.assertEqual(fields[:7], ["1", str(int(NOW.timestamp())), str(int(NOW.timestamp()) + 10), "10", "64", "64", "64"])
+        self.assertEqual(fields[7:], [self.exporter.terminal_key, self.exporter.nonce, self.exporter.binding_hash])
+        self.assertEqual(self.exporter.readiness_path.name, "readiness_" + "a" * 32 + ".csv")
+        self.assertNotIn(str(self.account.login), raw.decode("ascii"))
+        self.assertNotIn(self.account.server.encode("utf-8"), raw)
+        self.assertEqual(self.exporter.path.read_text(encoding="ascii").split(";")[1], "waiting")
+
+    def test_invalid_or_missing_readiness_cannot_suppress_or_authorize_proposals(self):
+        feed = readiness_feed()
+        self.exporter.publish(proposal(), execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=feed)
+        original = self.exporter.path.read_bytes()
+        self.assertTrue(self.exporter.readiness_path.is_file())
+        feed["as_of"] = (NOW + timedelta(seconds=1)).isoformat()
+        self.exporter.publish(proposal(), execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=feed)
+        self.assertEqual(self.exporter.path.read_bytes(), original)
+        self.assertFalse(self.exporter.readiness_path.exists())
+        self.exporter.publish(None, execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=feed)
+        self.assertEqual(self.exporter.path.read_text(encoding="ascii").split(";")[1], "waiting")
+        self.exporter.publish(proposal(), execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=readiness_feed())
+        self.publish()  # Legacy callers need not supply the optional feed.
+        self.assertFalse(self.exporter.readiness_path.exists())
+        invalid_proposal = proposal()
+        invalid_proposal["stop"] = 2600
+        with self.assertRaises(chart.OverlayError):
+            self.exporter.publish(invalid_proposal, execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=readiness_feed())
+
+    def test_sidecar_atomic_io_failure_is_isolated_from_complete_proposal_row(self):
+        real_replace = chart.os.replace
+
+        def replace(source, target):
+            if Path(target) == self.exporter.readiness_path:
+                raise PermissionError("synthetic sidecar reader lock")
+            return real_replace(source, target)
+
+        with patch.object(chart.os, "replace", side_effect=replace), patch.object(chart.time, "sleep"):
+            self.exporter.publish(proposal(), execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=readiness_feed())
+        self.assertEqual(self.exporter.path.read_text(encoding="ascii").split(";")[1], "active")
+        self.assertFalse(self.exporter.readiness_path.exists())
+        self.assertEqual(list(self.exporter.directory.glob(".readiness-*.tmp")), [])
+
+    def test_clear_removes_owned_readiness_and_never_refreshes_zero_counts(self):
+        self.exporter.publish(None, execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=readiness_feed())
+        self.exporter.clear(NOW + timedelta(seconds=1))
+        self.assertFalse(self.exporter.readiness_path.exists())
+        self.assertEqual(self.exporter.path.read_text(encoding="ascii").split(";")[1], "waiting")
+
+    def test_fresh_local_readiness_never_renews_waiting_or_expired_active_row(self):
+        for value in (None, proposal()):
+            with self.subTest(active=value is not None):
+                self.exporter.publish(value, execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=readiness_feed())
+                original = self.exporter.path.read_bytes()
+                later = NOW + timedelta(seconds=26)
+                self.exporter.refresh_readiness(readiness_feed(later), later)
+                self.assertEqual(self.exporter.path.read_bytes(), original)
+                self.assertLess(int(original.decode("ascii").split(";")[12]), int(later.timestamp()))
+                fields = self.exporter.readiness_path.read_text(encoding="ascii").split(";")
+                self.assertEqual(int(fields[2]), int(later.timestamp()) + 10)
+                # Re-exporting the same source after its deadline cannot keep it LIVE.
+                self.exporter.refresh_readiness(readiness_feed(later), later + timedelta(seconds=10))
+                self.assertFalse(self.exporter.readiness_path.exists())
+                self.assertEqual(self.exporter.path.read_bytes(), original)
+
+    def test_invalid_readiness_destination_and_locked_clear_do_not_block_levels(self):
+        self.exporter.readiness_path.mkdir()
+        self.exporter.publish(proposal(), execution=EXECUTION, quote=QUOTE, observed_at=NOW, feed=readiness_feed())
+        self.assertTrue(self.exporter.readiness_path.is_dir())
+        self.assertEqual(self.exporter.path.read_text(encoding="ascii").split(";")[1], "active")
+        with patch.object(self.exporter, "_clear_readiness", side_effect=PermissionError("synthetic sidecar lock")):
+            self.exporter.clear(NOW)
+        self.assertEqual(self.exporter.path.read_text(encoding="ascii").split(";")[1], "waiting")
 
     def test_failed_atomic_replace_preserves_old_complete_row_and_removes_temporary_file(self):
         original = self.publish()
