@@ -34,6 +34,12 @@ Refreshing readiness alone never extends the proposal file's expiry. Slow
 requests or unavailable broker quotes can still exceed the unchanged ten-second
 freshness limit; LIVE then disappears until verified fresh data returns.
 
+After a local quote/history failure, the helper retries collection on its
+existing one-second loop and uploads as soon as a guarded snapshot succeeds.
+It does not wait an additional five seconds after local recovery. Network
+failures retain their five-second backoff. Local failures log a fixed reason
+code and UTC time without raw SDK messages, credentials or account identifiers.
+
 The server opt-in is `MT5_DEMO_ORDERS_ENABLED=true`, together with
 `MARKET_SOURCE=mt5`, `MT5_MANUAL_TICKETS_ENABLED=true`, and the existing private
 `MT5_MANUAL_BRIDGE_KEY`. Both workflows are disabled in a clean example

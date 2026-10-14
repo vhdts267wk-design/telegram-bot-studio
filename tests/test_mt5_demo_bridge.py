@@ -475,6 +475,141 @@ class DemoBridgeTests(unittest.TestCase):
             self.assertEqual(polls[0], 2)  # The failed upload never claims work.
             self.mt5.order_send.assert_not_called()
 
+    def test_local_quote_failure_recovers_at_next_second_without_claiming_invalid_data(self):
+        elapsed, calls, exporter = [0.0], [], Mock()
+        output, errors = io.StringIO(), io.StringIO()
+        def clock(): return NOW + timedelta(seconds=elapsed[0])
+        def collect(_mt5, settings, observed):
+            if elapsed[0] == 0:
+                raise demo.market.MarketDataError("A fresh, valid broker quote is required.")
+            feed = overlay_fixtures.readiness_feed(observed)
+            feed.update(symbol=settings.symbol, broker_utc_offset_minutes=settings.broker_utc_offset_minutes)
+            return feed
+        def posted(settings, route, payload):
+            calls.append((elapsed[0], route))
+            if route == "register": return {"paired": True}
+            self.assertGreaterEqual(elapsed[0], 1, "Invalid local data reached the service or claim poll")
+            if route == "chart": return {"proposal": None}
+            if route == "poll": return {"trade": None}
+            return {}
+        with patch.object(trade, "terminal_is_running", side_effect=[True, True, True, False]), patch.object(
+            demo.time, "monotonic", side_effect=lambda: elapsed[0]
+        ), patch.object(demo.market, "build_payload", side_effect=collect), redirect_stdout(output), redirect_stderr(errors):
+            result = demo.run_bridge(self.mt5, self.settings, post=posted, clock=clock,
+                                     sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+                                     exporter_factory=lambda *args: exporter)
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [(0, "register"), (1, "market"), (1, "chart"), (1, "poll")])
+        self.assertEqual(errors.getvalue().count("MT5 feed unavailable"), 1)
+        self.assertRegex(errors.getvalue(), r"Reason:\s*stale_quote")
+        self.assertIn("UTC:", errors.getvalue())
+        self.assertIn(NOW.strftime("%Y-%m-%dT%H:%M:%S"), errors.getvalue())
+        self.assertEqual(output.getvalue().count("Fresh MT5 feed ready."), 1)
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_transport_failure_retains_five_second_backoff_and_never_claims_before_success(self):
+        elapsed, calls, exporter = [0.0], [], Mock()
+        output, errors = io.StringIO(), io.StringIO()
+        def clock(): return NOW + timedelta(seconds=elapsed[0])
+        def collect(_mt5, settings, observed):
+            feed = overlay_fixtures.readiness_feed(observed)
+            feed.update(symbol=settings.symbol, broker_utc_offset_minutes=settings.broker_utc_offset_minutes)
+            return feed
+        def posted(settings, route, payload):
+            calls.append((elapsed[0], route))
+            if route == "register": return {"paired": True}
+            if route == "market" and elapsed[0] == 0:
+                raise RuntimeError("PRIVATE_SYNTHETIC_TRANSPORT_DETAIL")
+            if route == "chart": return {"proposal": None}
+            if route == "poll": return {"trade": None}
+            return {}
+        with patch.object(trade, "terminal_is_running", side_effect=[True] * 7 + [False]), patch.object(
+            demo.time, "monotonic", side_effect=lambda: elapsed[0]
+        ), patch.object(demo.market, "build_payload", side_effect=collect), redirect_stdout(output), redirect_stderr(errors):
+            result = demo.run_bridge(self.mt5, self.settings, post=posted, clock=clock,
+                                     sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+                                     exporter_factory=lambda *args: exporter)
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [(0, "register"), (0, "market"), (5, "market"), (5, "chart"), (5, "poll")])
+        self.assertEqual(errors.getvalue().count("Demo connection unavailable"), 1)
+        self.assertNotIn("PRIVATE_SYNTHETIC_TRANSPORT_DETAIL", errors.getvalue())
+        self.assertEqual(output.getvalue().count("Fresh MT5 feed ready."), 1)
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_repeated_private_local_failures_log_fixed_code_and_never_contact_claim_queue(self):
+        elapsed, exporter = [0.0], Mock()
+        errors, post = io.StringIO(), Mock(return_value={"paired": True})
+        failure = demo.market.MarketDataError("PRIVATE_SYNTHETIC_SDK_ACCOUNT_PATH_TOKEN")
+        with patch.object(trade, "terminal_is_running", side_effect=[True] * 4 + [False]), patch.object(
+            demo.time, "monotonic", side_effect=lambda: elapsed[0]
+        ), patch.object(demo.market, "build_payload", side_effect=failure), redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            result = demo.run_bridge(self.mt5, self.settings, post=post,
+                                     clock=lambda: NOW + timedelta(seconds=elapsed[0]),
+                                     sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+                                     exporter_factory=lambda *args: exporter)
+        self.assertEqual(result, 0)
+        self.assertEqual([call.args[1] for call in post.call_args_list], ["register"])
+        self.assertEqual(errors.getvalue().count("MT5 feed unavailable"), 1)
+        self.assertRegex(errors.getvalue(), r"Reason:\s*invalid_local_data")
+        self.assertIn("UTC:", errors.getvalue())
+        self.assertNotIn("PRIVATE_SYNTHETIC", errors.getvalue())
+        exporter.publish.assert_not_called()
+        exporter.refresh_readiness.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_local_failure_during_transport_backoff_cannot_shorten_network_retry_deadline(self):
+        elapsed, calls, captures, exporter = [0.0], [], [], Mock()
+        output, errors = io.StringIO(), io.StringIO()
+        def clock(): return NOW + timedelta(seconds=elapsed[0])
+        def collect(_mt5, settings, observed):
+            captures.append(elapsed[0])
+            if elapsed[0] == 1:
+                raise demo.market.MarketDataError("A fresh, valid broker quote is required.")
+            feed = overlay_fixtures.readiness_feed(observed)
+            feed.update(symbol=settings.symbol, broker_utc_offset_minutes=settings.broker_utc_offset_minutes)
+            return feed
+        def posted(settings, route, payload):
+            calls.append((elapsed[0], route))
+            if route == "register": return {"paired": True}
+            if route == "market" and elapsed[0] == 0:
+                raise RuntimeError("PRIVATE_SYNTHETIC_TRANSPORT_FAILURE")
+            if route == "chart": return {"proposal": None}
+            if route == "poll": return {"trade": None}
+            return {}
+        with patch.object(trade, "terminal_is_running", side_effect=[True] * 7 + [False]), patch.object(
+            demo.time, "monotonic", side_effect=lambda: elapsed[0]
+        ), patch.object(demo.market, "build_payload", side_effect=collect), redirect_stdout(output), redirect_stderr(errors):
+            result = demo.run_bridge(self.mt5, self.settings, post=posted, clock=clock,
+                                     sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+                                     exporter_factory=lambda *args: exporter)
+        self.assertEqual(result, 0)
+        self.assertIn(1, captures)
+        self.assertIn(2, captures)  # Local market recovery occurred before the network retry deadline.
+        self.assertEqual(calls, [(0, "register"), (0, "market"), (5, "market"), (5, "chart"), (5, "poll")])
+        self.assertNotIn("PRIVATE_SYNTHETIC_TRANSPORT_FAILURE", errors.getvalue())
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_terminal_installation_mismatch_stops_without_retry_or_feed_claim(self):
+        exporter, post = Mock(), Mock(return_value={"paired": True})
+        failure = demo.market.MarketDataError("PRIVATE_SYNTHETIC_TERMINAL_PATH", reason_code="terminal_installation_mismatch")
+        errors = io.StringIO()
+        with patch.object(trade, "terminal_is_running", side_effect=[True, True, False]), patch.object(
+            demo.time, "monotonic", return_value=0
+        ), patch.object(demo.market, "build_payload", side_effect=failure) as capture, redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            result = demo.run_bridge(self.mt5, self.settings, post=post, clock=lambda: NOW,
+                                     sleep=Mock(), exporter_factory=lambda *args: exporter)
+        self.assertEqual(result, 1)
+        capture.assert_called_once()
+        self.assertEqual([call.args[1] for call in post.call_args_list], ["register"])
+        self.assertNotIn("PRIVATE_SYNTHETIC", errors.getvalue())
+        exporter.publish.assert_not_called()
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
     def test_successful_slow_transport_keeps_real_readiness_fresh_without_renewing_main_row(self):
         common = self.fixture.fixture.base / "display-common"
         data = self.fixture.fixture.base / ("A" * 32)
@@ -644,6 +779,39 @@ class DemoBridgeTests(unittest.TestCase):
         exporter.publish.assert_not_called()
         self.mt5.order_check.assert_not_called()
         self.mt5.order_send.assert_not_called()
+
+
+class MarketFailureReasonTests(unittest.TestCase):
+    def test_authored_quote_history_and_risk_messages_have_fixed_codes(self):
+        cases = {
+            "A fresh broker quote is required.": "missing_quote",
+            "A fresh, valid broker quote is required.": "stale_quote",
+            "Load completed bars in every required timeframe.": "incomplete_history",
+            "Incomplete broker candle.": "incomplete_history",
+            "Required closed histories must be current.": "history_not_current",
+            "Invalid or unfinished broker candle.": "invalid_history",
+            "Complete broker risk data is required.": "risk_data_unavailable",
+            "Current Demo risk data is required.": "risk_data_unavailable",
+        }
+        for message, expected in cases.items():
+            with self.subTest(expected=expected, message=message):
+                self.assertEqual(demo.market_failure_reason(demo.market.MarketDataError(message)), expected)
+
+    def test_only_whitelisted_terminal_codes_are_preserved(self):
+        for code in demo.market.TERMINAL_FAILURE_MESSAGES:
+            error = demo.market.MarketDataError("PRIVATE_SYNTHETIC_TERMINAL_DETAIL", reason_code=code)
+            with self.subTest(code=code):
+                self.assertEqual(demo.market_failure_reason(error), code)
+
+    def test_unknown_private_text_and_forged_reason_codes_never_leave_fixed_fallback(self):
+        for message in ("PRIVATE_SYNTHETIC_ACCOUNT_TOKEN_PATH", "Private prefix: A fresh broker quote is required."):
+            error = demo.market.MarketDataError(message)
+            error.reason_code = "PRIVATE_SYNTHETIC_FORGED_REASON"
+            with self.subTest(message=message):
+                result = demo.market_failure_reason(error)
+                self.assertEqual(result, "invalid_local_data")
+                self.assertNotIn("PRIVATE", result)
+                self.assertNotIn(message, result)
 
 
 if __name__ == "__main__":
