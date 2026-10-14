@@ -45,7 +45,7 @@ class DemoBridgeTests(unittest.TestCase):
         eligible = candle_fixtures.MultiTimeframeTests().feed(now=NOW, broker_offset=0)
         self.fixture.rates = {
             minutes: [{**bar, "time": int(trade.utc_date(bar["time"]).timestamp())} for bar in eligible["timeframes"][frame]]
-            for frame, minutes in (("H1", 60), ("M15", 15), ("M5", 5), ("M1", 1))
+            for frame, minutes in (("M30", 30), ("M15", 15), ("M5", 5), ("M1", 1))
         }
         self.mt5.order_check.side_effect = None
         self.mt5.order_check.return_value = SimpleNamespace(retcode=0)
@@ -107,7 +107,7 @@ class DemoBridgeTests(unittest.TestCase):
         eligible = candle_fixtures.MultiTimeframeTests().feed(now=NOW, broker_offset=0, sell=True)
         self.fixture.rates = {
             minutes: [{**bar, "time": int(trade.utc_date(bar["time"]).timestamp())} for bar in eligible["timeframes"][frame]]
-            for frame, minutes in (("H1", 60), ("M15", 15), ("M5", 5), ("M1", 1))
+            for frame, minutes in (("M30", 30), ("M15", 15), ("M5", 5), ("M1", 1))
         }
         self.tick.bid, self.tick.ask = 1999.997, 1999.999
         offer = self.current_offer()
@@ -184,18 +184,18 @@ class DemoBridgeTests(unittest.TestCase):
         self.mt5.positions_get.return_value = (object(),)
         self.assertEqual(self.execute()["status"], "failed")
         self.mt5.positions_get.return_value = ()
-        self.fixture.rates[60] = self.fixture.rates[60][:-1]
+        self.fixture.rates[30] = self.fixture.rates[30][:-1]
         offer = deepcopy(self.offer)
         offer["id"] = str(uuid4())
         self.assertEqual(self.execute(offer)["status"], "failed")
         self.mt5.order_send.assert_not_called()
 
-    def test_four_frame_execution_still_requires_22_closed_h1_bars_and_rejects_old_profiles(self):
-        self.fixture.rates[60] = self.fixture.rates[60][-21:]
+    def test_four_frame_execution_still_requires_22_closed_m30_bars_and_rejects_old_profiles(self):
+        self.fixture.rates[30] = self.fixture.rates[30][-21:]
         offer = deepcopy(self.offer)
         revised = demo.market.build_payload(self.mt5, self.settings.market, NOW)
         offer["payload"]["closed_history_sha256"] = demo.closed_history_sha256(revised)
-        self.assertEqual(set(revised["timeframes"]), {"H1", "M15", "M5", "M1"})
+        self.assertEqual(set(revised["timeframes"]), {"M30", "M15", "M5", "M1"})
         self.assertEqual(self.execute(offer)["status"], "failed")
         old = deepcopy(self.offer)
         old["id"] = str(uuid4())
@@ -219,6 +219,25 @@ class DemoBridgeTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertEqual(self.execute(offer)["status"], "failed")
             self.account.equity, self.account.margin_free = old_equity, old_margin
+        self.mt5.order_send.assert_not_called()
+
+    def test_old_h1_qualified_and_experimental_claims_fail_before_preflight_or_send(self):
+        for experimental in (False, True):
+            offer = self.current_offer(experimental=experimental)
+            offer["payload"].update(strategy_id="mtf-ema-pullback-60m-demo-v5" if experimental else "mtf-ema-pullback-60m-v4",
+                                    strategy_version=5 if experimental else 4,
+                                    policy_id="mtf-manual-demo-estimated-cost-risk-v5" if experimental else "mtf-manual-demo-cost-risk-v4")
+            with self.subTest(experimental=experimental):
+                self.assertEqual(self.execute(offer)["status"], "failed")
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
+    def test_schema2_local_snapshot_blocks_current_m30_accept_before_preflight(self):
+        feed = demo.market.build_payload(self.mt5, self.settings.market, NOW)
+        feed["schema_version"] = 2
+        with patch.object(demo.market, "build_payload", return_value=feed):
+            self.assertEqual(self.execute()["status"], "failed")
+        self.mt5.order_check.assert_not_called()
         self.mt5.order_send.assert_not_called()
 
     def test_m1_deadlines_cannot_extend_and_slow_preflight_cannot_send_after_expiry(self):
@@ -441,7 +460,7 @@ class DemoBridgeTests(unittest.TestCase):
         self.mt5.order_send.assert_called_once()
         native.assert_not_called()
         feed = next(payload for route, payload in calls if route == "market")
-        self.assertEqual(set(feed["timeframes"]), {"M1", "M5", "M15", "H1"})
+        self.assertEqual(set(feed["timeframes"]), {"M1", "M5", "M15", "M30"})
         self.assertIn("execution", feed)
         self.assertEqual(feed["device_id"], self.ledger.device_id)
         self.assertIn("Demo approval helper ready.", output.getvalue())

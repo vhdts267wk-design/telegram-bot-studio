@@ -36,7 +36,7 @@ class ChartAnalysisTests(unittest.TestCase):
             self.assert_no_trade(chart_analysis.format_chart_proposal(self.candidate))
             result = mtf_runtime.evaluate_feed(self.feed, self.now)
             text = chart_analysis.format_chart_analysis(self.feed, result, self.now)
-            self.assertIn("M1 / M5 / M15 / H1", text)
+            self.assertIn("M1 / M5 / M15 / M30", text)
             self.assertNotIn("H4", text)
             self.assertEqual(text.count("شراء BUY"), 1)
             self.assertIn("موافقتك اليدوية لكل صفقة", text)

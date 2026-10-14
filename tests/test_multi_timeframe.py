@@ -18,9 +18,9 @@ class MultiTimeframeTests(unittest.TestCase):
         for name, seconds in mtf.TIMEFRAME_SECONDS.items():
             end = datetime.fromtimestamp((int(now.timestamp()) + broker_offset * 60) // seconds * seconds
                                          - broker_offset * 60, timezone.utc)
-            step = {"M15": 0.2, "M5": 0.1, "M1": 0.02, "H1": .4}[name]
-            body = {"M15": 0.1, "M5": 0.04, "M1": 0.01, "H1": .2}[name]
-            wick = {"M15": 0.15, "M5": 0.1, "M1": 0.015, "H1": .3}[name]
+            step = {"M15": 0.2, "M5": 0.1, "M1": 0.02, "M30": .4}[name]
+            body = {"M15": 0.1, "M5": 0.04, "M1": 0.01, "M30": .2}[name]
+            wick = {"M15": 0.15, "M5": 0.1, "M1": 0.015, "M30": .3}[name]
             bars = []
             for index in range(count):
                 close = round(2000 - step * (count - 1 - index), 6)
@@ -40,7 +40,7 @@ class MultiTimeframeTests(unittest.TestCase):
                                close=round(4000 - bar["close"], 6))
             frames[name] = bars
         return {
-            "schema_version": 2, "source": "MetaTrader 5", "symbol": "XAUUSD",
+            "schema_version": 3, "source": "MetaTrader 5", "symbol": "XAUUSD",
             "timeframe": "M15", "as_of": now.isoformat(), "broker_utc_offset_minutes": broker_offset,
             "quote": {"bid": 1999.997 if sell else 2000.001,
                       "ask": 1999.999 if sell else 2000.003, "time": now.isoformat()},
@@ -101,7 +101,7 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assertEqual(Decimal(str(result["entry"])) - Decimal(str(result["target"])), 2 * risk)
         self.assertEqual(result["nominal_reward_risk"], 2)
 
-    def test_four_frame_context_is_qualitative_and_h1_levels_use_only_recent_closed_range(self):
+    def test_four_frame_context_is_qualitative_and_m30_levels_use_only_recent_closed_range(self):
         for sell in (False, True):
             feed = self.feed(sell=sell)
             result = self.analyze(feed)
@@ -109,17 +109,17 @@ class MultiTimeframeTests(unittest.TestCase):
             self.assertEqual(context["trends"], dict.fromkeys(mtf.TIMEFRAME_SECONDS, "SELL" if sell else "BUY"))
             self.assertEqual((context["alignment"], context["confidence"], context["counter_trend"]),
                              ("aligned", "aligned", False))
-            recent = feed["timeframes"]["H1"][-20:]
+            recent = feed["timeframes"]["M30"][-20:]
             self.assertEqual(context["support"], min(bar["low"] for bar in recent))
             self.assertEqual(context["resistance"], max(bar["high"] for bar in recent))
-            self.assertEqual(result["context_bar_times"], {key: feed["timeframes"][key][-1]["time"] for key in ("H1",)})
+            self.assertEqual(result["context_bar_times"], {key: feed["timeframes"][key][-1]["time"] for key in ("M30",)})
             self.assertNotIn("probability", context)
-            feed["timeframes"]["H1"][0].update(low=1000, high=3000)
+            feed["timeframes"]["M30"][0].update(low=1000, high=3000)
             self.assertEqual(self.analyze(feed)["timeframe_context"], context)
 
     def test_higher_context_conflict_blocks_buy_and_sell_without_actionable_fields(self):
         for sell in (False, True):
-            for frame in ("H1",):
+            for frame in ("M30",):
                 with self.subTest(sell=sell, frame=frame):
                     feed = self.feed(sell=sell)
                     feed["timeframes"][frame] = self.feed(sell=not sell)["timeframes"][frame]
@@ -131,22 +131,22 @@ class MultiTimeframeTests(unittest.TestCase):
                     for key in ("stop", "target", "target2", "entry_zone_low", "effective_reward_risk"):
                         self.assertNotIn(key, result)
 
-    def test_h4_is_not_required_but_h1_still_requires_22_closed_contiguous_bars(self):
+    def test_h4_is_not_required_but_m30_still_requires_22_closed_contiguous_bars(self):
         feed = self.feed(count=22)
-        self.assertEqual(set(feed["timeframes"]), {"H1", "M15", "M5", "M1"})
+        self.assertEqual(set(feed["timeframes"]), {"M30", "M15", "M5", "M1"})
         result = self.analyze(feed)
         self.assertEqual(result["state"], "signal", result)
-        self.assertEqual(result["timeframe_context"]["levels_timeframe"], "H1")
-        self.assertEqual(set(result["context_bar_times"]), {"H1"})
-        self.assertEqual(result["strategy_version"], 4)
-        feed["timeframes"]["H1"].pop(0)
+        self.assertEqual(result["timeframe_context"]["levels_timeframe"], "M30")
+        self.assertEqual(set(result["context_bar_times"]), {"M30"})
+        self.assertEqual(result["strategy_version"], 6)
+        feed["timeframes"]["M30"].pop(0)
         self.assert_waiting(self.analyze(feed), "warmup", "insufficient_contiguous_history")
         legacy = self.feed()
         legacy["timeframes"]["H4"] = []
         self.assert_waiting(self.analyze(legacy), "warmup", "missing_timeframes")
 
     def test_neutral_higher_context_waits_and_never_implies_confidence_percentage(self):
-        for frame in ("H1",):
+        for frame in ("M30",):
             feed = self.feed()
             for bar in feed["timeframes"][frame]:
                 bar.update(open=2000, high=2000.1, low=1999.9, close=2000)
@@ -157,6 +157,47 @@ class MultiTimeframeTests(unittest.TestCase):
                              ("unconfirmed", "unconfirmed"))
             self.assertIs(result["timeframe_context"]["counter_trend"], False)
 
+    def test_old_schema_two_and_hourly_frame_contract_are_rejected(self):
+        feed = self.feed()
+        feed["schema_version"] = 2
+        self.assert_waiting(self.analyze(feed), "invalid", "unsupported_feed")
+        feed = self.feed()
+        feed["timeframes"]["H1"] = feed["timeframes"].pop("M30")
+        self.assert_waiting(self.analyze(feed), "warmup", "missing_timeframes")
+        feed = self.feed()
+        feed["timeframes"]["H4"] = []
+        self.assert_waiting(self.analyze(feed), "warmup", "missing_timeframes")
+
+    def test_strict_half_hour_warmup_after_22utc_resume_is_ready_at_09utc(self):
+        resumed = datetime(2026, 10, 13, 22, tzinfo=timezone.utc)
+        for hour, minute, expected_count, state in ((8, 59, 21, "warmup"), (9, 0, 22, "signal")):
+            now = datetime(2026, 10, 14, hour, minute, tzinfo=timezone.utc)
+            feed = self.feed(now=now, broker_offset=180)
+            for frame, rows in feed["timeframes"].items():
+                feed["timeframes"][frame] = [row for row in rows if datetime.fromisoformat(row["time"]) >= resumed]
+            feed["candles"] = deepcopy(feed["timeframes"]["M15"])
+            result = self.analyze(feed, now=now)
+            self.assertEqual(len(feed["timeframes"]["M30"]), expected_count)
+            self.assertEqual(result["state"], state, result)
+            if state == "signal":
+                self.assertEqual(result["horizon_seconds"], 3600)
+                self.assertEqual(result["timeframe_context"]["levels_timeframe"], "M30")
+                self.assertEqual(set(result["context_bar_times"]), {"M30"})
+        now = resumed + timedelta(hours=5, minutes=30)
+        feed = self.feed(now=now)
+        m15 = [row for row in feed["timeframes"]["M15"] if datetime.fromisoformat(row["time"]) >= resumed]
+        self.assertEqual(len(m15), 22)
+
+    def test_unexpected_m30_gap_resets_warmup_without_filling_bars(self):
+        feed = self.feed()
+        for row in feed["timeframes"]["M30"][:-21]:
+            row["time"] = (datetime.fromisoformat(row["time"]) - timedelta(minutes=30)).isoformat()
+        original = deepcopy(feed)
+        result = self.analyze(feed)
+        self.assert_waiting(result, "warmup", "insufficient_contiguous_history")
+        self.assertEqual(result["contiguous_counts"]["M30"], 21)
+        self.assertEqual(feed, original)
+
     def test_three_frame_legacy_missing_higher_history_and_bad_clock_offsets_fail_closed(self):
         feed = self.feed()
         feed["timeframes"] = {key: feed["timeframes"][key] for key in ("M1", "M5", "M15")}
@@ -166,7 +207,7 @@ class MultiTimeframeTests(unittest.TestCase):
             feed["broker_utc_offset_minutes"] = offset
             self.assert_waiting(self.analyze(feed), "invalid", "invalid_broker_utc_offset")
 
-    def test_h1_grid_uses_explicit_broker_offset_instead_of_utc_midnight(self):
+    def test_m30_grid_uses_explicit_broker_offset_instead_of_utc_midnight(self):
         for offset in (-720, -345, 0, 180, 345, 840):
             feed = self.feed(broker_offset=offset)
             result = self.analyze(feed)
@@ -175,16 +216,16 @@ class MultiTimeframeTests(unittest.TestCase):
                 stamp = datetime.fromisoformat(reference)
                 self.assertEqual((stamp.timestamp() + offset * 60) % mtf.TIMEFRAME_SECONDS[frame], 0)
             if offset == 345:
-                self.assertNotEqual(datetime.fromisoformat(result["context_bar_times"]["H1"]).timestamp() % 3600, 0)
+                self.assertNotEqual(datetime.fromisoformat(result["context_bar_times"]["M30"]).timestamp() % 3600, 0)
         feed = self.feed(broker_offset=345)
         feed["broker_utc_offset_minutes"] = 0
-        self.assert_waiting(self.analyze(feed), "invalid", "unaligned_candles_H1")
+        self.assert_waiting(self.analyze(feed), "invalid", "unaligned_candles_M30")
 
     def test_higher_bars_closed_at_receipt_but_after_m1_decision_are_lookahead(self):
         clock = self.now.replace(hour=13, minute=0)
-        for target in ("H1",):
+        for target in ("M30",):
             feed = self.feed(now=clock)
-            for frame in ("M1", "M5", "M15", "H1"):
+            for frame in ("M1", "M5", "M15", "M30"):
                 if frame == target:
                     continue
                 for bar in feed["timeframes"][frame]:
@@ -321,7 +362,7 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assert_waiting(self.analyze(feed), "invalid", "lookahead_M15")
 
     def test_stale_higher_frame_is_not_reused(self):
-        for key, seconds in (("M15", 900), ("M5", 300), ("H1", 3600)):
+        for key, seconds in (("M15", 900), ("M5", 300), ("M30", 1800)):
             with self.subTest(key=key):
                 feed = self.feed()
                 for bar in feed["timeframes"][key]:
@@ -492,8 +533,8 @@ class MultiTimeframeTests(unittest.TestCase):
 
     def test_policy_identity_is_detached_and_hash_ignores_crlf_conversion(self):
         identity = mtf.strategy_identity()
-        self.assertEqual(identity["strategy_id"], "mtf-ema-pullback-60m-v4")
-        self.assertEqual(identity["policy_id"], "mtf-manual-demo-cost-risk-v4")
+        self.assertEqual(identity["strategy_id"], "mtf-ema-pullback-60m-v6")
+        self.assertEqual(identity["policy_id"], "mtf-manual-demo-cost-risk-v6")
         self.assertRegex(identity["fingerprint"], r"^[0-9a-f]{64}$")
         identity["strategy_id"] = "forged"
         self.assertEqual(mtf.strategy_identity()["strategy_id"], mtf.STRATEGY_ID)

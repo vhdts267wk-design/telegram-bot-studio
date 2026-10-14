@@ -31,7 +31,7 @@ EXPERIMENTAL_FIELDS = (FIELDS - {"qualification_id"}) | {
 COST_ASSUMPTION_FIELDS = frozenset({
     "verified", "method", "commission_round_turn", "slippage_price", "spread_price", "tick_size",
 })
-FRAME_SECONDS = {"H1": 3600, "M15": 900, "M5": 300, "M1": 60}
+FRAME_SECONDS = {"M30": 1800, "M15": 900, "M5": 300, "M1": 60}
 
 
 class OverlayError(ValueError):
@@ -99,7 +99,7 @@ def validate_timeframe_context(value, direction):
     if (type(value) is not dict or set(value) != {
         "trends", "alignment", "confidence", "counter_trend", "support", "resistance", "levels_timeframe",
     } or type(value["trends"]) is not dict or set(value["trends"]) != set(FRAME_SECONDS)
-        or value["levels_timeframe"] != "H1"
+        or value["levels_timeframe"] != "M30"
         or direction not in ("BUY", "SELL")
         or any(type(trend) is not str or trend != direction for trend in value["trends"].values())
         or value["alignment"] != "aligned" or value["confidence"] != "aligned"
@@ -115,11 +115,11 @@ def validate_timeframe_context(value, direction):
 
 
 def validate_context_references(value, *, trigger, boundary, broker_offset_minutes):
-    """Require the last closed H1 bar at both signal and current boundary."""
-    if type(value) is not dict or set(value) != {"H1"}:
+    """Require the last closed M30 bar at both signal and current boundary."""
+    if type(value) is not dict or set(value) != {"M30"}:
         raise OverlayError("Incomplete higher-timeframe references")
     result = {}
-    for frame in ("H1",):
+    for frame in ("M30",):
         if type(value[frame]) is not str:
             raise OverlayError("Invalid higher-timeframe reference format")
         reference = utc(value[frame])
@@ -140,7 +140,8 @@ def current_timeframe_context(feed, *, observed_at, broker_offset_minutes):
     """
     now = utc(observed_at)
     offset = validate_broker_offset(broker_offset_minutes)
-    if type(feed) is not dict or type(feed.get("timeframes")) is not dict or set(feed["timeframes"]) != set(FRAME_SECONDS):
+    if (type(feed) is not dict or type(feed.get("schema_version")) is not int or feed["schema_version"] != 3
+        or type(feed.get("timeframes")) is not dict or set(feed["timeframes"]) != set(FRAME_SECONDS)):
         raise OverlayError("Incomplete local four-timeframe history")
     if validate_broker_offset(feed.get("broker_utc_offset_minutes")) != offset:
         raise OverlayError("Changed local context broker offset")
@@ -200,13 +201,13 @@ def current_timeframe_context(feed, *, observed_at, broker_offset_minutes):
                              else "SELL" if separation < 0 and slope < 0 and closes[-1] < fast[-1] else "NEUTRAL")
     direction = trends["M15"]
     aligned = direction != "NEUTRAL" and all(trend == direction for trend in trends.values())
-    counter = direction != "NEUTRAL" and trends["H1"] not in (direction, "NEUTRAL")
+    counter = direction != "NEUTRAL" and trends["M30"] not in (direction, "NEUTRAL")
     midpoint = (positive(feed["quote"]["bid"]) + positive(feed["quote"]["ask"])) / 2
-    support = min(row["low"] for row in streams["H1"][-20:])
-    resistance = max(row["high"] for row in streams["H1"][-20:])
+    support = min(row["low"] for row in streams["M30"][-20:])
+    resistance = max(row["high"] for row in streams["M30"][-20:])
     return {"trends": trends, "alignment": "aligned" if aligned else "counter_trend" if counter else "unconfirmed",
             "confidence": "aligned" if aligned else "reduced" if counter else "unconfirmed", "counter_trend": counter,
-            "levels_timeframe": "H1", "support": support if Decimal(str(support)) <= midpoint else None,
+            "levels_timeframe": "M30", "support": support if Decimal(str(support)) <= midpoint else None,
             "resistance": resistance if Decimal(str(resistance)) >= midpoint else None}
 
 
@@ -252,7 +253,7 @@ def feed_readiness(feed, *, symbol, broker_offset_minutes, observed_at):
     now = utc(observed_at)
     offset = validate_broker_offset(broker_offset_minutes)
     if (type(feed) is not dict or feed.get("source") != "MetaTrader 5"
-        or type(feed.get("schema_version")) is not int or feed["schema_version"] != 2
+        or type(feed.get("schema_version")) is not int or feed["schema_version"] != 3
         or feed.get("symbol") != symbol
         or validate_broker_offset(feed.get("broker_utc_offset_minutes")) != offset
         or type(feed.get("timeframes")) is not dict
@@ -316,9 +317,9 @@ def validate_proposal(value, *, symbol, execution, quote, observed_at, broker_of
     ):
         raise OverlayError("Incompatible chart proposal")
     if (
-        value["strategy_id"] != ("mtf-ema-pullback-60m-demo-v5" if experimental else "mtf-ema-pullback-60m-v4")
-        or type(value["strategy_version"]) is not int or value["strategy_version"] != (5 if experimental else 4)
-        or value["policy_id"] != ("mtf-manual-demo-estimated-cost-risk-v5" if experimental else "mtf-manual-demo-cost-risk-v4")
+        value["strategy_id"] != ("mtf-ema-pullback-60m-demo-v7" if experimental else "mtf-ema-pullback-60m-v6")
+        or type(value["strategy_version"]) is not int or value["strategy_version"] != (7 if experimental else 6)
+        or value["policy_id"] != ("mtf-manual-demo-estimated-cost-risk-v7" if experimental else "mtf-manual-demo-cost-risk-v6")
         or type(value["horizon_seconds"]) is not int or value["horizon_seconds"] != 3600
         or type(value["strategy_fingerprint"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["strategy_fingerprint"]) is None
         or (not experimental and (type(value["qualification_id"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["qualification_id"]) is None))
@@ -479,7 +480,7 @@ class ChartExporter:
                 return
             counts, deadline = feed_readiness(feed, symbol=self.symbol,
                                               broker_offset_minutes=self.offset, observed_at=observed_at)
-            self._write([1, int(utc(observed_at).timestamp()), int(deadline.timestamp()), *counts,
+            self._write([2, int(utc(observed_at).timestamp()), int(deadline.timestamp()), *counts,
                          self.terminal_key, self.nonce, self.binding_hash], readiness=True)
         except (OverlayError, OSError):
             # Display diagnostics never change proposal/notification behavior.

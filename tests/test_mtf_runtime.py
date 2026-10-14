@@ -238,10 +238,10 @@ class MtfRuntimeTests(unittest.TestCase):
             self.assertTrue(mtf_runtime.eligible_result(changed, self.now))
             self.assertFalse(mtf_runtime.eligible_payload(changed, self.feed, self.now))
 
-    def test_h1_reference_is_required_latest_closed_and_bound_to_broker_clock(self):
+    def test_m30_reference_is_required_latest_closed_and_bound_to_broker_clock(self):
         with pinned_synthetic_evidence(self.feed, self.now):
             original = {**self.qualified(), "workflow": "manual_ticket"}
-            for frame in ("H1",):
+            for frame in ("M30",):
                 seconds = multi_timeframe.TIMEFRAME_SECONDS[frame]
                 for delta in (-seconds, seconds, 1):
                     changed = deepcopy(original)
@@ -254,7 +254,7 @@ class MtfRuntimeTests(unittest.TestCase):
             changed = dict(original, broker_utc_offset_minutes=345)
             self.assertFalse(mtf_runtime.eligible_result(changed, self.now))
             legacy = deepcopy(self.feed)
-            del legacy["timeframes"]["H1"]
+            del legacy["timeframes"]["M30"]
             self.assertFalse(mtf_runtime.eligible_payload(original, legacy, self.now))
 
     def test_new_opposing_or_neutral_higher_context_invalidates_frozen_buy_and_sell(self):
@@ -263,7 +263,7 @@ class MtfRuntimeTests(unittest.TestCase):
             with pinned_synthetic_evidence(feed, self.now):
                 original = dict(mtf_runtime.evaluate_feed(feed, self.now), workflow="manual_ticket")
                 self.assertEqual(original["state"], "signal", original)
-                for frame in ("H1",):
+                for frame in ("M30",):
                     changed = deepcopy(feed)
                     changed["timeframes"][frame] = candle_fixtures.MultiTimeframeTests().feed(sell=not sell)["timeframes"][frame]
                     self.assertEqual(mtf_runtime.evaluate_feed(changed, self.now)["reason"], "higher_timeframe_conflict")
@@ -280,11 +280,11 @@ class MtfRuntimeTests(unittest.TestCase):
         with pinned_synthetic_evidence(self.feed, self.now, report=report):
             self.assertEqual(mtf_runtime.evaluate_feed(self.feed, self.now)["reason"], "evidence_unavailable")
 
-    def test_h1_levels_source_and_four_frame_context_are_mandatory_for_current_claims(self):
+    def test_m30_levels_source_and_four_frame_context_are_mandatory_for_current_claims(self):
         with pinned_synthetic_evidence(self.feed, self.now):
             original = {**self.qualified(), "workflow": "manual_ticket"}
             self.assertTrue(mtf_runtime.eligible_payload(original, self.feed, self.now))
-            for level_source in (None, "H4", "M15"):
+            for level_source in (None, "H1", "H4", "M15"):
                 changed = deepcopy(original)
                 changed["timeframe_context"]["levels_timeframe"] = level_source
                 self.assertFalse(mtf_runtime.eligible_result(changed, self.now))
@@ -293,9 +293,17 @@ class MtfRuntimeTests(unittest.TestCase):
             changed["context_bar_times"]["H4"] = (self.now - timedelta(hours=4)).isoformat()
             self.assertFalse(mtf_runtime.eligible_result(changed, self.now))
             for key, old in (("strategy_id", "mtf-ema-pullback-60m-v2"), ("strategy_version", 2),
-                             ("policy_id", "mtf-manual-demo-cost-risk-v2")):
+                             ("policy_id", "mtf-manual-demo-cost-risk-v2"),
+                             ("strategy_id", "mtf-ema-pullback-60m-v4"), ("strategy_version", 4),
+                             ("policy_id", "mtf-manual-demo-cost-risk-v4")):
                 changed = dict(original, **{key: old})
                 self.assertFalse(mtf_runtime.eligible_result(changed, self.now), key)
+            changed = deepcopy(original)
+            changed["context_bar_times"]["H1"] = changed["context_bar_times"].pop("M30")
+            self.assertFalse(mtf_runtime.eligible_result(changed, self.now))
+            old_feed = deepcopy(self.feed)
+            old_feed["schema_version"] = 2
+            self.assertFalse(mtf_runtime.eligible_payload(original, old_feed, self.now))
 
     def test_current_exposure_margin_cost_and_freshness_fail_closed_for_frozen_offer(self):
         with pinned_synthetic_evidence(self.feed, self.now):

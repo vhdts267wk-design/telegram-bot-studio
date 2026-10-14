@@ -25,7 +25,7 @@ POLL_SECONDS = 60
 REQUEST_TIMEOUT = 15
 MAX_QUOTE_AGE_SECONDS = 10
 FUTURE_TOLERANCE_SECONDS = 5
-TIMEFRAMES = {"H1": 3600, "M15": 900, "M5": 300, "M1": 60}
+TIMEFRAMES = {"M30": 1800, "M15": 900, "M5": 300, "M1": 60}
 FIXED_VOLUME = 0.01
 TERMINAL_FAILURE_MESSAGES = {
     "terminal_unavailable": "The MT5 client connection is unavailable. Check that the selected terminal is open and connected.",
@@ -325,7 +325,7 @@ def build_payload(mt5: Any, settings: Settings, now: datetime | None = None) -> 
     risk = build_risk_context(mt5, settings, bid, ask, now)
     check_terminal(mt5, settings.terminal)
     return {
-        "schema_version": 2, "as_of": now.isoformat().replace("+00:00", "Z"),
+        "schema_version": 3, "as_of": now.isoformat().replace("+00:00", "Z"),
         "broker_utc_offset_minutes": settings.broker_utc_offset_minutes,
         "symbol": settings.symbol,
         "timeframe": "M15",
