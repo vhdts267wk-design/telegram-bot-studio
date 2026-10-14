@@ -28,7 +28,7 @@ EXPERIMENTAL_POLICY_ID = "mtf-manual-demo-estimated-cost-risk-v7"
 EXPERIMENTAL_SIGNAL_MODE = "experimental_demo"
 HORIZON_SECONDS = 3600
 LOOKBACK_BARS = 64
-MIN_CONTIGUOUS_BARS = 22
+MIN_CLOSED_BARS = 22
 TIMEFRAME_SECONDS = MappingProxyType({"M15": 900, "M5": 300, "M1": 60, "M30": 1800})
 RISK_FIELDS = frozenset({
     "account_mode", "volume", "equity", "open_positions", "pending_orders",
@@ -38,8 +38,8 @@ RISK_FIELDS = frozenset({
 })
 POLICY = MappingProxyType({
     "schema_version": 6, "lookback_bars": LOOKBACK_BARS,
-    "min_contiguous_bars": MIN_CONTIGUOUS_BARS,
-    "gap_policy": "reset_indicators_at_contiguous_suffix_without_filling",
+    "min_closed_bars": MIN_CLOSED_BARS,
+    "gap_policy": "real_closed_bar_sequence_without_filling_v1",
     "horizon_seconds": HORIZON_SECONDS,
     "ema_fast": 9, "ema_slow": 21, "atr_period": 14,
     "quote_max_age_seconds": 10, "quote_future_skew_seconds": 5,
@@ -48,7 +48,7 @@ POLICY = MappingProxyType({
     "m15_min_ema_separation_atr": "0.05", "max_latest_true_range_atr": "3",
     "higher_context": "closed_M30_must_agree_with_M15_ema_slope_close",
     "higher_context_min_ema_separation_atr": "0.05",
-    "m30_level_bars": 20, "m30_levels": "completed_contiguous_range_extrema",
+    "m30_level_bars": 20, "m30_levels": "completed_real_bar_range_extrema",
     "candle_grid": "verified_broker_offset_minutes",
     "swing_m5_bars": 5, "stop_buffer_m5_atr": "0.2",
     "target_r": "2", "target2_r": "3", "min_effective_reward_risk": "1.5",
@@ -131,7 +131,7 @@ def _result(state, reason, *, counts=None, experimental_demo=False, **values):
         "strategy_version": EXPERIMENTAL_STRATEGY_VERSION if experimental_demo else STRATEGY_VERSION,
         "policy_id": EXPERIMENTAL_POLICY_ID if experimental_demo else POLICY_ID,
         "strategy_fingerprint": _fingerprint(experimental_demo), "horizon_seconds": HORIZON_SECONDS,
-        "required_bars": MIN_CONTIGUOUS_BARS, "candle_counts": counts or {},
+        "required_bars": MIN_CLOSED_BARS, "candle_counts": counts or {},
         **({"signal_mode": EXPERIMENTAL_SIGNAL_MODE, "entry_window_seconds": 30,
             "provisional": True} if experimental_demo else {}),
         **values,
@@ -210,6 +210,7 @@ def _bars(values, timeframe, now, broker_utc_offset_minutes=0):
 
 
 def _contiguous_suffix(bars, timeframe):
+    """Describe clock continuity for diagnostics, independently of warmup."""
     seconds = timedelta(seconds=TIMEFRAME_SECONDS[timeframe])
     start = len(bars) - 1
     while start > 0 and bars[start]["time"] - bars[start - 1]["time"] == seconds:
@@ -376,12 +377,14 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
         counts = {key: len(streams[key]) for key in TIMEFRAME_SECONDS}
         if any(count > LOOKBACK_BARS for count in counts.values()):
             return result("invalid", "excess_history", counts=counts)
-        supplied = {key: _bars(streams[key], key, clock, offset) for key in TIMEFRAME_SECONDS}
-        bars = {key: _contiguous_suffix(values, key) for key, values in supplied.items()}
-        contiguous_counts = {key: len(values) for key, values in bars.items()}
-        if any(count < MIN_CONTIGUOUS_BARS for count in contiguous_counts.values()):
-            return result("warmup", "insufficient_contiguous_history", counts=counts,
-                           contiguous_counts=contiguous_counts)
+        bars = {key: _bars(streams[key], key, clock, offset) for key in TIMEFRAME_SECONDS}
+        usable_counts = {key: len(values) for key, values in bars.items()}
+        contiguous_counts = {key: len(_contiguous_suffix(values, key)) for key, values in bars.items()}
+        # Warm indicators on actual completed broker bars, including earlier
+        # sessions. Keep timestamp gaps intact and report continuity separately.
+        context.update(usable_counts=usable_counts, contiguous_counts=contiguous_counts)
+        if any(count < MIN_CLOSED_BARS for count in usable_counts.values()):
+            return result("warmup", "insufficient_closed_history", counts=counts)
         trigger_close = bars["M1"][-1]["time"] + timedelta(seconds=60)
         if not timedelta(0) <= clock - trigger_close <= timedelta(seconds=75):
             return result("stale", "stale_m1_timing", counts=counts)
@@ -503,7 +506,6 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
         return result(
             "signal", "closed_four_timeframe_alignment", counts=counts,
             symbol=symbol, direction=direction, display_timeframe="M1", **prices,
-            contiguous_counts=contiguous_counts,
             broker_fingerprint=risk["broker_fingerprint"],
             account_mode="demo", volume=0.01, price_digits=digits, execution=dict(feed["execution"]),
             max_drift_r=0.1, bar_time=current1["time"].isoformat(),

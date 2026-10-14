@@ -10,7 +10,8 @@ REASONS = {
     "unverified_costs": "تكاليف العمولة والانزلاق غير موثّقة.",
     "costs_unverified": "تكاليف العمولة والانزلاق غير موثّقة.",
     "missing_timeframes": "بيانات أحد الأطر M1 أو M5 أو M15 أو M30 غير متاحة.",
-    "insufficient_history": "نحتاج 22 شمعة مكتملة ومتّصلة بعد آخر فجوة في كل إطار.",
+    "insufficient_history": "نحتاج 22 شمعة حقيقية مكتملة في كل إطار، ويمكن استعمال الجلسات السابقة.",
+    "insufficient_closed_history": "نحتاج 22 شمعة حقيقية مكتملة في كل إطار، ويمكن استعمال الجلسات السابقة.",
     "stale_quote": "السعر أقدم من 10 ثوانٍ.",
     "stale_snapshot": "تحديث الربط قديم.",
     "stale_m1_timing": "شمعة توقيت الدخول M1 قديمة.",
@@ -196,9 +197,7 @@ def format_analysis(feed, result, now, *, received_at=None, include_proposal=Tru
             rows = frames.get(frame, [])
             if type(rows) is not list or len(rows) > 64:
                 raise ValueError("Invalid timeframe history")
-            validated_frames[frame] = multi_timeframe._contiguous_suffix(
-                multi_timeframe._bars(rows, frame, clock, offset), frame,
-            )
+            validated_frames[frame] = multi_timeframe._bars(rows, frame, clock, offset)
         if validated_frames["M1"]:
             close1 = _time(validated_frames["M1"][-1]["time"]) + timedelta(seconds=60)
             if clock - close1 > timedelta(seconds=75):
@@ -216,7 +215,7 @@ def format_analysis(feed, result, now, *, received_at=None, include_proposal=Tru
             if not suffix or _time(suffix[-1]["time"]) + timedelta(seconds=seconds) > clock:
                 lines.append(f"{frame} — {role}: بيانات مكتملة غير متاحة.")
             elif len(suffix) < 22:
-                lines.append(f"{frame} — {role}: تجهيز السجل ({len(suffix)}/22 شمعة متصلة).")
+                lines.append(f"{frame} — {role}: تجهيز السجل ({len(suffix)}/22 شمعة مكتملة).")
             else:
                 indicators[frame] = multi_timeframe._indicators(suffix)
                 trend = TREND_LABELS[multi_timeframe._trend(suffix, indicators[frame], strict=frame not in {"M1", "M5"})]

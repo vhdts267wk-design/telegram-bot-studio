@@ -9,12 +9,15 @@ or manage an existing trade.
 
 The current strategy uses M30 for trend and observed support/resistance, M15 for
 confirmation, and M5/M1 for entry timing. H1 and H4 are not read, hashed or required.
-Each of the four streams still needs 22 contiguous completed bars. The v6
+Each of the four streams needs 22 real completed bars, including earlier
+sessions. Indicators use the actual broker bar sequence without filling or
+modifying any candle. Timestamp gaps are preserved as history diagnostics;
+they no longer discard older bars from warmup. The v6
 qualified and v7 experimental identities reject earlier H1 and five-frame proposals
 and qualification artifacts. M30 levels use its last 20 completed bars and carry
 `levels_timeframe: M30` in the context contract.
 
-Use display indicator 2.14 for the four-frame panel. It shows the live connection,
+Use display indicator 2.16 for the four-frame panel. It shows the live connection,
 M30/M15/M5/M1 closed-candle readiness and the specific warmup count, plus only
 those four chart-view buttons. A full 22/22 readiness tile means history is
 available, not that a signal or order has been approved. Telegram Accept remains
@@ -22,7 +25,7 @@ the sole owner approval for a Demo attempt; the panel cannot submit one.
 
 The local helper writes a separate expiring `readiness_<terminal-key>.csv`
 snapshot beside the existing proposal file. This display-only snapshot uses the
-same terminal/account binding and four actual contiguous closed-bar counts.
+same terminal/account binding and four actual usable closed-bar counts.
 Its version is 2, with counts ordered M30/M15/M5/M1; version 1 H1 readiness
 rows are incompatible. The server feed uses schema 3 with the same four frames.
 Its deadline cannot exceed ten seconds after the captured feed or quote. Missing,
@@ -32,11 +35,21 @@ The strategy fingerprint changes, invalidating earlier offers and qualification
 artifacts. Qualified mode needs freshly reviewed evidence; the explicit
 experimental Demo mode remains provisional and does not certify performance.
 
-Following an uninterrupted 22:00 UTC restart, M30 needs 11 hours of closed
-history and becomes ready at 09:00 UTC. M15 needs 5.5 hours and is ready at
-03:30 UTC. Unexpected gaps still reset warmup; no closure exception or synthetic
-candle is introduced. Trend, spread, session and risk conditions can still block
-a proposal after all four streams are ready.
+The helper already requests the latest 64 actual closed bars per timeframe at
+startup and every five seconds. At least 22 actual closed bars per frame now
+satisfy warmup immediately, including bars before a daily break. The forming
+candle is never requested. Each new closed candle enters the rolling snapshot;
+there is no incremental cache or requirement to rebuild 11 hours of M30 bars
+after each restart. EMA uses the real earlier closes and ATR retains the price
+gap at reopening. This bar-sequence policy does not certify uninterrupted
+historical data or infer a closure calendar.
+
+The engine, local context validator, Telegram analysis and native panel use the
+same completed-bar count. Trend, spread, session, freshness, exposure and risk
+conditions can still block a proposal after history is ready. The changed
+strategy fingerprint invalidates prior qualification evidence; it is never
+automatically repinned. This installation remains analysis-only and cannot
+prepare or send an order.
 
 Local display samples are collected before the network cycle and again after
 the chart response, with Demo/account checks around each collection. Feed
@@ -117,3 +130,17 @@ close a position either.
 The feature does not make unavailable market histories usable or create signals
 when the strategy/risk conditions fail. Experimental costs and performance
 remain unverified. Real-money accounts are always rejected.
+
+### Panel candle counts
+
+Panel 2.16 counts completed M30/M15/M5/M1 candles directly from MT5 when the
+helper's readiness update is unavailable. `LOCAL HISTORY` identifies this
+display: the counts describe terminal history, not a live bot connection or a
+valid signal. A frame still loading shows `--/22` and retries on the next timer
+tick. Counts include real closed bars from previous sessions and are capped at `22/22`, the
+strategy's minimum history requirement.
+
+The panel continues to show `SIGNAL: UNAVAILABLE` when the bot update is missing
+or expired. Native counts never create or extend proposals, notifications or
+orders. Fresh authenticated helper updates retain the existing `LIVE` display
+and all existing eligibility checks.

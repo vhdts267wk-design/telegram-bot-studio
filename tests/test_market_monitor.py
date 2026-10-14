@@ -159,14 +159,19 @@ class BrokerFeedTests(unittest.TestCase):
                 self.assertNotIn("دعم محتمل", text)
                 self.assertNotIn("اقتراح شراء", text)
 
-    def test_gap_ends_derived_window_instead_of_filling_missing_history(self):
+    def test_real_closed_history_survives_gaps_without_filling_missing_bars(self):
         feed = broker_feed()
         feed["timeframes"]["M5"].pop(-5)
+        original = copy.deepcopy(feed)
         text = monitor.market_text({"payload": feed, "updated_at": NOW}, NOW)
-        self.assertIn("تجهيز السجل (4/22", text)
-        self.assertIn("22 شمعة", text)
+        self.assertEqual(len(feed["timeframes"]["M5"]), 23)
+        self.assertEqual(feed, original)
+        self.assertIn("M5 — إشارة الدخول: ميل", text)
+        self.assertNotIn("تجهيز السجل (4/22", text)
+        feed["timeframes"]["M5"] = feed["timeframes"]["M5"][-21:]
+        text = monitor.market_text({"payload": feed, "updated_at": NOW}, NOW)
+        self.assertIn("تجهيز السجل (21/22 شمعة مكتملة)", text)
         self.assertNotIn("M5 — إشارة الدخول: ميل", text)
-        self.assertNotIn("دعم محتمل", text)
         text = monitor.market_text({"payload": broker_feed(), "updated_at": NOW}, NOW)
         self.assertIn("M15 — تأكيد الاتجاه: ميل", text)
         self.assertIn("M5 — إشارة الدخول: ميل", text)

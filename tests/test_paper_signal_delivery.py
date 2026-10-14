@@ -124,12 +124,20 @@ class PaperSourceGateTests(PinnedSyntheticEvidenceMixin, unittest.TestCase):
         self.assertEqual(result["candle_count"], 19)
         self.assertEqual(result["remaining_bars"], 3)
 
-    def test_missing_broker_interval_resets_only_actual_contiguous_suffix(self):
+    def test_real_broker_history_survives_gap_without_bypassing_evidence(self):
         snapshot = broker_snapshot()
         snapshot["payload"]["timeframes"]["M5"].pop(-10)
+        original = copy.deepcopy(snapshot)
         result, _, _ = monitor.paper_result(snapshot, NOW, "mt5")
-        self.assertEqual(result["state"], "warmup")
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["reason"], "evidence_unavailable")
+        self.assertNotIn("direction", result)
+        with mtf_fixtures.pinned_synthetic_evidence(snapshot["payload"], NOW):
+            result, _, _ = monitor.paper_result(snapshot, NOW, "mt5")
+        self.assertEqual(result["state"], "signal", result)
+        self.assertEqual(result["usable_counts"]["M5"], 23)
         self.assertEqual(result["contiguous_counts"]["M5"], 9)
+        self.assertEqual(snapshot, original)
 
     def test_legacy_m15_alone_never_reaches_retired_buy_sell_engine(self):
         snapshot = broker_snapshot()

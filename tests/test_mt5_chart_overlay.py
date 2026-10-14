@@ -68,13 +68,13 @@ class ReadinessValidationTests(unittest.TestCase):
     def validate(self, feed, *, now=NOW):
         return chart.feed_readiness(feed, symbol="XAUUSD", broker_offset_minutes=180, observed_at=now)
 
-    def test_counts_are_actual_closed_contiguous_suffixes_and_empty_frame_is_zero(self):
+    def test_counts_include_real_closed_previous_session_bars_and_empty_frame_is_zero(self):
         feed = readiness_feed()
         for row in feed["timeframes"]["M30"][:-10]:
             row["time"] = (chart.utc(row["time"]) - timedelta(hours=1)).isoformat()
         feed["timeframes"]["M15"] = []
         counts, deadline = self.validate(feed)
-        self.assertEqual(counts, [10, 0, 64, 64])
+        self.assertEqual(counts, [64, 0, 64, 64])
         self.assertEqual(deadline, NOW + timedelta(seconds=10))
 
     def test_capture_boundary_rather_than_later_receipt_defines_closed_history(self):

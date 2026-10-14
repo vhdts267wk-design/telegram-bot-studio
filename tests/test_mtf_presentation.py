@@ -174,14 +174,14 @@ class MtfPresentationTests(unittest.TestCase):
                 self.assertNotIn("M15 — تأكيد الاتجاه: ميل", text)
                 self.assert_no_trade(text)
 
-    def test_gap_resets_observations_and_shows_warmup_without_fabrication(self):
+    def test_previous_session_history_provides_observations_without_fabrication(self):
         feed = deepcopy(self.feed)
         for bar in feed["timeframes"]["M5"][:-21]:
             bar["time"] = (datetime.fromisoformat(bar["time"]) - timedelta(minutes=5)).isoformat()
         result = multi_timeframe.analyze_multi_timeframe(feed, self.now)
         text = presentation.format_analysis(feed, result, self.now)
-        self.assertIn("M5 — إشارة الدخول: تجهيز السجل (21/22", text)
-        self.assertNotIn("M5 — إشارة الدخول: ميل", text)
+        self.assertNotIn("M5 — إشارة الدخول: تجهيز السجل", text)
+        self.assertIn("M5 — إشارة الدخول: ميل", text)
         self.assert_no_trade(text)
 
     def test_higher_frame_conflict_waits_with_reduced_qualitative_confidence(self):

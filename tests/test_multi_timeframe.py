@@ -131,7 +131,7 @@ class MultiTimeframeTests(unittest.TestCase):
                     for key in ("stop", "target", "target2", "entry_zone_low", "effective_reward_risk"):
                         self.assertNotIn(key, result)
 
-    def test_h4_is_not_required_but_m30_still_requires_22_closed_contiguous_bars(self):
+    def test_h4_is_not_required_but_m30_still_requires_22_actual_closed_bars(self):
         feed = self.feed(count=22)
         self.assertEqual(set(feed["timeframes"]), {"M30", "M15", "M5", "M1"})
         result = self.analyze(feed)
@@ -140,7 +140,7 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assertEqual(set(result["context_bar_times"]), {"M30"})
         self.assertEqual(result["strategy_version"], 6)
         feed["timeframes"]["M30"].pop(0)
-        self.assert_waiting(self.analyze(feed), "warmup", "insufficient_contiguous_history")
+        self.assert_waiting(self.analyze(feed), "warmup", "insufficient_closed_history")
         legacy = self.feed()
         legacy["timeframes"]["H4"] = []
         self.assert_waiting(self.analyze(legacy), "warmup", "missing_timeframes")
@@ -168,33 +168,36 @@ class MultiTimeframeTests(unittest.TestCase):
         feed["timeframes"]["H4"] = []
         self.assert_waiting(self.analyze(feed), "warmup", "missing_timeframes")
 
-    def test_strict_half_hour_warmup_after_22utc_resume_is_ready_at_09utc(self):
-        resumed = datetime(2026, 10, 13, 22, tzinfo=timezone.utc)
-        for hour, minute, expected_count, state in ((8, 59, 21, "warmup"), (9, 0, 22, "signal")):
-            now = datetime(2026, 10, 14, hour, minute, tzinfo=timezone.utc)
-            feed = self.feed(now=now, broker_offset=180)
-            for frame, rows in feed["timeframes"].items():
-                feed["timeframes"][frame] = [row for row in rows if datetime.fromisoformat(row["time"]) >= resumed]
-            feed["candles"] = deepcopy(feed["timeframes"]["M15"])
-            result = self.analyze(feed, now=now)
-            self.assertEqual(len(feed["timeframes"]["M30"]), expected_count)
-            self.assertEqual(result["state"], state, result)
-            if state == "signal":
-                self.assertEqual(result["horizon_seconds"], 3600)
-                self.assertEqual(result["timeframe_context"]["levels_timeframe"], "M30")
-                self.assertEqual(set(result["context_bar_times"]), {"M30"})
-        now = resumed + timedelta(hours=5, minutes=30)
+    def test_prior_session_history_is_usable_without_eleven_new_hours_after_resume(self):
+        now = datetime(2026, 10, 14, 6, tzinfo=timezone.utc)
         feed = self.feed(now=now)
-        m15 = [row for row in feed["timeframes"]["M15"] if datetime.fromisoformat(row["time"]) >= resumed]
-        self.assertEqual(len(m15), 22)
+        for frame, seconds in mtf.TIMEFRAME_SECONDS.items():
+            candidate = datetime.fromisoformat(feed["timeframes"][frame][-1]["time"])
+            stamps = []
+            while len(stamps) < 64:
+                if not 20 <= candidate.hour < 22:
+                    stamps.append(candidate.isoformat())
+                candidate -= timedelta(seconds=seconds)
+            for row, stamp in zip(feed["timeframes"][frame], reversed(stamps)):
+                row["time"] = stamp
+        feed["candles"] = deepcopy(feed["timeframes"]["M15"])
+        original = deepcopy(feed)
+        result = self.analyze(feed, now=now)
+        self.assertEqual(result["state"], "signal", result)
+        self.assertEqual(result["required_bars"], 22)
+        self.assertEqual(result["usable_counts"], dict.fromkeys(mtf.TIMEFRAME_SECONDS, 64))
+        self.assertEqual(result["contiguous_counts"]["M30"], 16)
+        self.assertEqual(result["horizon_seconds"], 3600)
+        self.assertEqual(feed, original)
 
-    def test_unexpected_m30_gap_resets_warmup_without_filling_bars(self):
+    def test_m30_timestamp_gap_is_preserved_and_reported_separately_from_usable_history(self):
         feed = self.feed()
         for row in feed["timeframes"]["M30"][:-21]:
             row["time"] = (datetime.fromisoformat(row["time"]) - timedelta(minutes=30)).isoformat()
         original = deepcopy(feed)
         result = self.analyze(feed)
-        self.assert_waiting(result, "warmup", "insufficient_contiguous_history")
+        self.assertEqual(result["state"], "signal", result)
+        self.assertEqual(result["usable_counts"]["M30"], 64)
         self.assertEqual(result["contiguous_counts"]["M30"], 21)
         self.assertEqual(feed, original)
 
@@ -259,36 +262,46 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assertEqual(result["cost_context"], {"commission_round_turn": .02, "slippage_price": .002,
                                                  "loss_cash_per_price_unit": 1.0, "profit_cash_per_price_unit": 1.0})
 
-    def test_22_actual_contiguous_bars_are_sufficient(self):
+    def test_22_actual_closed_bars_are_sufficient(self):
         feed = self.feed(count=22)
         result = self.analyze(feed)
         self.assertEqual(result["state"], "signal", result)
         self.assertEqual(result["required_bars"], 22)
+        self.assertEqual(result["usable_counts"], dict.fromkeys(mtf.TIMEFRAME_SECONDS, 22))
         self.assertEqual(result["contiguous_counts"], dict.fromkeys(mtf.TIMEFRAME_SECONDS, 22))
 
-    def test_gap_resets_indicators_without_filling_or_using_older_regime(self):
+    def test_previous_actual_bars_warm_ema_and_atr_without_filling_timestamp_gaps(self):
         feed = self.feed()
         for frame, seconds in mtf.TIMEFRAME_SECONDS.items():
             for bar in feed["timeframes"][frame][:-22]:
                 bar["time"] = (datetime.fromisoformat(bar["time"]) - timedelta(seconds=seconds)).isoformat()
-                bar.update(open=1000, high=1001, low=999, close=1000)
+                bar.update(open=1990, high=1990.1, low=1989.9, close=1990)
+        original = deepcopy(feed)
         result = self.analyze(feed)
         suffix = deepcopy(feed)
         suffix["timeframes"] = {key: values[-22:] for key, values in feed["timeframes"].items()}
         suffix_result = self.analyze(suffix)
         self.assertEqual(result["state"], "signal", result)
+        self.assertEqual(result["usable_counts"], dict.fromkeys(mtf.TIMEFRAME_SECONDS, 64))
         self.assertEqual(result["contiguous_counts"], dict.fromkeys(mtf.TIMEFRAME_SECONDS, 22))
-        self.assertEqual(result["indicators"], suffix_result["indicators"])
-        self.assertEqual(result["stop"], suffix_result["stop"])
+        self.assertNotEqual(result["indicators"], suffix_result["indicators"])
+        self.assertNotEqual(result["stop"], suffix_result["stop"])
+        for frame, rows in feed["timeframes"].items():
+            closes = [row["close"] for row in rows]
+            self.assertEqual(result["indicators"][frame]["fast"], round(mtf.paper_signals._ema(closes, 9)[-1], 8))
+            self.assertEqual(result["indicators"][frame]["slow"], round(mtf.paper_signals._ema(closes, 21)[-1], 8))
+            self.assertEqual(result["indicators"][frame]["atr"], round(mtf.paper_signals._atr(rows), 8))
         self.assertEqual(len(feed["timeframes"]["M15"]), 64)
+        self.assertEqual(feed, original)
 
-    def test_gap_with_only_21_recent_bars_waits_even_when_total_64(self):
+    def test_64_actual_bars_remain_usable_with_only_21_recent_contiguous_bars(self):
         feed = self.feed()
         for bar in feed["timeframes"]["M15"][:-21]:
             bar["time"] = (datetime.fromisoformat(bar["time"]) - timedelta(minutes=15)).isoformat()
         result = self.analyze(feed)
-        self.assert_waiting(result, "warmup", "insufficient_contiguous_history")
+        self.assertEqual(result["state"], "signal", result)
         self.assertEqual(result["candle_counts"]["M15"], 64)
+        self.assertEqual(result["usable_counts"]["M15"], 64)
         self.assertEqual(result["contiguous_counts"]["M15"], 21)
 
     def test_each_timeframe_requires_22_and_missing_frames_wait(self):
@@ -296,7 +309,9 @@ class MultiTimeframeTests(unittest.TestCase):
             with self.subTest(key=key):
                 feed = self.feed()
                 feed["timeframes"][key] = feed["timeframes"][key][-21:]
-                self.assert_waiting(self.analyze(feed), "warmup", "insufficient_contiguous_history")
+                result = self.analyze(feed)
+                self.assert_waiting(result, "warmup", "insufficient_closed_history")
+                self.assertEqual(result["usable_counts"][key], 21)
         feed = self.feed()
         del feed["timeframes"]["M1"]
         self.assert_waiting(self.analyze(feed), "warmup", "missing_timeframes")

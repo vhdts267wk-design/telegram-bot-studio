@@ -1,5 +1,5 @@
 #property copyright "MT5 Bot"
-#property version   "2.14"
+#property version   "2.16"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 0
@@ -410,6 +410,66 @@ bool ReadReadiness(Readiness &r)
   }
 
 
+// Local history is display-only; it never supplies signal readiness or levels.
+int CountClosedContiguous(const MqlRates &rates[],const int copied,const int seconds,const datetime broker_now)
+  {
+   if(copied<1 || copied>64 || ArraySize(rates)<copied || seconds<=0 || broker_now<=0) return(-1);
+   for(int i=0;i<copied;i++)
+     {
+      if(rates[i].time<=0 || (long)rates[i].time%seconds!=0
+         || (long)rates[i].time+seconds>(long)broker_now
+         || (i>0 && rates[i].time<=rates[i-1].time)
+         || !MathIsValidNumber(rates[i].open) || !MathIsValidNumber(rates[i].high)
+         || !MathIsValidNumber(rates[i].low) || !MathIsValidNumber(rates[i].close)
+         || rates[i].open<=0 || rates[i].high<=0 || rates[i].low<=0 || rates[i].close<=0
+         || rates[i].low>MathMin(rates[i].open,rates[i].close)
+         || rates[i].high<MathMax(rates[i].open,rates[i].close)
+         || rates[i].low>rates[i].high || rates[i].tick_volume<0 || rates[i].tick_volume>1000000000000)
+         return(-1);
+     }
+   int start=copied-1;
+   while(start>0 && (long)rates[start].time-(long)rates[start-1].time==seconds) start--;
+   return(copied-start);
+  }
+
+int CountClosedHistory(const MqlRates &rates[],const int copied,const int seconds,const datetime broker_now)
+  {
+   // Warmup counts real completed observations across historical time gaps.
+   // The original validator still checks every supplied candle; no missing
+   // candles are created and the forming candle remains excluded by CopyRates.
+   int contiguous=CountClosedContiguous(rates,copied,seconds,broker_now);
+   return(contiguous<0 ? -1 : copied);
+  }
+
+bool ReadLocalCandleCounts(int &counts[])
+  {
+   ArrayResize(counts,4);
+   ArrayInitialize(counts,-1);
+   if(MQLInfoInteger(MQL_TESTER) || _Symbol!="XAUUSD" || g_terminal_key==""
+      || g_account_changed || AccountInfoInteger(ACCOUNT_LOGIN)!=g_session_login
+      || AccountInfoString(ACCOUNT_SERVER)!=g_session_server
+      || AccountInfoInteger(ACCOUNT_TRADE_MODE)!=ACCOUNT_TRADE_MODE_DEMO
+      || !TerminalInfoInteger(TERMINAL_CONNECTED)) return(false);
+   ENUM_TIMEFRAMES frames[]={PERIOD_M30,PERIOD_M15,PERIOD_M5,PERIOD_M1};
+   datetime broker_now=TimeCurrent();
+   bool available=false;
+   for(int i=0;i<4;i++)
+     {
+      MqlRates rates[];
+      ArraySetAsSeries(rates,false);
+      // Position one excludes the forming candle. Unloaded history retries on the next timer tick.
+      int copied=CopyRates(_Symbol,frames[i],1,64,rates);
+      counts[i]=CountClosedHistory(rates,copied,PeriodSeconds(frames[i]),broker_now);
+      if(counts[i]>=0) available=true;
+     }
+   if(g_account_changed || AccountInfoInteger(ACCOUNT_LOGIN)!=g_session_login
+      || AccountInfoString(ACCOUNT_SERVER)!=g_session_server
+      || AccountInfoInteger(ACCOUNT_TRADE_MODE)!=ACCOUNT_TRADE_MODE_DEMO
+      || !TerminalInfoInteger(TERMINAL_CONNECTED))
+     { ArrayInitialize(counts,-1); return(false); }
+   return(available);
+  }
+
 // Presentation state belongs only to this chart. No control submits a trade.
 CCanvas g_panel;
 bool g_panel_collapsed=false;
@@ -559,13 +619,18 @@ bool DrawPanel(const bool active,const string message)
    Readiness readiness;
    ZeroMemory(readiness);
    bool telemetry=ReadReadiness(readiness) && main_fresh;
+   int local_counts[];
+   ArrayResize(local_counts,4);
+   ArrayInitialize(local_counts,-1);
+   bool local_history=false;
+   if(!telemetry) local_history=ReadLocalCandleCounts(local_counts);
    string state=active ? g_panel_proposal.direction : (main_fresh ? "WAITING" : "CHECK FEED");
    color state_color=active ? (state=="BUY" ? C'77,216,164' : C'255,143,121') : C'238,190,97';
-   string live=telemetry ? "LIVE" : (!connected ? "OFFLINE" : (main_fresh ? "NO UPDATE" : "CHECK FEED"));
+   string live=telemetry ? "LIVE" : (local_history ? "LOCAL HISTORY" : (!connected ? "OFFLINE" : (main_fresh ? "NO UPDATE" : "CHECK FEED")));
    color live_color=telemetry ? C'77,216,164' : C'238,190,97';
    string clock=TimeToString(now,TIME_SECONDS)+" UTC";
    PanelTextFit(18,13,_Symbol,width-180,20,clrWhite,true);
-   if(width>=300) PanelText(168,20,"2.14",8,C'143,162,188');
+   if(width>=300) PanelText(168,20,"2.16",8,C'143,162,188');
    string account_label=AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_DEMO ? "Demo" : "Demo required";
    PanelTextFit(18,47,"Chart "+ViewPeriodName(_Period)+"  |  "+account_label,width-160,9,C'143,162,188');
 
@@ -603,7 +668,8 @@ bool DrawPanel(const bool active,const string message)
       if(telemetry && readiness.counts[i]<22 && warmup_frame<0) warmup_frame=i;
       RoundedPanelRect(x,136,tile_width,56,8,ColorToARGB(ready ? C'20,49,48' : C'23,37,58',255));
       PanelText(x+10,143,readiness_frames[i],8,C'175,191,213',true);
-      string count=telemetry ? IntegerToString((int)MathMin(22,readiness.counts[i]))+"/22" : "--/22";
+      int displayed_count=telemetry ? readiness.counts[i] : local_counts[i];
+      string count=displayed_count>=0 ? IntegerToString((int)MathMin(22,displayed_count))+"/22" : "--/22";
       PanelTextFit(x+10,162,count,tile_width-20,12,ready ? C'77,216,164' : C'238,190,97',true);
      }
    RoundedPanelRect(18,205,width-36,28,7,ColorToARGB(C'24,38,60',255));
@@ -641,6 +707,7 @@ bool DrawPanel(const bool active,const string message)
      {
       string reason=message;
       string detail="No trade is prepared or submitted by this panel.";
+      if(local_history) detail="Local candles only. Live bot feed unavailable.";
       if(g_waiting_snapshot && main_fresh && telemetry && warmup_frame>=0)
         {
          reason=readiness_frames[warmup_frame]+" warmup: "+IntegerToString(readiness.counts[warmup_frame])+"/22 closed candles";
@@ -802,7 +869,7 @@ int OnInit()
    int instance=0;
    do { g_prefix=base+IntegerToString(instance)+"_"; instance++; }
    while(ObjectFind(0,g_prefix+"status")>=0 || ObjectFind(0,g_prefix+"panel")>=0);
-   IndicatorSetString(INDICATOR_SHORTNAME,"MT5 Bot Panel 2.14");
+   IndicatorSetString(INDICATOR_SHORTNAME,"MT5 Bot Panel 2.16");
    if(!EventSetTimer(1)) return(INIT_FAILED);
    UpdateOverlay();
    return(INIT_SUCCEEDED);

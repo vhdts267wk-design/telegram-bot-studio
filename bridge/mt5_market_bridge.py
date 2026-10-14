@@ -253,8 +253,8 @@ def closed_candles(mt5, settings, label, seconds, now_seconds):
     if times[-1] != latest_closed_bar(now_seconds, seconds, settings.broker_utc_offset_minutes):
         raise MarketDataError("Required closed histories must be current.")
     # Broker session breaks are real missing intervals. Preserve them instead
-    # of fabricating candles; the analyzer resets its indicator warmup after
-    # each gap and decides whether the final contiguous suffix is sufficient.
+    # of fabricating candles. Bar-based analysis warms on real completed bars
+    # from earlier sessions, while current quote/bar freshness remains strict.
     return candles
 
 

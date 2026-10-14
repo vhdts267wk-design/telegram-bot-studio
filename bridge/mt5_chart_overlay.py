@@ -166,12 +166,9 @@ def current_timeframe_context(feed, *, observed_at, broker_offset_minutes):
             parsed.append({"time": stamp, **prices})
         if parsed[-1]["time"].timestamp() != latest_closed_reference(now.timestamp(), seconds, offset):
             raise OverlayError("Stale local context history")
-        start = len(parsed) - 1
-        while start > 0 and (parsed[start]["time"] - parsed[start - 1]["time"]).total_seconds() == seconds:
-            start -= 1
-        streams[frame] = parsed[start:]
+        streams[frame] = parsed
         if len(streams[frame]) < 22:
-            raise OverlayError("Insufficient contiguous context history")
+            raise OverlayError("Insufficient completed context history")
 
     def ema(closes, period):
         current = math.fsum(closes[:period]) / period
@@ -287,10 +284,7 @@ def feed_readiness(feed, *, symbol, broker_offset_minutes, observed_at):
             stamps.append(stamp)
         if stamps and stamps[-1].timestamp() != latest_closed_reference(captured.timestamp(), seconds, offset):
             raise OverlayError("Stale local readiness history")
-        start = max(0, len(stamps) - 1)
-        while start > 0 and (stamps[start] - stamps[start - 1]).total_seconds() == seconds:
-            start -= 1
-        counts.append(len(stamps) - start)
+        counts.append(len(stamps))
     deadline = min(captured + timedelta(seconds=10), quote_stamp + timedelta(seconds=10),
                    now + timedelta(seconds=DISPLAY_TTL_SECONDS))
     if int(deadline.timestamp()) <= int(now.timestamp()):

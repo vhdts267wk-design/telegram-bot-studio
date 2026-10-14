@@ -19,6 +19,17 @@ class IndicatorContractTests(unittest.TestCase):
     def setUp(self):
         self.source = SOURCE.read_text(encoding="utf-8")
 
+    def function_source(self, declaration):
+        """Select a whole MQL function without depending on adjacent helpers."""
+        start = self.source.index(declaration)
+        opening = self.source.index("{", start)
+        depth = 1
+        for index in range(opening + 1, len(self.source)):
+            depth += (self.source[index] == "{") - (self.source[index] == "}")
+            if depth == 0:
+                return self.source[start:index + 1]
+        self.fail(f"Unclosed function: {declaration}")
+
     def test_indicator_has_only_display_capabilities(self):
         self.assertIn("#property indicator_chart_window", self.source)
         forbidden = r"\b(?:OrderSend|OrderSendAsync|OrderCheck|CTrade|WebRequest|SocketCreate|ShellExecuteW|FileWrite|FileDelete|FileMove|FileCopy|GlobalVariableSet|OBJ_BUTTON)\b|#import\b"
@@ -26,6 +37,7 @@ class IndicatorContractTests(unittest.TestCase):
         self.assertEqual(re.findall(r"#include\s+([^\r\n]+)", self.source), [r"<Canvas\Canvas.mqh>"])
         self.assertIn("FILE_READ|FILE_BIN|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE", self.source)
         self.assertNotIn("FILE_WRITE", self.source)
+        self.assertNotRegex(self.source, r"\b(?:FileWrite\w*|SymbolInfoSessionQuote|SymbolInfoSessionTrade)\s*\(")
         self.assertEqual(self.source.count("FileOpen("), 2)
         self.assertIn("g_panel.CreateBitmapLabel(", self.source)
         self.assertIn('ObjectSetString(0,name,OBJPROP_TOOLTIP,"\\n")', self.source)
@@ -73,9 +85,9 @@ class IndicatorContractTests(unittest.TestCase):
     def test_four_frame_panel_has_only_view_actions_and_visible_version(self):
         panel = self.source.split("bool DrawPanel(", 1)[1].split("void HandlePanelClick(", 1)[0]
         click = self.source.split("void HandlePanelClick(", 1)[1].split("void ClearLevels()", 1)[0]
-        self.assertIn('#property version   "2.14"', self.source)
-        self.assertIn('PanelText(168,20,"2.14"', panel)
-        self.assertIn('INDICATOR_SHORTNAME,"MT5 Bot Panel 2.14"', self.source)
+        self.assertIn('#property version   "2.16"', self.source)
+        self.assertIn('PanelText(168,20,"2.16"', panel)
+        self.assertIn('INDICATOR_SHORTNAME,"MT5 Bot Panel 2.16"', self.source)
         self.assertIn('"M30 / M15 / M5 / M1"', panel)
         self.assertIn('string readiness_frames[]={"M30","M15","M5","M1"}', panel)
         self.assertIn('string frames[]={"M1","M5","M15","M30"}', panel)
@@ -97,7 +109,7 @@ class IndicatorContractTests(unittest.TestCase):
                          "c8c34f50fd4874ccd08df462782d3eb15d9e5219a6bfb22d268fbe6edd036181")
 
     def test_readiness_has_strict_bounded_readonly_anonymous_contract(self):
-        reader = self.source.split("bool ReadReadiness(", 1)[1].split("// Presentation state", 1)[0]
+        reader = self.function_source("bool ReadReadiness(")
         self.assertIn("READINESS_FIELD_COUNT 10", self.source)
         self.assertIn("READINESS_TTL_SECONDS 25", self.source)
         self.assertIn("READINESS_MAX_BYTES   2048", self.source)
@@ -135,11 +147,61 @@ class IndicatorContractTests(unittest.TestCase):
         self.assertIn("g_waiting_snapshot && main_fresh && telemetry && warmup_frame>=0", panel)
         self.assertIn("string reason=message", panel)
         self.assertIn('" warmup: "+IntegerToString(readiness.counts[warmup_frame])+"/22 closed candles"', panel)
-        self.assertIn("MathMin(22,readiness.counts[i])", panel)
+        self.assertIn("MathMin(22,displayed_count)", panel)
         self.assertIn('telemetry ? "LIVE"', panel)
         self.assertIn('"All four frames ready. Waiting for market and risk conditions."', panel)
         self.assertIn('"Ready candles do not guarantee a signal."', panel)
         self.assertIn(' : "--/22"', panel)
+
+    def test_native_history_reads_closed_bars_independently_without_bridge_capabilities(self):
+        counter = self.function_source("int CountClosedContiguous(")
+        history_counter = self.function_source("int CountClosedHistory(")
+        reader = self.function_source("bool ReadLocalCandleCounts(")
+        compact = re.sub(r"\s+", "", reader)
+        self.assertIn("ArraySetAsSeries(rates,false)", compact)
+        self.assertIn("CopyRates(_Symbol,frames[i],1,64,rates)", compact)
+        self.assertIn("PERIOD_M30,PERIOD_M15,PERIOD_M5,PERIOD_M1", compact)
+        self.assertIn("PeriodSeconds(frames[i])", compact)
+        self.assertIn("ArrayInitialize(counts,-1)", compact)
+        self.assertEqual(self.source.count("ReadLocalCandleCounts("), 2)
+        self.assertEqual(self.source.count("CountClosedContiguous("), 2)
+        self.assertEqual(self.source.count("CountClosedHistory("), 2)
+        self.assertIn("CountClosedHistory(rates,copied,PeriodSeconds(frames[i]),broker_now)", compact)
+        self.assertIn("CountClosedContiguous(rates,copied,seconds,broker_now)", history_counter)
+        self.assertIn("return(contiguous<0 ? -1 : copied)", history_counter)
+        self.assertNotRegex(history_counter, r"\b(?:for|while|ArrayResize|ArrayCopy)\s*\(")
+        self.assertEqual(hashlib.sha256(counter.encode("utf-8")).hexdigest(),
+                         "6d1fca7049ea3ec5930661fc3c327eaeaf1b3950e8be68ef237eb5af553e544e")
+        for guard in ("g_account_changed", "ACCOUNT_LOGIN", "ACCOUNT_SERVER", "ACCOUNT_TRADE_MODE_DEMO", "TERMINAL_CONNECTED"):
+            self.assertEqual(reader.count(guard), 2)
+        self.assertIn("MQL_TESTER", reader)
+        self.assertIn("return(-1)", re.sub(r"\s+", "", counter))
+        # Source constraints verify that the fallback is display-only. The
+        # pure counter's arithmetic is exercised by the native compiler probe.
+        self.assertNotRegex(counter + history_counter + reader, r"\b(?:ReadProposal|ReadReadiness|NotifyOpportunity|DrawProposal|Alert|WebRequest|FileOpen|FileWrite\w*|GlobalVariable\w*|OrderSend\w*|ChartSetSymbolPeriod)\s*\(")
+        self.assertNotRegex(counter + history_counter + reader, r"\bg_(?:snapshot_\w*|waiting_snapshot|panel_proposal)\b")
+
+    def test_native_counts_do_not_authorize_signals_or_turn_missing_feed_live(self):
+        panel = self.function_source("bool DrawPanel(")
+        for declaration in ("bool ReadProposal(", "void UpdateOverlay()", "void NotifyOpportunity("):
+            with self.subTest(declaration=declaration):
+                function = self.function_source(declaration)
+                self.assertNotIn("ReadLocalCandleCounts", function)
+                self.assertNotIn("CountClosedContiguous", function)
+                self.assertNotIn("CountClosedHistory", function)
+                self.assertNotIn("local_history", function)
+        self.assertRegex(panel, r"if\(!telemetry\)\s*local_history=ReadLocalCandleCounts\(local_counts\)")
+        self.assertIn('"LOCAL HISTORY"', panel)
+        self.assertIn('telemetry ? "LIVE"', panel)
+        self.assertIn("bool telemetry=ReadReadiness(readiness) && main_fresh", panel)
+        self.assertIn("telemetry ? readiness.counts[i] : local_counts[i]", panel)
+        self.assertIn('"SIGNAL: UNAVAILABLE"', panel)
+        ready = re.search(r"bool ready=([^;]+);", panel)
+        self.assertIsNotNone(ready)
+        self.assertIn("telemetry", ready.group(1))
+        self.assertNotIn("local_history", ready.group(1))
+        self.assertIn("g_waiting_snapshot && main_fresh && telemetry && warmup_frame>=0", panel)
+        self.assertIn("g_waiting_snapshot && main_fresh && telemetry)", panel)
 
     def test_notice_dedup_is_shared_atomic_anonymous_and_survives_waiting_or_reload(self):
         claim = self.source.split("bool ClaimOpportunityNotice(", 1)[1].split("void NotifyOpportunity(", 1)[0]
