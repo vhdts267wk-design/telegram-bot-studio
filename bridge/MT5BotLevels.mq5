@@ -1,5 +1,5 @@
 #property copyright "MT5 Bot"
-#property version   "2.13"
+#property version   "2.14"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 0
@@ -363,7 +363,7 @@ struct Readiness
   {
    datetime observed;
    datetime valid_until;
-   int counts[4]; // H1, M15, M5, M1 closed candles, each bounded to 0..64.
+   int counts[4]; // M30, M15, M5, M1 closed candles, each bounded to 0..64.
   };
 
 bool ReadReadiness(Readiness &r)
@@ -386,7 +386,7 @@ bool ReadReadiness(Readiness &r)
       if(bytes[i]<33 || bytes[i]>126 || bytes[i]=='"') return(false);
    string fields[];
    string row=CharArrayToString(bytes,0,(int)size,CP_UTF8);
-   if(StringSplit(row,';',fields)!=READINESS_FIELD_COUNT || fields[0]!="1"
+   if(StringSplit(row,';',fields)!=READINESS_FIELD_COUNT || fields[0]!="2"
       || fields[7]!=g_terminal_key || !AccountBindingMatches(fields[8],fields[9])) return(false);
    long observed=0,valid_until=0;
    if(!ParseInteger(fields[1],observed) || !ParseInteger(fields[2],valid_until)) return(false);
@@ -430,7 +430,7 @@ string ViewPeriodName(const ENUM_TIMEFRAMES period)
    if(period==PERIOD_M1) return("M1");
    if(period==PERIOD_M5) return("M5");
    if(period==PERIOD_M15) return("M15");
-   if(period==PERIOD_H1) return("H1");
+   if(period==PERIOD_M30) return("M30");
    string name=EnumToString(period);
    StringReplace(name,"PERIOD_","");
    return(name);
@@ -565,7 +565,7 @@ bool DrawPanel(const bool active,const string message)
    color live_color=telemetry ? C'77,216,164' : C'238,190,97';
    string clock=TimeToString(now,TIME_SECONDS)+" UTC";
    PanelTextFit(18,13,_Symbol,width-180,20,clrWhite,true);
-   if(width>=300) PanelText(168,20,"2.13",8,C'143,162,188');
+   if(width>=300) PanelText(168,20,"2.14",8,C'143,162,188');
    string account_label=AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_DEMO ? "Demo" : "Demo required";
    PanelTextFit(18,47,"Chart "+ViewPeriodName(_Period)+"  |  "+account_label,width-160,9,C'143,162,188');
 
@@ -589,11 +589,11 @@ bool DrawPanel(const bool active,const string message)
    int badge_width=g_panel.TextWidth(live);
    g_panel.TextOut(width-124+(106-badge_width)/2,21,live,ColorToARGB(live_color,255));
    PanelText(width-124,48,clock,8,C'143,162,188');
-   PanelTextFit(18,73,"H1 / M15 / M5 / M1",width-36,16,clrWhite,true);
+   PanelTextFit(18,73,"M30 / M15 / M5 / M1",width-36,16,clrWhite,true);
    g_panel.FillRectangle(18,104,width-19,104,ColorToARGB(C'36,51,73',255));
    PanelText(18,114,"CLOSED CANDLES",8,C'143,162,188',true);
    PanelTextFit(width/2,114,"22 needed per frame",width/2-18,8,C'143,162,188');
-   string readiness_frames[]={"H1","M15","M5","M1"};
+   string readiness_frames[]={"M30","M15","M5","M1"};
    int tile_width=(width-60)/4;
    int warmup_frame=-1;
    for(int i=0;i<4;i++)
@@ -658,7 +658,7 @@ bool DrawPanel(const bool active,const string message)
    g_panel.FillRectangle(18,body_base,width-19,body_base,ColorToARGB(C'36,51,73',255));
    PanelText(18,body_base+11,"Chart timeframe",9,C'175,191,213',true);
    PanelTextFit(145,body_base+12,"View only",width-163,8,C'143,162,188');
-   string frames[]={"M1","M5","M15","H1"};
+   string frames[]={"M1","M5","M15","M30"};
    int button_width=(width-54)/4;
    for(int i=0;i<4;i++)
       PanelButton("view_"+frames[i],frames[i],18+i*(button_width+6),body_base+34,button_width,29,
@@ -688,7 +688,7 @@ void HandlePanelClick(const int chart_x,const int chart_y)
       if(hit.action=="view_M1") period=PERIOD_M1;
       if(hit.action=="view_M5") period=PERIOD_M5;
       if(hit.action=="view_M15") period=PERIOD_M15;
-      if(hit.action=="view_H1") period=PERIOD_H1;
+      if(hit.action=="view_M30") period=PERIOD_M30;
       // Only this chart's view changes. Signal timing stays on completed M1.
       if(period!=PERIOD_CURRENT && period!=_Period)
         {
@@ -758,7 +758,7 @@ void UpdateOverlay()
    g_waiting_snapshot=false;
    if(MQLInfoInteger(MQL_TESTER)) { ShowWaiting("Live terminal required"); return; }
    // The view timeframe does not change the closed-M1 signal/history contract.
-   if(_Symbol!="XAUUSD") { ShowWaiting("Use XAUUSD: H1 / M15 / M5 / M1"); return; }
+   if(_Symbol!="XAUUSD") { ShowWaiting("Use XAUUSD: M30 / M15 / M5 / M1"); return; }
    if(g_terminal_key=="") { ShowWaiting("Terminal folder unavailable"); return; }
    if(AccountInfoInteger(ACCOUNT_TRADE_MODE)!=ACCOUNT_TRADE_MODE_DEMO) { ShowWaiting("Demo account required"); return; }
    if(AccountInfoInteger(ACCOUNT_LOGIN)!=g_session_login || AccountInfoString(ACCOUNT_SERVER)!=g_session_server)
@@ -802,7 +802,7 @@ int OnInit()
    int instance=0;
    do { g_prefix=base+IntegerToString(instance)+"_"; instance++; }
    while(ObjectFind(0,g_prefix+"status")>=0 || ObjectFind(0,g_prefix+"panel")>=0);
-   IndicatorSetString(INDICATOR_SHORTNAME,"MT5 Bot Panel 2.13");
+   IndicatorSetString(INDICATOR_SHORTNAME,"MT5 Bot Panel 2.14");
    if(!EventSetTimer(1)) return(INIT_FAILED);
    UpdateOverlay();
    return(INIT_SUCCEEDED);

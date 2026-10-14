@@ -81,7 +81,7 @@ def validate_feed(payload, now, expected_symbol=None):
     if bid > ask or stamp > now + timedelta(seconds=30) or stamp < now - timedelta(days=10):
         raise ValueError("Invalid quote")
     bars = payload["candles"]
-    if not isinstance(bars, list) or not (1 if payload.get("schema_version") == 2 else 4) <= len(bars) <= 64:
+    if not isinstance(bars, list) or not (1 if payload.get("schema_version") == 3 else 4) <= len(bars) <= 64:
         raise ValueError("Insufficient history")
     clean_bars = []
     previous = None
@@ -128,8 +128,8 @@ def validate_feed(payload, now, expected_symbol=None):
             raise ValueError("Invalid execution metadata")
         cleaned["execution"] = {"tick_size": _number(execution["tick_size"]), "point": _number(execution["point"]), "digits": digits, "stops_level": stops}
     if "timeframes" in payload or "schema_version" in payload or "risk_context" in payload:
-        if type(payload.get("schema_version")) is not int or payload["schema_version"] != 2:
-            raise ValueError("Version 2 multi-timeframe data is required")
+        if type(payload.get("schema_version")) is not int or payload["schema_version"] != 3:
+            raise ValueError("Version 3 multi-timeframe data is required")
         if not {"as_of", "broker_utc_offset_minutes", "execution"} <= set(payload):
             raise ValueError("Complete normalized snapshot metadata is required")
         as_of = _utc(payload["as_of"])
@@ -137,12 +137,12 @@ def validate_feed(payload, now, expected_symbol=None):
         if not timedelta(0) <= now - as_of <= timedelta(seconds=30) or type(offset) is not int or not -720 <= offset <= 840 or offset % 15:
             raise ValueError("Invalid normalized snapshot clock")
         frames = payload.get("timeframes")
-        if type(frames) is not dict or set(frames) != {"M15", "M5", "M1", "H1"}:
+        if type(frames) is not dict or set(frames) != {"M15", "M5", "M1", "M30"}:
             raise ValueError("All four timeframes are required")
         clean_frames = {"M15": clean_bars}
         if frames["M15"] != payload["candles"]:
             raise ValueError("Conflicting M15 history")
-        for frame, seconds in (("M5", 300), ("M1", 60), ("H1", 3600)):
+        for frame, seconds in (("M5", 300), ("M1", 60), ("M30", 1800)):
             rows = frames[frame]
             if type(rows) is not list or not 1 <= len(rows) <= 64:
                 raise ValueError("Insufficient timeframe history")
@@ -180,7 +180,7 @@ def validate_feed(payload, now, expected_symbol=None):
         risk_stamp = _utc(risk["as_of"])
         if not timedelta(seconds=-5) <= now - risk_stamp <= timedelta(seconds=30):
             raise ValueError("Stale risk metadata")
-        cleaned.update(schema_version=2, as_of=as_of.isoformat(), broker_utc_offset_minutes=offset, timeframes=clean_frames, risk_context={**risk, "as_of": risk_stamp.isoformat()})
+        cleaned.update(schema_version=3, as_of=as_of.isoformat(), broker_utc_offset_minutes=offset, timeframes=clean_frames, risk_context={**risk, "as_of": risk_stamp.isoformat()})
     return cleaned
 
 
@@ -883,7 +883,7 @@ async def reviews_command(update, context):
         if historical:
             await message.reply_text(
                 "أرشيف السجل الورقي القديم — عرض عند الطلب فقط.\n"
-                "هذه سجلات محفوظة كما كانت، ولا تُحدّث الآن. لا تخص استراتيجية H1/M15/M5/M1 الحالية أو تقييمها لمدة 60 دقيقة، "
+                "هذه سجلات محفوظة كما كانت، ولا تُحدّث الآن. لا تخص استراتيجية M30/M15/M5/M1 الحالية أو تقييمها لمدة 60 دقيقة، "
                 "ولا تُستخدم كأدلة لتأهيل الإشارات أو لإيقافها. /signals لعرض الحالة الحالية.",
                 parse_mode=None,
             )
@@ -930,7 +930,7 @@ async def watch_command(update, context):
         if mtf_runtime.signal_mode() == "experimental_demo":
             await message.reply_text(
                 "تم تفعيل متابعة إشارات Demo التجريبية — الأداء غير مثبت؛ التكاليف افتراضات تقديرية غير موثّقة.\n"
-                "H1 للاتجاه العام والدعم والمقاومة، M15 للتأكيد، وM5/M1 للدخول؛ شموع مكتملة وأسعار حديثة. تعارض H1 يعني الانتظار.\n"
+                "M30 للاتجاه العام والدعم والمقاومة، M15 للتأكيد، وM5/M1 للدخول؛ شموع مكتملة وأسعار حديثة. تعارض M30 يعني الانتظار.\n"
                 "ارتداد M5 خلال آخر 3 شموع قبل شمعة التأكيد؛ يبقى كسر M1 بإغلاق مكتمل مطلوباً.\n"
                 "تظهر الإشارة عند اجتياز فلاتر المخاطر والسبريد والنشاط: Demo فقط بحجم 0.01، دون صفقات أو أوامر معلّقة، ومخاطرة مقدّرة بعد التكاليف حتى 1% من حقوق الحساب (Equity).\n"
                 "صلاحية الدخول والتجهيز 30 ثانية من إغلاق M1؛ يعاد فحص السعر والسبريد والمخاطر قبل التجهيز. تُذكر قيم العمولة والانزلاق المقدّرة مع كل إشارة.\n"
@@ -941,7 +941,7 @@ async def watch_command(update, context):
             )
             return
         await message.reply_text(
-            "تم تفعيل المتابعة: H1 للاتجاه العام، M15 للتأكيد، وM5/M1 للدخول، من شموع مكتملة وأسعار حديثة. التعارض يعني الانتظار.\n"
+            "تم تفعيل المتابعة: M30 للاتجاه العام، M15 للتأكيد، وM5/M1 للدخول، من شموع مكتملة وأسعار حديثة. التعارض يعني الانتظار.\n"
             "اقتراح الصفقة مشروط بتوافق الأطر وفلاتر المخاطر والسبريد والنشاط، وبأدلة خارج العينة: 200 صفقة مستقلة على الأقل والحد الأدنى لفاصل الثقة 95% ≥70% بعد التكاليف.\n"
             "النجاح للاختبار: TP1 قبل SL خلال 60 دقيقة من الدخول؛ انتهاء المدة يُحسب غير ناجح. الأداء التاريخي لا يضمن نتيجة الصفقة.\n"
             "التنبيهات التلقائية فقط عند ظهور فرصة جديدة اجتازت الشروط؛ لا تصلك تقارير دورية أو رسائل انتظار. التنفيذ يظل يدوياً لكل صفقة: تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك.\n"

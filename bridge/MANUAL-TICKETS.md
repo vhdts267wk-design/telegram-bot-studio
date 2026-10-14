@@ -2,13 +2,13 @@
 
 `mt5_manual_bridge.py` prepares the installed desktop terminal's **New Order** window for a human review and final native Buy/Sell click. It does not send an order, accept an execution request, modify a position, or close a trade. A `prepared` result means that the visible ticket fields were verified; it is not a trade confirmation.
 
-Keep the intended Windows MT5 **Demo** terminal open and connected. The display indicator can show opportunities on any **XAUUSD chart timeframe**. Keep a separate chart of the exact broker gold symbol on **M1** open for the helper to activate during native ticket preparation. H1 determines the overall trend, M15 confirms direction, and M5/M1 determine entry timing regardless of the display timeframe. This workflow retains the **0.01 lot** limit and paired device/account identity. Algorithmic trading and external Python trading can remain disabled: the SDK is used only for prices, broker settings, and account checks.
+Keep the intended Windows MT5 **Demo** terminal open and connected. The display indicator can show opportunities on any **XAUUSD chart timeframe**. Keep a separate chart of the exact broker gold symbol on **M1** open for the helper to activate during native ticket preparation. M30 determines the overall trend, M15 confirms direction, and M5/M1 determine entry timing regardless of the display timeframe. This workflow retains the **0.01 lot** limit and paired device/account identity. Algorithmic trading and external Python trading can remain disabled: the SDK is used only for prices, broker settings, and account checks.
 
 ## Explicit Demo experimental profile
 
-The server defaults to `MT5_SIGNAL_MODE=qualified`. An operator can explicitly choose `MT5_SIGNAL_MODE=experimental_demo` for provisional Demo signals with estimated costs. This profile does not certify a win rate or mark broker costs as verified. It is limited to the same paired **Demo account and 0.01 lot**, with the same H1 trend, M15 confirmation, M5/M1 entry, price grid, fresh quote, account exposure, cash risk, reward/risk, margin and spread/drift checks. It never enables automatic order execution.
+The server defaults to `MT5_SIGNAL_MODE=qualified`. An operator can explicitly choose `MT5_SIGNAL_MODE=experimental_demo` for provisional Demo signals with estimated costs. This profile does not certify a win rate or mark broker costs as verified. It is limited to the same paired **Demo account and 0.01 lot**, with the same M30 trend, M15 confirmation, M5/M1 entry, price grid, fresh quote, account exposure, cash risk, reward/risk, margin and spread/drift checks. It never enables automatic order execution.
 
-Experimental payloads use the complete distinct profile `strategy_id=mtf-ema-pullback-60m-demo-v5`, `strategy_version=5`, `policy_id=mtf-manual-demo-estimated-cost-risk-v5`, `signal_mode=experimental_demo`, `provisional=true`, and `entry_window_seconds=30`. They omit `qualification_id` and empirical evidence metrics. A partial profile, a certified hash attached to this profile, or an unknown mode is rejected. Qualified payloads use the new four-frame identity, verified costs, qualification hash and ten-second action window. Older three-frame and five-frame proposals and evidence are invalidated.
+Experimental payloads use the complete distinct profile `strategy_id=mtf-ema-pullback-60m-demo-v7`, `strategy_version=7`, `policy_id=mtf-manual-demo-estimated-cost-risk-v7`, `signal_mode=experimental_demo`, `provisional=true`, and `entry_window_seconds=30`. They omit `qualification_id` and empirical evidence metrics. A partial profile, a certified hash attached to this profile, or an unknown mode is rejected. Qualified payloads use the new four-frame identity, verified costs, qualification hash and ten-second action window. Earlier H1 four-frame, three-frame and five-frame proposals and evidence are invalidated.
 
 The estimate method is `spread_tick_floor_v1`. For exactly 0.01 lot, round-trip commission in account currency is at least the larger of reported commission and `loss_cash_per_price_unit × max(spread, 10 × tick_size)`; per-side price slippage is at least the larger of reported slippage, half the spread and two ticks. Missing costs can use these floors only when the source explicitly marks costs unverified. Every experimental proposal includes the values and method in `cost_assumptions` with `verified=false`. The local helper recalculates cash risk with the larger of the frozen proposal estimates, current reported costs and current spread/tick floors. Missing live costs cannot erase the saved estimates. These are assumptions for Demo experimentation, not measured trading costs.
 
@@ -16,17 +16,17 @@ Experimental alerts, chart levels and ticket preparation expire **30 seconds aft
 
 ## Default qualified profile
 
-The current strategy is `mtf-ema-pullback-60m-v4`, version 4, with policy `mtf-manual-demo-cost-risk-v4`. Each of the M1/M5/M15/H1 streams uses at most 64 actual completed bars and requires at least 22 contiguous bars after its latest gap. Gaps are never filled and forming candles are never used. H1/M15/M5 references must already be closed at the M1 decision; the verified broker UTC offset determines higher-frame boundaries. Entry is the fresh executable Ask/Bid rounded adversely to the tick grid; SL uses a recent M5 swing plus a 0.2 ATR buffer. TP1 is 2R and supplementary TP2 is 3R. Published prices remain fixed.
+Feed schema 3 requires exactly M30/M15/M5/M1 and rejects older schema 2 H1 feeds. The current strategy is `mtf-ema-pullback-60m-v6`, version 6, with policy `mtf-manual-demo-cost-risk-v6`. Each of the M1/M5/M15/M30 streams uses at most 64 actual completed bars and requires at least 22 contiguous bars after its latest gap. Gaps are never filled and forming candles are never used. M30/M15/M5 references must already be closed at the M1 decision; the verified broker UTC offset determines higher-frame boundaries. Entry is the fresh executable Ask/Bid rounded adversely to the tick grid; SL uses a recent M5 swing plus a 0.2 ATR buffer. TP1 is 2R and supplementary TP2 is 3R. Published prices remain fixed.
 
 `broker_utc_offset_minutes` retains the verified bar-clock convention, and
-`context_bar_times` binds the latest completed H1 reference. The
+`context_bar_times` binds the latest completed M30 reference. The
 `timeframe_context` contains four BUY/SELL/NEUTRAL `trends`, `alignment`
 (`aligned`, `counter_trend` or `unconfirmed`), qualitative `confidence`
 (`aligned`, `reduced` or `unconfirmed`), a `counter_trend` boolean and nullable
-`support`/`resistance`, with `levels_timeframe: H1`. Opposing H1 produces `higher_timeframe_conflict` and
-waits with reduced qualitative confidence; neutral H1 waits for confirmation.
-No confidence label represents a win probability. H1 support/resistance is
-the low/high range of the last 20 contiguous completed H1 bars, retained only
+`support`/`resistance`, with `levels_timeframe: M30`. Opposing M30 produces `higher_timeframe_conflict` and
+waits with reduced qualitative confidence; neutral M30 waits for confirmation.
+No confidence label represents a win probability. M30 support/resistance is
+the low/high range of the last 20 contiguous completed M30 bars, retained only
 on the appropriate side of the current quote midpoint. It does not establish
 confirmed pivots or guaranteed reversals. Automatic Telegram and laptop alerts
 remain quiet until a new opportunity actually meets all current requirements.
@@ -78,8 +78,8 @@ Compile `bridge/MT5BotLevels.mq5` in MetaEditor and copy the resulting
 `MT5BotLevels.ex5` into `MQL5/Indicators` under this terminal's **File >
 Open Data Folder**. For an existing installation, replace the source/binary in
 their current folder rather than creating a duplicate in a new subfolder.
-Refresh MT5's Navigator and reload **MT5BotLevels 2.13** on
-the intended **XAUUSD** chart on any timeframe. Use indicator **version 2.13**; old M15/CSV-v1
+Refresh MT5's Navigator and reload **MT5BotLevels 2.14** on
+the intended **XAUUSD** chart on any timeframe. Use indicator **version 2.14**; old M15/CSV-v1
 snapshots are rejected. It is a display-only custom indicator and needs
 no DLLs, WebRequest permissions or algorithmic-trading setting. Keep the
 paired manual helper running.
@@ -87,13 +87,13 @@ paired manual helper running.
 Keep a separate **XAUUSD M1** chart open for native ticket preparation. The
 helper activates and verifies that M1 chart when you request preparation.
 
-CSV version 2 remains exactly 18 fields and retains its M1 signal timeframe. Its state is `active` for a qualified proposal, `experimental` for an explicit experimental Demo proposal, or `waiting`. Version 2.11 displays **Demo experimental**, **Estimated costs**, and **No certified win rate** on experimental levels, and overwrites those labels when the mode changes. Older version 2.00 indicators reject the experimental state and show no experimental levels until updated.
+CSV version 2 remains exactly 18 fields and retains its M1 signal timeframe. Its state is `active` for a qualified proposal, `experimental` for an explicit experimental Demo proposal, or `waiting`. The panel displays **Demo experimental**, **Estimated costs**, and **No certified win rate** on experimental levels, and overwrites those labels when the mode changes. Older version 2.00 indicators reject the experimental state and show no experimental levels until updated.
 
-Version 2.13 adds a four-frame readiness panel and removes the M30/H4 view
-buttons. H1/M15/M5/M1 tiles show closed contiguous history out of the required
+Version 2.14 shows the M30/M15/M5/M1 readiness panel and four chart-view
+buttons: M1, M5, M15 and M30. H1 and H4 are not required or read. M30/M15/M5/M1 tiles show closed contiguous history out of the required
 22 bars, with an explicit warmup message when a stream is short. The separate
 10-field `readiness_<terminal-data-folder-name>.csv` is display telemetry only:
-version, observed UTC, expiry UTC, H1/M15/M5/M1 counts, terminal marker, nonce
+version 2, observed UTC, expiry UTC, M30/M15/M5/M1 counts, terminal marker, nonce
 and account-binding hash. It expires no later than the source feed/quote's
 10-second freshness limit. Missing or expired data cannot show live readiness.
 It does not authorize a proposal, preparation, notification or order. The

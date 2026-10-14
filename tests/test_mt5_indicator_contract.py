@@ -42,7 +42,7 @@ class IndicatorContractTests(unittest.TestCase):
         self.assertIn('ObjectSetString(0,name,OBJPROP_TEXT,text)', self.source)
 
     def test_chart_view_timeframe_is_independent_of_closed_m1_signal_validation(self):
-        # A valid M1 opportunity must be visible while viewing XAUUSD M15/H1.
+        # A valid M1 opportunity must be visible while viewing XAUUSD M15/M30.
         # Changing the chart view never changes the incoming signal timeframe.
         parser = self.source.split("bool ReadProposal(", 1)[1].split("bool PrepareObject(", 1)[0]
         self.assertNotRegex(parser, r"\b_Period\b|\bPERIOD_CURRENT\b")
@@ -73,16 +73,16 @@ class IndicatorContractTests(unittest.TestCase):
     def test_four_frame_panel_has_only_view_actions_and_visible_version(self):
         panel = self.source.split("bool DrawPanel(", 1)[1].split("void HandlePanelClick(", 1)[0]
         click = self.source.split("void HandlePanelClick(", 1)[1].split("void ClearLevels()", 1)[0]
-        self.assertIn('#property version   "2.13"', self.source)
-        self.assertIn('PanelText(168,20,"2.13"', panel)
-        self.assertIn('INDICATOR_SHORTNAME,"MT5 Bot Panel 2.13"', self.source)
-        self.assertIn('"H1 / M15 / M5 / M1"', panel)
-        self.assertIn('string readiness_frames[]={"H1","M15","M5","M1"}', panel)
-        self.assertIn('string frames[]={"M1","M5","M15","H1"}', panel)
+        self.assertIn('#property version   "2.14"', self.source)
+        self.assertIn('PanelText(168,20,"2.14"', panel)
+        self.assertIn('INDICATOR_SHORTNAME,"MT5 Bot Panel 2.14"', self.source)
+        self.assertIn('"M30 / M15 / M5 / M1"', panel)
+        self.assertIn('string readiness_frames[]={"M30","M15","M5","M1"}', panel)
+        self.assertIn('string frames[]={"M1","M5","M15","M30"}', panel)
         self.assertEqual(re.findall(r'hit.action=="(view_[^"]+)"', click), [
-            "view_M1", "view_M5", "view_M15", "view_H1",
+            "view_M1", "view_M5", "view_M15", "view_M30",
         ])
-        self.assertNotRegex(self.source, r"\bPERIOD_(?:M30|H4)\b|view_(?:M30|H4)")
+        self.assertNotRegex(self.source, r"\bPERIOD_(?:H1|H4)\b|view_(?:H1|H4)")
         self.assertEqual(self.source.count("ChartSetSymbolPeriod("), 1)
         self.assertIn("ChartSetSymbolPeriod(0,_Symbol,period)", click)
         self.assertIn('hit.action=="refresh") { UpdateOverlay(); return; }', click)
@@ -104,7 +104,7 @@ class IndicatorContractTests(unittest.TestCase):
         for text in (
             "size>READINESS_MAX_BYTES", "FileSize(handle)==size && FileTell(handle)==size",
             "copied!=size || !unchanged", 'bytes[i]<33 || bytes[i]>126 || bytes[i]==\'"\'',
-            "StringSplit(row,';',fields)!=READINESS_FIELD_COUNT", 'fields[0]!="1"',
+            "StringSplit(row,';',fields)!=READINESS_FIELD_COUNT", 'fields[0]!="2"',
             "fields[7]!=g_terminal_key", "AccountBindingMatches(fields[8],fields[9])",
             "ParseInteger(fields[1],observed)", "ParseInteger(fields[2],valid_until)",
             "ParseInteger(fields[i+3],count)", "count<0 || count>64", "observed<946684800",
@@ -241,16 +241,16 @@ class IndicatorContractTests(unittest.TestCase):
             "entry": 4000.00, "entry_zone_low": 3999.00, "entry_zone_high": 4001.00,
             "stop": 3990.00, "target": 4020.00, "price_digits": 2, "execution": execution,
             "bar_time": "2026-10-05T16:21:00Z", "expires_at": "2026-10-05T16:22:10Z",
-            "strategy_id": "mtf-ema-pullback-60m-v4", "strategy_version": 4,
-            "policy_id": "mtf-manual-demo-cost-risk-v4", "horizon_seconds": 3600,
+            "strategy_id": "mtf-ema-pullback-60m-v6", "strategy_version": 6,
+            "policy_id": "mtf-manual-demo-cost-risk-v6", "horizon_seconds": 3600,
             "strategy_fingerprint": "a" * 64, "qualification_id": "b" * 64,
             "direction_bar_time": "2026-10-05T16:00:00Z",
             "confirmation_bar_time": "2026-10-05T16:15:00Z",
             "broker_utc_offset_minutes": 180,
-            "context_bar_times": {"H1": "2026-10-05T15:00:00Z"},
-            "timeframe_context": {"trends": {key: "BUY" for key in ("M1", "M5", "M15", "H1")},
+            "context_bar_times": {"M30": "2026-10-05T15:30:00Z"},
+            "timeframe_context": {"trends": {key: "BUY" for key in ("M1", "M5", "M15", "M30")},
                                   "alignment": "aligned", "confidence": "aligned", "counter_trend": False,
-                                  "levels_timeframe": "H1", "support": 3900, "resistance": 4100},
+                                  "levels_timeframe": "M30", "support": 3900, "resistance": 4100},
         }
         quote = {"time": now.isoformat(), "bid": 3999.99, "ask": 4000.01}
         with tempfile.TemporaryDirectory(prefix="indicator-contract-") as temporary:

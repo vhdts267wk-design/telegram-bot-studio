@@ -479,7 +479,7 @@ def _manual_offer_text(payload, expires_at, *, demo=False) -> str:
         f"SL وقف: {payload['stop']:.{digits}f} | TP1 هدف: {payload['target']:.{digits}f} | TP2: {payload['target2']:.{digits}f}",
         f"الحجم: {payload['volume']:g} lot | العائد/المخاطرة بعد التكاليف: {payload['effective_reward_risk']:.2f}:1.",
         *mtf_presentation.context_lines(payload, digits),
-        "السبب: H1 اتجاه عام، M15 تأكيد، M5/M1 دخول؛ اجتازت فلاتر المخاطر والسبريد.",
+        "السبب: M30 اتجاه عام، M15 تأكيد، M5/M1 دخول؛ اجتازت فلاتر المخاطر والسبريد.",
         f"مهلة الدخول: {seconds} ثانية من إغلاق M1؛ آخر وقت {'للتنفيذ' if demo else 'للتجهيز'}: {_utc(expires_at):%H:%M:%S} UTC.",
     ]
     if experimental:

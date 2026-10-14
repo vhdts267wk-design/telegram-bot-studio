@@ -232,17 +232,17 @@ def validate_manual_offer(offer, settings, now):
     experimental = payload.get("signal_mode") == "experimental_demo"
     profile_valid = (
         payload.get("provisional") is True
-        and payload.get("strategy_id") == "mtf-ema-pullback-60m-demo-v5"
-        and type(payload.get("strategy_version")) is int and payload["strategy_version"] == 5
-        and payload.get("policy_id") == "mtf-manual-demo-estimated-cost-risk-v5"
+        and payload.get("strategy_id") == "mtf-ema-pullback-60m-demo-v7"
+        and type(payload.get("strategy_version")) is int and payload["strategy_version"] == 7
+        and payload.get("policy_id") == "mtf-manual-demo-estimated-cost-risk-v7"
         and type(payload.get("entry_window_seconds")) is int and payload["entry_window_seconds"] == 30
         and payload.get("qualification_id", "") == ""
         and "evidence_metrics" not in payload
     ) if experimental else (
         payload.get("provisional") is False
-        and payload.get("strategy_id") == "mtf-ema-pullback-60m-v4"
-        and type(payload.get("strategy_version")) is int and payload["strategy_version"] == 4
-        and payload.get("policy_id") == "mtf-manual-demo-cost-risk-v4"
+        and payload.get("strategy_id") == "mtf-ema-pullback-60m-v6"
+        and type(payload.get("strategy_version")) is int and payload["strategy_version"] == 6
+        and payload.get("policy_id") == "mtf-manual-demo-cost-risk-v6"
         and payload.get("signal_mode", "qualified") == "qualified"
         and type(payload.get("entry_window_seconds", 10)) is int and payload.get("entry_window_seconds", 10) == 10
         and "cost_assumptions" not in payload
@@ -283,7 +283,7 @@ def validate_manual_offer(offer, settings, now):
         chart.validate_context_references(payload.get("context_bar_times"), trigger=bar.timestamp(),
             boundary=now.timestamp(), broker_offset_minutes=settings.market.broker_utc_offset_minutes)
     except chart.OverlayError:
-        raise trade.GuardError("The closed H1 context reference is invalid.") from None
+        raise trade.GuardError("The closed M30 context reference is invalid.") from None
     entry, stop, target = (trade.positive_decimal(payload.get(key)) for key in ("entry", "stop", "target"))
     if not (stop < entry < target if payload["direction"] == "BUY" else target < entry < stop) or trade.positive_decimal(payload.get("max_drift_r")) != trade.MAX_DRIFT_R:
         raise trade.GuardError("The frozen manual protection or drift limit is invalid.")

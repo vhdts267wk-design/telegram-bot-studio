@@ -1,4 +1,4 @@
-"""Causal H1 context, M15 direction and M5/M1 timing for Demo.
+"""Causal M30 context, M15 direction and M5/M1 timing for Demo.
 
 Candidates do not authorize orders or ticket preparation. Qualified signals
 require operator-pinned empirical evidence. An explicitly selected experimental
@@ -19,17 +19,17 @@ from types import MappingProxyType
 
 from bot import paper_signals
 
-STRATEGY_ID = "mtf-ema-pullback-60m-v4"
-STRATEGY_VERSION = 4
-POLICY_ID = "mtf-manual-demo-cost-risk-v4"
-EXPERIMENTAL_STRATEGY_ID = "mtf-ema-pullback-60m-demo-v5"
-EXPERIMENTAL_STRATEGY_VERSION = 5
-EXPERIMENTAL_POLICY_ID = "mtf-manual-demo-estimated-cost-risk-v5"
+STRATEGY_ID = "mtf-ema-pullback-60m-v6"
+STRATEGY_VERSION = 6
+POLICY_ID = "mtf-manual-demo-cost-risk-v6"
+EXPERIMENTAL_STRATEGY_ID = "mtf-ema-pullback-60m-demo-v7"
+EXPERIMENTAL_STRATEGY_VERSION = 7
+EXPERIMENTAL_POLICY_ID = "mtf-manual-demo-estimated-cost-risk-v7"
 EXPERIMENTAL_SIGNAL_MODE = "experimental_demo"
 HORIZON_SECONDS = 3600
 LOOKBACK_BARS = 64
 MIN_CONTIGUOUS_BARS = 22
-TIMEFRAME_SECONDS = MappingProxyType({"M15": 900, "M5": 300, "M1": 60, "H1": 3600})
+TIMEFRAME_SECONDS = MappingProxyType({"M15": 900, "M5": 300, "M1": 60, "M30": 1800})
 RISK_FIELDS = frozenset({
     "account_mode", "volume", "equity", "open_positions", "pending_orders",
     "loss_cash_per_price_unit", "profit_cash_per_price_unit", "commission_round_turn",
@@ -37,7 +37,7 @@ RISK_FIELDS = frozenset({
     "broker_fingerprint",
 })
 POLICY = MappingProxyType({
-    "schema_version": 4, "lookback_bars": LOOKBACK_BARS,
+    "schema_version": 6, "lookback_bars": LOOKBACK_BARS,
     "min_contiguous_bars": MIN_CONTIGUOUS_BARS,
     "gap_policy": "reset_indicators_at_contiguous_suffix_without_filling",
     "horizon_seconds": HORIZON_SECONDS,
@@ -46,9 +46,9 @@ POLICY = MappingProxyType({
     "snapshot_max_age_seconds": 30, "risk_max_age_seconds": 30,
     "m1_max_close_age_seconds": 75,
     "m15_min_ema_separation_atr": "0.05", "max_latest_true_range_atr": "3",
-    "higher_context": "closed_H1_must_agree_with_M15_ema_slope_close",
+    "higher_context": "closed_M30_must_agree_with_M15_ema_slope_close",
     "higher_context_min_ema_separation_atr": "0.05",
-    "h1_level_bars": 20, "h1_levels": "completed_contiguous_range_extrema",
+    "m30_level_bars": 20, "m30_levels": "completed_contiguous_range_extrema",
     "candle_grid": "verified_broker_offset_minutes",
     "swing_m5_bars": 5, "stop_buffer_m5_atr": "0.2",
     "target_r": "2", "target2_r": "3", "min_effective_reward_risk": "1.5",
@@ -249,17 +249,17 @@ def _timeframe_context(bars, indicators, bid, ask):
               for key in TIMEFRAME_SECONDS}
     direction = trends["M15"]
     counter = direction != "NEUTRAL" and any(
-        trends[key] not in {direction, "NEUTRAL"} for key in ("H1",)
+        trends[key] not in {direction, "NEUTRAL"} for key in ("M30",)
     )
     aligned = direction != "NEUTRAL" and all(value == direction for value in trends.values())
     midpoint = (Decimal(str(bid)) + Decimal(str(ask))) / 2
-    closed_range = bars["H1"][-20:]
+    closed_range = bars["M30"][-20:]
     support = min(bar["low"] for bar in closed_range)
     resistance = max(bar["high"] for bar in closed_range)
     return {"trends": trends,
             "alignment": "counter_trend" if counter else "aligned" if aligned else "unconfirmed",
             "confidence": "reduced" if counter else "aligned" if aligned else "unconfirmed",
-            "counter_trend": counter, "levels_timeframe": "H1",
+            "counter_trend": counter, "levels_timeframe": "M30",
             "support": support if Decimal(str(support)) <= midpoint else None,
             "resistance": resistance if Decimal(str(resistance)) >= midpoint else None}
 
@@ -351,7 +351,7 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
 
     try:
         clock = _utc(datetime.now(timezone.utc) if now is None else now)
-        if type(feed) is not dict or feed.get("source") != "MetaTrader 5" or type(feed.get("schema_version")) is not int or feed["schema_version"] != 2:
+        if type(feed) is not dict or feed.get("source") != "MetaTrader 5" or type(feed.get("schema_version")) is not int or feed["schema_version"] != 3:
             return result("invalid", "unsupported_feed", counts=counts)
         offset = broker_utc_offset_minutes(feed.get("broker_utc_offset_minutes"))
         symbol = feed.get("symbol")
@@ -385,7 +385,7 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
         trigger_close = bars["M1"][-1]["time"] + timedelta(seconds=60)
         if not timedelta(0) <= clock - trigger_close <= timedelta(seconds=75):
             return result("stale", "stale_m1_timing", counts=counts)
-        for key in ("M15", "M5", "H1"):
+        for key in ("M15", "M5", "M30"):
             end = bars[key][-1]["time"] + timedelta(seconds=TIMEFRAME_SECONDS[key])
             if end > trigger_close:
                 return result("invalid", "lookahead_" + key, counts=counts)
@@ -398,7 +398,7 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
         indicators = {key: _indicators(values) for key, values in bars.items()}
         context.update(
             broker_utc_offset_minutes=offset,
-            context_bar_times={"H1": bars["H1"][-1]["time"].isoformat()},
+            context_bar_times={"M30": bars["M30"][-1]["time"].isoformat()},
             timeframe_context=_timeframe_context(bars, indicators, bid, ask),
         )
         try:
@@ -430,7 +430,7 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
         higher_trends = context["timeframe_context"]["trends"]
         if context["timeframe_context"]["counter_trend"]:
             return result("no_signal", "higher_timeframe_conflict", counts=counts)
-        if higher_trends["H1"] == "NEUTRAL":
+        if higher_trends["M30"] == "NEUTRAL":
             return result("no_signal", "higher_timeframe_neutral", counts=counts)
         sign = 1 if buy else -1
         confirmation = indicators["M5"]
@@ -518,7 +518,7 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
             cost_context={key: float(risk[key]) for key in ("commission_round_turn", "slippage_price", "loss_cash_per_price_unit", "profit_cash_per_price_unit")},
             indicators={key: {name: round(number, 8) for name, number in values.items()} for key, values in indicators.items()},
             explanation=("Experimental Demo candidate with estimated costs; no empirical success claim. Human execution only."
-                         if experimental_demo else "Closed H1 context, M15 direction, M5 recovery and M1 breakout agree. Qualitative alignment is not a success probability. Candidate awaits empirical qualification and human review."),
+                         if experimental_demo else "Closed M30 context, M15 direction, M5 recovery and M1 breakout agree. Qualitative alignment is not a success probability. Candidate awaits empirical qualification and human review."),
             invalidation="Reject if closed higher context/direction/confirmation reverses, quote/spread/risk guards fail or the proposal expires. Keep published SL/TP fixed.",
         )
     except _Invalid as error:

@@ -31,9 +31,9 @@ class NativeFourFrameContractTests(unittest.TestCase):
     def test_current_qualified_and_experimental_drafts_need_no_h4_reference(self):
         for experimental in (False, True):
             value = draft(experimental=experimental)
-            self.assertEqual(set(value.context_bar_times), {"H1"})
-            self.assertEqual(set(value.timeframe_context["trends"]), {"H1", "M15", "M5", "M1"})
-            self.assertEqual(value.timeframe_context["levels_timeframe"], "H1")
+            self.assertEqual(set(value.context_bar_times), {"M30"})
+            self.assertEqual(set(value.timeframe_context["trends"]), {"M30", "M15", "M5", "M1"})
+            self.assertEqual(value.timeframe_context["levels_timeframe"], "M30")
             native.require_qualified(value, NOW)
 
     def test_old_five_frame_profiles_cannot_prepare_a_ticket(self):
@@ -45,11 +45,32 @@ class NativeFourFrameContractTests(unittest.TestCase):
             with self.subTest(experimental=experimental), self.assertRaises(native.TicketError):
                 native.require_qualified(value, NOW)
 
-    def test_h1_context_is_mandatory_and_old_h4_fields_are_rejected(self):
-        for mutation in ("missing_h1", "old_h4_reference", "old_h4_trend", "missing_levels_source", "old_levels_source"):
+    def test_prior_h1_profiles_cannot_prepare_a_ticket_with_new_m30_context(self):
+        for experimental in (False, True):
+            value = replace(draft(experimental=experimental),
+                            strategy_id="mtf-ema-pullback-60m-demo-v5" if experimental else "mtf-ema-pullback-60m-v4",
+                            strategy_version=5 if experimental else 4,
+                            policy_id="mtf-manual-demo-estimated-cost-risk-v5" if experimental else "mtf-manual-demo-cost-risk-v4")
+            with self.subTest(experimental=experimental), self.assertRaises(native.TicketError):
+                native.require_qualified(value, NOW)
+
+    def test_old_h1_context_cannot_be_relabelled_as_current_m30_profile(self):
+        for mutation in ("reference", "trend", "levels"):
             value = deepcopy(draft())
-            if mutation == "missing_h1":
-                value.context_bar_times.pop("H1")
+            if mutation == "reference":
+                value.context_bar_times["H1"] = value.context_bar_times.pop("M30")
+            elif mutation == "trend":
+                value.timeframe_context["trends"]["H1"] = value.timeframe_context["trends"].pop("M30")
+            else:
+                value.timeframe_context["levels_timeframe"] = "H1"
+            with self.subTest(mutation=mutation), self.assertRaises(native.TicketError):
+                native.require_qualified(value, NOW)
+
+    def test_m30_context_is_mandatory_and_old_h4_fields_are_rejected(self):
+        for mutation in ("missing_m30", "old_h4_reference", "old_h4_trend", "missing_levels_source", "old_levels_source"):
+            value = deepcopy(draft())
+            if mutation == "missing_m30":
+                value.context_bar_times.pop("M30")
             elif mutation == "old_h4_reference":
                 value.context_bar_times["H4"] = (NOW - timedelta(hours=4)).isoformat()
             elif mutation == "old_h4_trend":

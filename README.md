@@ -13,7 +13,7 @@ Docker, and Railway.
 - Persistent chat menu buttons after `/start`
 - `/start`, `/help`, `/about`, and `/ping` commands
 - `/gold`, `/market`, `/signals`, `/reviews` and `/news` work without OpenAI or screenshots
-- `/market` reads completed MT5 M1/M5/M15/H1 candles; `/news` remains a separate request
+- `/market` reads completed MT5 M1/M5/M15/M30 candles; `/news` remains a separate request
 - Empirically gated **Demo MT5 proposals at 0.01 lot**, with a native ticket draft and the final Buy/Sell click made by the human
 - Echo replies for normal text messages
 - Fallback handler for unknown commands
@@ -52,7 +52,7 @@ The bot shows a persistent reply keyboard after `/start` with these buttons:
 | `Help`  | Show available commands          |
 | `About` | Show short bot information       |
 | `Ping`  | Check whether the bot is running |
-| `Market` | XAUUSD H1 overall trend, M15 confirmation and M5/M1 entry timing |
+| `Market` | XAUUSD M30 overall trend, M15 confirmation and M5/M1 entry timing |
 | `News` | Cited political and economic news |
 | `Signals` | A qualified manual Demo proposal or an explicit waiting reason |
 
@@ -107,24 +107,31 @@ another chart tab is selected. Waiting updates do not trigger alerts. Its
 expiry, device binding and closed-M1/fresh-feed checks remain in force. A
 preparation request only fills a native Demo ticket; Buy/Sell remains manual.
 
-The current MT5 strategy is `mtf-ema-pullback-60m-v4` (version 4, policy
-`mtf-manual-demo-cost-risk-v4`): **H1 overall trend → M15
+The current MT5 strategy is `mtf-ema-pullback-60m-v6` (version 6, policy
+`mtf-manual-demo-cost-risk-v6`): **M30 overall trend → M15
 confirmation → M5 pullback/recovery and M1 entry timing**.
 It uses EMA9/EMA21 and ATR14 from actual completed broker candles. Each stream
 contains at most 64 actual bars and needs a contiguous suffix of at least 22;
-any gap resets indicator warmup. H4 is not read or required; H1 still needs
+any gap resets indicator warmup. H1 and H4 are not read or required; M30 needs
 22 contiguous completed bars after its latest gap. Missing bars are never
-filled, and no forming candle or later H1/M15/M5 close can confirm an earlier
-M1 decision. H1
+filled, and no forming candle or later M30/M15/M5 close can confirm an earlier
+M1 decision. M30
 bars use the explicitly verified broker UTC offset to identify their boundaries.
 
+Feed schema 3 requires exactly M30/M15/M5/M1. Schema 2 H1 feeds, earlier
+strategy profiles, pending claims and qualification artifacts are incompatible.
+After an uninterrupted restart at 22:00 UTC, 22 closed M30 bars are available
+at 09:00 UTC; M15 reaches 22 bars at 03:30 UTC. This resolves the H1 warmup
+conflict without skipping missing bars. Readiness alone does not authorize a
+signal: the remaining trend, session and risk checks still apply.
+
 The four-frame context reports each completed stream as BUY, SELL or NEUTRAL.
-H1 opposing the M15 direction produces `higher_timeframe_conflict` and
-waits with reduced qualitative confidence; neutral H1 also waits. A short
+M30 opposing the M15 direction produces `higher_timeframe_conflict` and
+waits with reduced qualitative confidence; neutral M30 also waits. A short
 upward move against a downward higher trend cannot become a strong automatic
 BUY suggestion. Alignment and confidence describe agreement among frames;
 they are not a win probability. Support and resistance are the low/high range
-of the latest 20 contiguous completed H1 bars, retained only on the appropriate
+of the latest 20 contiguous completed M30 bars, retained only on the appropriate
 side of the current quote midpoint. These are observed ranges, not confirmed
 pivots or guaranteed turning points.
 
@@ -152,8 +159,8 @@ older three-frame and five-frame identities; qualified mode needs a newly review
 matching the current implementation and policy.
 
 An explicit `MT5_SIGNAL_MODE=experimental_demo` opt-in enables a separate Demo
-research profile, `mtf-ema-pullback-60m-demo-v5` (version 5, policy
-`mtf-manual-demo-estimated-cost-risk-v5`). Its messages and chart labels
+research profile, `mtf-ema-pullback-60m-demo-v7` (version 7, policy
+`mtf-manual-demo-estimated-cost-risk-v7`). Its messages and chart labels
 say that performance is unproven and costs are estimates; it carries no
 qualification ID or certified win-rate claim. The M5 pullback may occur in any
 of the three preceding completed candles, followed by the latest completed
@@ -200,7 +207,7 @@ checks. Tick activity must be at least half the preceding 20-bar median; it is
 a price-update proxy, not verified traded volume or market depth.
 
 Historical qualification requires same-broker UTC Bid/Ask tick history,
-completed M1/M5/M15/H1 history, file fingerprints, verified timestamp/DST provenance,
+completed M1/M5/M15/M30 history, file fingerprints, verified timestamp/DST provenance,
 chronological development/validation/untouched OOS splits, and commission,
 slippage, financing and 0.01-lot contract/cash-conversion assumptions covering
 the tested period. Record historical tick size, point, digits and stop/margin
