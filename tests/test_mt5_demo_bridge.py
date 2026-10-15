@@ -51,6 +51,19 @@ class DemoBridgeTests(unittest.TestCase):
         self.mt5.order_check.return_value = SimpleNamespace(retcode=0)
         self.mt5.order_send.side_effect = None
         self.mt5.order_send.return_value = SimpleNamespace(retcode=10009, volume=0.01, order=123456)
+        self.mt5.mock_add_spec([*self.mt5._mock_methods, "history_deals_get"])
+        self.mt5.history_deals_get.return_value = ()
+        original_build = demo.market.build_payload
+        def synthetic_session(mt5, settings, now):
+            feed = original_build(mt5, settings, now)
+            feed["session_context"] = {"source": "mt5_symbol_info_session_trade", "verified": True,
+                                      "as_of": trade.iso_date(now),
+                                      "session_open": trade.iso_date(now.replace(hour=0, minute=0, second=0, microsecond=0)),
+                                      "session_close": trade.iso_date(now.replace(hour=22, minute=0, second=0, microsecond=0))}
+            return feed
+        session_patch = patch.object(demo.market, "build_payload", side_effect=synthetic_session)
+        session_patch.start()
+        self.addCleanup(session_patch.stop)
         self.ledger = demo.DemoLedger(old.state_directory)
         self.addCleanup(self.ledger.close)
         self.offer = self.current_offer()
@@ -96,12 +109,18 @@ class DemoBridgeTests(unittest.TestCase):
         self.settings = replace(self.settings, market=replace(self.settings.market, cost_model_verified=False, commission_round_turn_per_lot=None, slippage_price=None))
         self.assertEqual(self.execute(self.experimental())["status"], "filled")
 
-    def test_market_execution_uses_ioc_without_price(self):
-        self.symbol.trade_exemode, self.symbol.filling_mode = 2, 2
+    def test_market_execution_uses_full_fok_without_price(self):
+        self.symbol.trade_exemode, self.symbol.filling_mode = 2, 3
         self.assertEqual(self.execute()["status"], "filled")
         request = self.mt5.order_send.call_args.args[0]
         self.assertNotIn("price", request)
-        self.assertEqual(request["type_filling"], self.mt5.ORDER_FILLING_IOC)
+        self.assertEqual(request["type_filling"], self.mt5.ORDER_FILLING_FOK)
+
+    def test_ioc_only_entry_is_rejected_before_preflight_or_send(self):
+        self.symbol.trade_exemode, self.symbol.filling_mode = 2, 2
+        self.assertEqual(self.execute()["status"], "failed")
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
 
     def test_genuine_closed_sell_signal_sends_fixed_sell_protection(self):
         eligible = candle_fixtures.MultiTimeframeTests().feed(now=NOW, broker_offset=0, sell=True)
@@ -232,6 +251,17 @@ class DemoBridgeTests(unittest.TestCase):
         self.mt5.order_check.assert_not_called()
         self.mt5.order_send.assert_not_called()
 
+    def test_prior_untimed_m30_profiles_cannot_execute_even_with_new_timing_fields(self):
+        for experimental in (False, True):
+            offer = self.current_offer(experimental=experimental)
+            offer["payload"].update(strategy_id="mtf-ema-pullback-60m-demo-v7" if experimental else "mtf-ema-pullback-60m-v6",
+                                    strategy_version=7 if experimental else 6,
+                                    policy_id="mtf-manual-demo-estimated-cost-risk-v7" if experimental else "mtf-manual-demo-cost-risk-v6")
+            with self.subTest(experimental=experimental):
+                self.assertEqual(self.execute(offer)["status"], "failed")
+        self.mt5.order_check.assert_not_called()
+        self.mt5.order_send.assert_not_called()
+
     def test_schema2_local_snapshot_blocks_current_m30_accept_before_preflight(self):
         feed = demo.market.build_payload(self.mt5, self.settings.market, NOW)
         feed["schema_version"] = 2
@@ -250,6 +280,18 @@ class DemoBridgeTests(unittest.TestCase):
         offer = deepcopy(self.offer)
         offer["id"] = str(uuid4())
         self.assertEqual(self.execute(offer, clock=lambda: moment[0])["status"], "failed")
+        self.mt5.order_send.assert_not_called()
+
+    def test_durable_exit_write_cannot_consume_the_entry_window_and_still_send(self):
+        moment = [NOW]
+        original = demo.owned_exits.ExitLedger.stage
+        def slow_stage(exit_ledger, offer, request, now):
+            original(exit_ledger, offer, request, now)
+            moment[0] = NOW + timedelta(seconds=10)
+        with patch.object(demo.owned_exits.ExitLedger, "stage", slow_stage):
+            self.assertEqual(self.execute(clock=lambda: moment[0])["status"], "failed")
+        row = demo.owned_exits.ExitLedger(self.ledger).get(self.offer["id"])
+        self.assertEqual(row["state"], "entry_failed")
         self.mt5.order_send.assert_not_called()
 
     def test_quote_changed_after_final_risk_read_is_rejected_without_send(self):

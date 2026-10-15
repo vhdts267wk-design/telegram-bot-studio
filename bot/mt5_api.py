@@ -9,7 +9,7 @@ from uuid import UUID
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from bot import manual_ticket_store, market_store, mtf_runtime, proposal_overlay, trade_store
+from bot import manual_ticket_store, market_store, mtf_runtime, proposal_overlay, trade_store, mt5_exit_events
 
 MAX_CONTROL_BYTES = 8192
 
@@ -432,3 +432,4 @@ def install_routes(app, application, settings):
     app.add_api_route("/api/mt5/demo/poll", demo_poll, methods=["POST"])
     app.add_api_route("/api/mt5/demo/result", demo_result, methods=["POST"])
     app.add_api_route("/api/mt5/demo/chart", demo_chart, methods=["POST"])
+    mt5_exit_events.install_routes(app, read_request, now_utc)

@@ -30,8 +30,8 @@ confidence describes disagreement, not a probability of winning. Telegram
 opportunity messages include M30 alignment and the range of the last 20
 completed M30 bars as observed support/resistance. On-demand commands explain
 waiting reasons; automatic alerts remain limited to new eligible opportunities.
-The qualified `mtf-ema-pullback-60m-v6` and experimental Demo
-`mtf-ema-pullback-60m-demo-v7` profiles invalidate older three-frame and five-frame proposals
+The qualified `mtf-ema-pullback-60m-v8` and experimental Demo
+`mtf-ema-pullback-60m-demo-v9` profiles invalidate older untimed M30, H1, three-frame and five-frame proposals
 and evidence. Demo 0.01, expiry and final manual Buy/Sell requirements still apply.
 
 Use an awake Windows x64 computer or Windows VPS, the broker's MT5 desktop terminal, and compatible x64 Python. Open the **exact intended terminal yourself**, log in there and confirm that it is connected. Neither helper accepts an account password or changes the logged-in account. This is not a mobile or web MT5 connection.

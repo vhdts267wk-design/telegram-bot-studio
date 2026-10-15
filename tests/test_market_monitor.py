@@ -580,13 +580,14 @@ class ManualTicketMonitorTests(unittest.IsolatedAsyncioTestCase):
             monitor.journal_store, "initialize_schema", side_effect=initialise("journal")
         ), patch.object(monitor.trade_store, "initialize_schema", side_effect=initialise("trade")), patch.object(
             monitor.manual_ticket_store, "initialize_schema", side_effect=initialise("manual")
+        ), patch.object(monitor.mt5_exit_events, "initialize_schema", side_effect=initialise("exit_events")
         ):
             await monitor.setup(application)
             await monitor.stop(application)
         service = application.bot_data[monitor.SERVICE_KEY]
         self.assertTrue(service.manual_tickets_enabled)
         self.assertFalse(service.trading_enabled)
-        self.assertEqual(order, ["market", "journal", "trade", "manual"])
+        self.assertEqual(order, ["market", "journal", "trade", "manual", "exit_events"])
 
     async def test_worker_dispatches_manual_preparation_offers_and_results_with_auto_disabled(self):
         application = SimpleNamespace(running=True, bot=object())

@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CommandHandler
 
-from bot import chart_analysis, free_news, journal_store, manual_ticket_store, market_news, market_store, mt5_api, mt5_notifications, mtf_runtime, multi_timeframe, paper_journal, paper_policy, paper_signals, reference_market, trade_store
+from bot import chart_analysis, free_news, journal_store, manual_ticket_store, market_news, market_store, mt5_api, mt5_notifications, mtf_runtime, multi_timeframe, paper_journal, paper_policy, paper_signals, reference_market, trade_store, mt5_exit_events
 
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ def _number(value):
 def validate_feed(payload, now, expected_symbol=None):
     """Validate broker data; legacy M15 alone never qualifies a new proposal."""
     required = {"symbol", "timeframe", "source", "quote", "candles"}
-    if not isinstance(payload, dict) or not required <= set(payload) or not set(payload) <= required | {"device_id", "execution", "schema_version", "timeframes", "risk_context", "as_of", "broker_utc_offset_minutes"}:
+    if not isinstance(payload, dict) or not required <= set(payload) or not set(payload) <= required | {"device_id", "execution", "schema_version", "timeframes", "risk_context", "as_of", "broker_utc_offset_minutes", "session_context"}:
         raise ValueError("Invalid feed")
     device_id = payload.get("device_id")
     if "device_id" in payload and (type(device_id) is not str or str(UUID(device_id)) != device_id):
@@ -181,6 +181,18 @@ def validate_feed(payload, now, expected_symbol=None):
         if not timedelta(seconds=-5) <= now - risk_stamp <= timedelta(seconds=30):
             raise ValueError("Stale risk metadata")
         cleaned.update(schema_version=3, as_of=as_of.isoformat(), broker_utc_offset_minutes=offset, timeframes=clean_frames, risk_context={**risk, "as_of": risk_stamp.isoformat()})
+    if "session_context" in payload:
+        from bot import trade_timing
+        session = payload["session_context"]
+        if (type(session) is not dict or set(session) != trade_timing.SESSION_FIELDS
+                or session.get("source") != trade_timing.SESSION_SOURCE or session.get("verified") is not True):
+            raise ValueError("Invalid verified broker session metadata")
+        captured, opened, closed = (_utc(session[key]) for key in ("as_of", "session_open", "session_close"))
+        if (not timedelta(0) <= now - captured <= timedelta(seconds=30)
+                or not opened <= captured < closed or not timedelta(0) < closed-opened <= timedelta(days=7)):
+            raise ValueError("Stale or invalid verified broker session")
+        cleaned["session_context"] = {**session, "as_of":captured.isoformat(),
+                                      "session_open":opened.isoformat(),"session_close":closed.isoformat()}
     return cleaned
 
 
@@ -728,6 +740,7 @@ async def setup(application):
         await journal_store.initialize_schema(pool)
         await trade_store.initialize_schema(pool)
         await manual_ticket_store.initialize_schema(pool)
+        await mt5_exit_events.initialize_schema(pool)
         service = MarketService(pool, application.bot.id)
         service.journal_enabled = True
         # Legacy automatic execution stays disabled. The separate Demo approval

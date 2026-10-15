@@ -1,5 +1,5 @@
 #property copyright "MT5 Bot"
-#property version   "2.16"
+#property version   "2.17"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 0
@@ -195,6 +195,111 @@ bool ParsePrice(const string text,double &value)
       || StringGetCharacter(text,length-1)=='.') return(false);
    value=StringToDouble(text);
    return(MathIsValidNumber(value) && value>=0.0 && value<10000000.0);
+  }
+
+// Read-only response to the Python helper's expiring, account-bound request.
+// No trading function is used. The broker's trade schedule supplies real ends.
+bool CurrentTradeSession(const datetime broker_now,long &opened,long &closed)
+  {
+   long starts[81],ends[81];
+   int count=0;
+   long today=(long)broker_now-(long)broker_now%86400;
+   for(int delta=-1;delta<=7;delta++)
+     {
+      long day=today+(long)delta*86400;
+      MqlDateTime parts;
+      if(!TimeToStruct((datetime)day,parts)) return(false);
+      for(uint index=0;index<=8;index++)
+        {
+         datetime from=0,to=0;
+         ResetLastError();
+         if(!SymbolInfoSessionTrade(_Symbol,(ENUM_DAY_OF_WEEK)parts.day_of_week,index,from,to))
+           {
+            int error=GetLastError();
+            if(error!=0 && error!=ERR_MARKET_SESSION_INDEX) return(false);
+            break;
+           }
+         long first=(long)from,last=(long)to;
+         if(index>=8 || count>=81 || first<0 || first>=86400
+            || last<0 || last>=172800) return(false);
+         // Some brokers publish an empty Saturday 00:00 -> 00:00 row.
+         // Equal endpoints provide no usable open interval; they never
+         // authorize trading, but must not invalidate other verified days.
+         if(first==last) continue;
+         if(last<first) last+=86400;
+         if(last<=first || last-first>86400) return(false);
+         starts[count]=day+first; ends[count]=day+last; count++;
+        }
+     }
+   opened=0; closed=0;
+   for(int i=0;i<count;i++)
+      if(starts[i]<=(long)broker_now && (long)broker_now<ends[i])
+        {
+         if(opened==0 || starts[i]<opened) opened=starts[i];
+         if(ends[i]>closed) closed=ends[i];
+        }
+   if(opened==0) return(false);
+   for(int pass=0;pass<count;pass++)
+     {
+      bool changed=false;
+      for(int i=0;i<count;i++)
+         if(starts[i]<=closed && ends[i]>=opened)
+           {
+            if(starts[i]<opened) { opened=starts[i]; changed=true; }
+            if(ends[i]>closed) { closed=ends[i]; changed=true; }
+           }
+      if(!changed) break;
+     }
+   return(closed>opened && closed-opened<=604800);
+  }
+
+void PublishTradeSession()
+  {
+   if(MQLInfoInteger(MQL_TESTER) || g_terminal_key=="" || g_account_changed
+      || AccountInfoInteger(ACCOUNT_LOGIN)!=g_session_login
+      || AccountInfoString(ACCOUNT_SERVER)!=g_session_server
+      || AccountInfoInteger(ACCOUNT_TRADE_MODE)!=ACCOUNT_TRADE_MODE_DEMO
+      || !TerminalInfoInteger(TERMINAL_CONNECTED) || !SymbolIsSynchronized(_Symbol)) return;
+   string request="MT5Bot\\session_request_"+g_terminal_key+".csv";
+   int handle=FileOpen(request,FILE_READ|FILE_BIN|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
+   if(handle==INVALID_HANDLE) return;
+   ulong size=FileSize(handle);
+   if(size<1 || size>2048) { FileClose(handle); return; }
+   uchar bytes[];
+   uint copied=FileReadArray(handle,bytes,0,(int)size);
+   bool unchanged=(FileSize(handle)==size && FileTell(handle)==size);
+   FileClose(handle);
+   if(copied!=size || !unchanged) return;
+   for(int i=0;i<(int)size;i++) if(bytes[i]<32 || bytes[i]>126) return;
+   string fields[];
+   if(StringSplit(CharArrayToString(bytes,0,(int)size,CP_UTF8),';',fields)!=8
+      || fields[0]!="1" || fields[1]!=_Symbol || fields[5]!=g_terminal_key
+      || !AccountBindingMatches(fields[6],fields[7])) return;
+   long observed=0,expires=0,offset=0;
+   if(!ParseInteger(fields[2],observed) || !ParseInteger(fields[3],expires)
+      || !ParseInteger(fields[4],offset,true) || offset < -720 || offset>840 || offset%15!=0) return;
+   datetime now=TimeGMT();
+   if(observed>(long)now || (long)now-observed>20 || expires<=observed
+      || expires>observed+20 || (long)now>=expires) return;
+   MqlTick quote;
+   if(!SymbolInfoTick(_Symbol,quote) || quote.time<=0
+      || MathAbs((double)((long)quote.time-((long)now+offset*60)))>10) return;
+   long opened=0,closed=0;
+   if(!CurrentTradeSession((datetime)((long)now+offset*60),opened,closed)) return;
+   opened-=offset*60; closed-=offset*60;
+   if(!AccountBindingMatches(fields[6],fields[7]) || TimeGMT()>=expires) return;
+   string row="1;"+_Symbol+";"+IntegerToString((long)now)+";"
+              +IntegerToString((long)MathMin(expires,(long)now+15))+";"
+              +IntegerToString(offset)+";"+IntegerToString(opened)+";"
+              +IntegerToString(closed)+";"+g_terminal_key+";"+fields[6]+";"+fields[7];
+   string target="MT5Bot\\sessions_"+g_terminal_key+".csv";
+   // A bounded reader rejects any incomplete concurrent write.
+   handle=FileOpen(target,FILE_WRITE|FILE_BIN|FILE_COMMON|FILE_SHARE_READ);
+   if(handle==INVALID_HANDLE) return;
+   uchar output[];
+   int length=StringToCharArray(row,output,0,WHOLE_ARRAY,CP_UTF8)-1;
+   if(length>0 && length<=2048) { FileWriteArray(handle,output,0,length); FileFlush(handle); }
+   FileClose(handle);
   }
 
 bool OnTickGrid(const double price,const double tick,const int digits)
@@ -630,7 +735,7 @@ bool DrawPanel(const bool active,const string message)
    color live_color=telemetry ? C'77,216,164' : C'238,190,97';
    string clock=TimeToString(now,TIME_SECONDS)+" UTC";
    PanelTextFit(18,13,_Symbol,width-180,20,clrWhite,true);
-   if(width>=300) PanelText(168,20,"2.16",8,C'143,162,188');
+   if(width>=300) PanelText(168,20,"2.17",8,C'143,162,188');
    string account_label=AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_DEMO ? "Demo" : "Demo required";
    PanelTextFit(18,47,"Chart "+ViewPeriodName(_Period)+"  |  "+account_label,width-160,9,C'143,162,188');
 
@@ -869,8 +974,9 @@ int OnInit()
    int instance=0;
    do { g_prefix=base+IntegerToString(instance)+"_"; instance++; }
    while(ObjectFind(0,g_prefix+"status")>=0 || ObjectFind(0,g_prefix+"panel")>=0);
-   IndicatorSetString(INDICATOR_SHORTNAME,"MT5 Bot Panel 2.16");
+   IndicatorSetString(INDICATOR_SHORTNAME,"MT5 Bot Panel 2.17");
    if(!EventSetTimer(1)) return(INIT_FAILED);
+   PublishTradeSession();
    UpdateOverlay();
    return(INIT_SUCCEEDED);
   }
@@ -883,7 +989,7 @@ void OnDeinit(const int reason)
    ChartRedraw(0);
   }
 
-void OnTimer() { UpdateOverlay(); }
+void OnTimer() { PublishTradeSession(); UpdateOverlay(); }
 
 void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam)
   {

@@ -4,20 +4,22 @@ This workflow lets the paired owner choose **Accept** or **Decline** beneath a
 current Telegram opportunity. Accept authorizes one market-order attempt on
 the bound Demo terminal, at exactly 0.01 lots, with the proposal's fixed SL and
 primary TP attached in the initial order. The market fill can differ from the
-reference entry. TP2 remains informational; this helper does not split positions
-or manage an existing trade.
+reference entry. TP2 remains informational. A new full FOK fill owned by this
+helper gets a durable timed exit: one hour from its broker fill time, capped by
+the frozen session safety limit. Existing or manually opened positions are never
+adopted. An uncertain or partial close is reported for attention and never retried.
 
 The current strategy uses M30 for trend and observed support/resistance, M15 for
 confirmation, and M5/M1 for entry timing. H1 and H4 are not read, hashed or required.
 Each of the four streams needs 22 real completed bars, including earlier
 sessions. Indicators use the actual broker bar sequence without filling or
 modifying any candle. Timestamp gaps are preserved as history diagnostics;
-they no longer discard older bars from warmup. The v6
-qualified and v7 experimental identities reject earlier H1 and five-frame proposals
+they no longer discard older bars from warmup. The v8
+qualified and v9 experimental identities reject earlier untimed M30, H1 and five-frame proposals
 and qualification artifacts. M30 levels use its last 20 completed bars and carry
 `levels_timeframe: M30` in the context contract.
 
-Use display indicator 2.16 for the four-frame panel. It shows the live connection,
+Use display indicator 2.17 for the four-frame panel. It shows the live connection,
 M30/M15/M5/M1 closed-candle readiness and the specific warmup count, plus only
 those four chart-view buttons. A full 22/22 readiness tile means history is
 available, not that a signal or order has been approved. Telegram Accept remains

@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from bot import mtf_runtime, multi_timeframe, strategy_evidence
+from bot import mtf_runtime, multi_timeframe, strategy_evidence, trade_timing
 from tests import test_multi_timeframe as candle_fixtures
 from tests import test_strategy_evidence as evidence_fixtures
 
@@ -164,9 +164,10 @@ class MtfRuntimeTests(unittest.TestCase):
                 updated = deepcopy(self.feed)
                 updated["as_of"] = updated["risk_context"]["as_of"] = clock.isoformat()
                 updated["quote"]["time"] = clock.isoformat()
+                updated["session_context"]["as_of"] = clock.isoformat()
                 with self.subTest(seconds=seconds), patch.object(mtf_runtime, "_clock", return_value=clock):
                     analyzed = multi_timeframe.analyze_multi_timeframe(updated, clock)
-                    self.assertEqual(analyzed["state"], "signal", analyzed)
+                    self.assertEqual(analyzed["state"], "signal" if seconds <= 10 else "blocked", analyzed)
                     result = mtf_runtime.evaluate_feed(updated, clock)
                     if seconds <= 10:
                         self.assertEqual(result["state"], "signal", result)
@@ -177,6 +178,27 @@ class MtfRuntimeTests(unittest.TestCase):
                         self.assertFalse(mtf_runtime.eligible_payload(dict(original, workflow="manual_ticket"), updated, clock))
                         for key in ("direction", "entry", "stop", "target", "qualification_id"):
                             self.assertNotIn(key, result)
+
+    def test_frozen_timing_plan_and_m30_target_path_cannot_be_changed(self):
+        with pinned_synthetic_evidence(self.feed, self.now):
+            original = self.qualified()
+            for field, value in (("max_hold_seconds", 7200), ("exit_buffer_seconds", 0),
+                                 ("latest_exit_at", (self.now + timedelta(hours=2)).isoformat()),
+                                 ("session_source", "guessed_hours")):
+                changed = deepcopy(original)
+                changed["trade_timing"][field] = value
+                self.assertFalse(mtf_runtime.eligible_result(changed, self.now), field)
+            for level in (original["entry"], original["target"], (original["entry"] + original["target"]) / 2):
+                changed = deepcopy(original)
+                changed["timeframe_context"]["resistance"] = level
+                self.assertFalse(mtf_runtime.eligible_result(changed, self.now), level)
+            changed = deepcopy(original)
+            changed.pop("trade_timing")
+            self.assertFalse(mtf_runtime.eligible_result(changed, self.now))
+            changed = deepcopy(original)
+            changed["trade_timing"] = trade_timing.build_trade_timing(self.feed["session_context"], self.now, self.now, 30)
+            changed["deadline"] = changed["trade_timing"]["latest_exit_at"]
+            self.assertFalse(mtf_runtime.eligible_result(changed, self.now), "qualified profile cannot carry experimental window")
 
     def test_future_original_decision_cannot_enter_the_actionable_window(self):
         with pinned_synthetic_evidence(self.feed, self.now):

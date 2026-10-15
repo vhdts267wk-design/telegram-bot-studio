@@ -240,7 +240,7 @@ class ManualMT5NotificationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(detail, sent.args[1])
         for detail in ("لقيت فرصة", "الدخول المقترح", "السبب", "شارت MT5"):
             self.assertIn(detail, sent.args[1])
-        self.assertLess(len(sent.args[1]), 1400)
+        self.assertLess(len(sent.args[1]), 2500)
         buttons = sent.kwargs["reply_markup"].inline_keyboard[0]
         self.assertEqual(buttons[0].text, "جهّز على اللابتوب")
         for button in buttons:

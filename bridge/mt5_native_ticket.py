@@ -92,9 +92,9 @@ def require_qualified(draft, now):
     """Require one complete Demo profile before any native window action."""
     experimental = draft.signal_mode == "experimental_demo"
     if (
-        draft.display_timeframe != "M1" or draft.strategy_id != ("mtf-ema-pullback-60m-demo-v7" if experimental else "mtf-ema-pullback-60m-v6")
-        or type(draft.strategy_version) is not int or draft.strategy_version != (7 if experimental else 6)
-        or draft.policy_id != ("mtf-manual-demo-estimated-cost-risk-v7" if experimental else "mtf-manual-demo-cost-risk-v6")
+        draft.display_timeframe != "M1" or draft.strategy_id != ("mtf-ema-pullback-60m-demo-v9" if experimental else "mtf-ema-pullback-60m-v8")
+        or type(draft.strategy_version) is not int or draft.strategy_version != (9 if experimental else 8)
+        or draft.policy_id != ("mtf-manual-demo-estimated-cost-risk-v9" if experimental else "mtf-manual-demo-cost-risk-v8")
         or type(draft.horizon_seconds) is not int or draft.horizon_seconds != 3600
         or type(draft.strategy_fingerprint) is not str or re.fullmatch(r"[0-9a-f]{64}", draft.strategy_fingerprint) is None
         or type(draft.entry_window_seconds) is not int or draft.entry_window_seconds != (30 if experimental else 10)

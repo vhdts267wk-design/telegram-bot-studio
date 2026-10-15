@@ -22,7 +22,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import CallbackQueryHandler, CommandHandler
 
-from bot import manual_ticket_store, market_monitor, market_store, mtf_presentation, mtf_runtime, proposal_overlay, trade_store
+from bot import manual_ticket_store, market_monitor, market_store, mt5_exit_events, mtf_presentation, mtf_runtime, proposal_overlay, trade_store
 
 
 logger = logging.getLogger(__name__)
@@ -457,7 +457,7 @@ def _offer_text(payload, expires_at) -> str:
         f"إشارة MT5 تحتاج موافقتك — {payload['symbol']}\n"
         f"{payload['direction']} | الحساب: {mode} | الحجم: {payload['volume']:g} lot\n"
         f"دخول مرجعي: {payload['entry']:.{digits}f}\nوقف: {payload['stop']:.{digits}f}\nهدف: {payload['target']:.{digits}f}\n"
-        f"صلاحية الموافقة حتى: {_utc(expires_at):%Y-%m-%d %H:%M:%S} UTC\n"
+        f"صلاحية الموافقة حتى: {mtf_presentation.lebanon_time(expires_at)}\n"
         "Accept يضع طلباً موافقاً عليه في قائمة التنفيذ على جهازك؛ لا يؤكد تعبئة الصفقة. Reject يرفض الطلب.\n"
         "سعر الدخول المعروض مرجعي. إذا تغير السعر بأكثر من 0.1R يُرفض التنفيذ؛ تُراجع إعدادات الحساب والحجم محلياً."
     )
@@ -470,6 +470,7 @@ def _manual_offer_text(payload, expires_at, *, demo=False) -> str:
     experimental = mtf_runtime.is_experimental_result(payload)
     direction = "شراء BUY" if payload["direction"] == "BUY" else "بيع SELL"
     seconds = mtf_runtime.entry_window_seconds(payload)
+    timing = mtf_presentation.timing_lines(payload, expires_at=expires_at, demo_execution=demo)
     lines = [
         f"🔔 لقيت فرصة على الذهب — {payload['symbol']} | {direction}",
         "Demo تجريبي — الأداء غير مثبت؛ التكاليف افتراضات تقديرية غير موثّقة." if experimental
@@ -480,7 +481,7 @@ def _manual_offer_text(payload, expires_at, *, demo=False) -> str:
         f"الحجم: {payload['volume']:g} lot | العائد/المخاطرة بعد التكاليف: {payload['effective_reward_risk']:.2f}:1.",
         *mtf_presentation.context_lines(payload, digits),
         "السبب: M30 اتجاه عام، M15 تأكيد، M5/M1 دخول؛ اجتازت فلاتر المخاطر والسبريد.",
-        f"مهلة الدخول: {seconds} ثانية من إغلاق M1؛ آخر وقت {'للتنفيذ' if demo else 'للتجهيز'}: {_utc(expires_at):%H:%M:%S} UTC.",
+        *(timing or [f"مهلة الدخول: {seconds} ثانية من إغلاق M1؛ آخر وقت للدخول: {mtf_presentation.lebanon_time(expires_at)}."]),
     ]
     if experimental:
         costs = payload["cost_assumptions"]
@@ -613,9 +614,10 @@ def _result_text(offer) -> str:
                 text += f"\n{label}: {value}"
         if result.get("executed_at") is not None:
             try:
-                text += f"\nوقت التنفيذ: {_utc(result['executed_at']):%Y-%m-%d %H:%M:%S} UTC"
+                text += f"\nوقت تأكيد التنفيذ: {mtf_presentation.lebanon_time(result['executed_at'])}"
             except (TypeError, ValueError, OverflowError):
                 pass
+        text += "\n" + "\n".join(mtf_presentation.timing_lines(payload, demo_execution=payload.get("workflow") == "demo_execution", include_entry=False))
     return text
 
 
@@ -636,7 +638,10 @@ def _manual_result_text(offer, now) -> str:
     else:
         heading = "حالة تجهيز نافذة الصفقة غير مؤكدة؛ تحقق من MT5 على اللابتوب قبل أي إجراء. لا تُجرى إعادة تجهيز تلقائية."
     payload = offer["payload"]
-    return heading + f"\n{payload['direction']} — {payload['symbol']} | Demo | الحجم: {_positive(payload['volume']):g} lot"
+    text = heading + f"\n{payload['direction']} — {payload['symbol']} | Demo | الحجم: {_positive(payload['volume']):g} lot"
+    if status == "prepared" and not _manual_entry_window_expired(offer, status, now):
+        text += "\n" + "\n".join(mtf_presentation.timing_lines(payload))
+    return text
 
 
 async def send_results(service, bot):
@@ -670,6 +675,8 @@ async def send_results(service, bot):
             return False
         except Exception as error:
             logger.warning("MT5 execution notification failed (%s).", type(error).__name__)
+    if _demo_enabled(service):
+        return await mt5_exit_events.send_notifications(service, bot, market_monitor.utc_now)
     return True
 
 

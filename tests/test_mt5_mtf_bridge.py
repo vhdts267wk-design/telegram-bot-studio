@@ -253,8 +253,8 @@ class QualifiedNativeTests(unittest.TestCase):
         self.time = self.now.now
         self.draft = native.Draft("XAUUSD", "BUY", Decimal("0.01"), Decimal("2490"), Decimal("2520"), 2,
                                   self.time + timedelta(minutes=5), display_timeframe="M1",
-                                  strategy_id="mtf-ema-pullback-60m-v6", strategy_version=6,
-                                  policy_id="mtf-manual-demo-cost-risk-v6", horizon_seconds=3600,
+                                  strategy_id="mtf-ema-pullback-60m-v8", strategy_version=8,
+                                  policy_id="mtf-manual-demo-cost-risk-v8", horizon_seconds=3600,
                                   strategy_fingerprint="a" * 64, qualification_id="b" * 64,
                                   direction_bar_time=self.time - timedelta(minutes=15),
                                   confirmation_bar_time=self.time - timedelta(minutes=5),

@@ -38,7 +38,7 @@ class ExperimentalMtfTests(unittest.TestCase):
             result = self.evaluate()
             self.assertEqual(result["state"], "signal", result)
             self.assertEqual((result["strategy_id"], result["strategy_version"], result["policy_id"]),
-                             (mtf.EXPERIMENTAL_STRATEGY_ID, 7, mtf.EXPERIMENTAL_POLICY_ID))
+                             (mtf.EXPERIMENTAL_STRATEGY_ID, 9, mtf.EXPERIMENTAL_POLICY_ID))
             self.assertTrue(result["provisional"])
             self.assertEqual(result["signal_mode"], "experimental_demo")
             self.assertEqual(result["entry_window_seconds"], 30)
@@ -79,7 +79,7 @@ class ExperimentalMtfTests(unittest.TestCase):
                     self.assertFalse(mtf_runtime.eligible_payload(original, changed, self.now))
                     del changed["timeframes"][frame]
                     self.assertFalse(mtf_runtime.eligible_payload(original, changed, self.now))
-                for version in (3, 5):
+                for version in (3, 5, 7):
                     legacy = deepcopy(original)
                     legacy.update(strategy_id=f"mtf-ema-pullback-60m-demo-v{version}", strategy_version=version,
                                   policy_id=f"mtf-manual-demo-estimated-cost-risk-v{version}")

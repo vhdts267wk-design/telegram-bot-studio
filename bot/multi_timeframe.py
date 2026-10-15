@@ -17,14 +17,14 @@ import re
 from statistics import median
 from types import MappingProxyType
 
-from bot import paper_signals
+from bot import paper_signals, trade_timing
 
-STRATEGY_ID = "mtf-ema-pullback-60m-v6"
-STRATEGY_VERSION = 6
-POLICY_ID = "mtf-manual-demo-cost-risk-v6"
-EXPERIMENTAL_STRATEGY_ID = "mtf-ema-pullback-60m-demo-v7"
-EXPERIMENTAL_STRATEGY_VERSION = 7
-EXPERIMENTAL_POLICY_ID = "mtf-manual-demo-estimated-cost-risk-v7"
+STRATEGY_ID = "mtf-ema-pullback-60m-v8"
+STRATEGY_VERSION = 8
+POLICY_ID = "mtf-manual-demo-cost-risk-v8"
+EXPERIMENTAL_STRATEGY_ID = "mtf-ema-pullback-60m-demo-v9"
+EXPERIMENTAL_STRATEGY_VERSION = 9
+EXPERIMENTAL_POLICY_ID = "mtf-manual-demo-estimated-cost-risk-v9"
 EXPERIMENTAL_SIGNAL_MODE = "experimental_demo"
 HORIZON_SECONDS = 3600
 LOOKBACK_BARS = 64
@@ -49,6 +49,8 @@ POLICY = MappingProxyType({
     "higher_context": "closed_M30_must_agree_with_M15_ema_slope_close",
     "higher_context_min_ema_separation_atr": "0.05",
     "m30_level_bars": 20, "m30_levels": "completed_real_bar_range_extrema",
+    "m30_target_path": "reject_known_opposing_level_between_entry_and_tp1_inclusive_v1",
+    "m30_range_break_confirmation": "latest_completed_M1_close_strictly_beyond_range_extreme_v1",
     "candle_grid": "verified_broker_offset_minutes",
     "swing_m5_bars": 5, "stop_buffer_m5_atr": "0.2",
     "target_r": "2", "target2_r": "3", "min_effective_reward_risk": "1.5",
@@ -57,6 +59,10 @@ POLICY = MappingProxyType({
     "max_equity_risk_fraction": "0.01", "minimum_free_margin_multiple": "2",
     "volume": "0.01", "maximum_open_positions": 0, "maximum_pending_orders": 0,
     "session_start_utc_hour": 6, "session_end_utc_hour": 19, "weekdays_only": True,
+    "session_policy_id": trade_timing.POLICY_ID,
+    "verified_broker_session_required": True,
+    "max_hold_seconds": trade_timing.MAX_HOLD_SECONDS,
+    "broker_session_exit_buffer_seconds": trade_timing.EXIT_BUFFER_SECONDS,
     "max_entry_delay_seconds": 10,
     "entry_rounding": "adverse_tick", "protection_rounding": "outward_tick",
     "cost_policy": "verified_round_trip_commission_and_per_side_slippage_v1",
@@ -103,6 +109,7 @@ def _fingerprint(experimental_demo=False):
         "policy": dict(EXPERIMENTAL_POLICY if experimental_demo else POLICY),
         "implementation_sha256": hashlib.sha256(Path(__file__).read_bytes().replace(b"\r\n", b"\n")).hexdigest(),
         "indicator_dependency_sha256": hashlib.sha256(Path(paper_signals.__file__).read_bytes().replace(b"\r\n", b"\n")).hexdigest(),
+        "timing_dependency_sha256": hashlib.sha256(Path(trade_timing.__file__).read_bytes().replace(b"\r\n", b"\n")).hexdigest(),
     }
     encoded = json.dumps(components, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -265,6 +272,33 @@ def _timeframe_context(bars, indicators, bid, ask):
             "resistance": resistance if Decimal(str(resistance)) >= midpoint else None}
 
 
+def target_crosses_m30_level(direction, entry, target, timeframe_context):
+    """Reject a fixed TP1 that requires crossing an already known M30 level.
+
+    An absent opposing level means the executable price has already broken
+    beyond the closed range. Levels at entry or TP1 count as an obstruction.
+    This is a structural filter, not a prediction that a level will hold.
+    """
+    if direction not in {"BUY", "SELL"} or type(timeframe_context) is not dict:
+        raise _Invalid("invalid_target_path")
+    clean_entry, clean_target = _decimal(entry), _decimal(target)
+    level = timeframe_context["resistance" if direction == "BUY" else "support"]
+    if level is None:
+        return False
+    opposing = _decimal(level)
+    return (clean_entry <= opposing <= clean_target if direction == "BUY"
+            else clean_target <= opposing <= clean_entry)
+
+
+def unconfirmed_m30_break(direction, entry, latest_closed_price, opposing_level):
+    """A live quote crossing the closed M30 range cannot confirm its own break."""
+    if direction not in {"BUY", "SELL"}:
+        raise _Invalid("invalid_target_path")
+    price, closed, level = (_decimal(value) for value in (entry, latest_closed_price, opposing_level))
+    return (price > level and closed <= level if direction == "BUY"
+            else price < level and closed >= level)
+
+
 def _execution(value):
     if type(value) is not dict or set(value) != {"tick_size", "point", "digits", "stops_level"}:
         raise _Invalid("invalid_execution_metadata")
@@ -412,10 +446,12 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
             return result("blocked", "existing_exposure", counts=counts)
         if risk["free_margin"] < Decimal("2") * risk["margin_required"]:
             return result("blocked", "insufficient_free_margin", counts=counts)
-        session_start = clock.replace(hour=6, minute=0, second=0, microsecond=0)
-        session_end = clock.replace(hour=19, minute=0, second=0, microsecond=0)
-        if clock.weekday() >= 5 or clock < session_start or clock + timedelta(seconds=HORIZON_SECONDS + (30 if experimental_demo else 10)) > session_end:
-            return result("blocked", "outside_full_horizon_session", counts=counts)
+        try:
+            timing_plan = trade_timing.build_trade_timing(
+                feed.get("session_context"), clock, trigger_close, 30 if experimental_demo else 10,
+            )
+        except trade_timing.TradeTimingError as error:
+            return result("blocked", error.reason, counts=counts)
         if any(not math.isfinite(item["atr"]) or item["atr"] <= 0 for item in indicators.values()):
             return result("no_signal", "flat_atr", counts=counts)
         if any(item["latest_true_range"] > 3 * item["atr"] for item in indicators.values()):
@@ -469,6 +505,12 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
         if volume_reference <= 0 or current1["tick_volume"] < 0.5 * volume_reference:
             return result("blocked", "low_tick_activity", counts=counts)
         entry = _grid(ask if buy else bid, tick, up=buy)
+        opposing_key = "resistance" if buy else "support"
+        opposing_level = (max(bar["high"] for bar in bars["M30"][-20:]) if buy
+                          else min(bar["low"] for bar in bars["M30"][-20:]))
+        if (context["timeframe_context"][opposing_key] is None
+                and unconfirmed_m30_break(direction, _price_number(entry), current1["close"], opposing_level)):
+            return result("blocked", "m30_break_not_confirmed", counts=counts)
         swing = min(bar["low"] for bar in bars["M5"][-5:]) if buy else max(bar["high"] for bar in bars["M5"][-5:])
         buffer = Decimal(str(confirmation["atr"])) * Decimal("0.2")
         stop = _grid(Decimal(str(swing)) - sign * buffer, tick, up=not buy)
@@ -480,6 +522,9 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
             return result("blocked", "excessive_or_unknown_spread", counts=counts)
         target = _grid(entry + sign * Decimal("2") * risk_distance, tick, up=buy)
         target2 = _grid(entry + sign * Decimal("3") * risk_distance, tick, up=buy)
+        if target_crosses_m30_level(direction, _price_number(entry), _price_number(target),
+                                   context["timeframe_context"]):
+            return result("blocked", "m30_level_blocks_target", counts=counts)
         distance = point * stops
         if (
             not (stop < bid <= ask < target if buy else target < bid <= ask < stop)
@@ -512,7 +557,7 @@ def _analyze_multi_timeframe(feed, now=None, *, research_only=False, experimenta
             direction_bar_time=bars["M15"][-1]["time"].isoformat(),
             confirmation_bar_time=current5["time"].isoformat(),
             decision_time=clock.isoformat(), quote_time=_utc(quote["time"]).isoformat(),
-            deadline=(clock + timedelta(seconds=HORIZON_SECONDS)).isoformat(),
+            deadline=timing_plan["latest_exit_at"], trade_timing=timing_plan,
             nominal_reward_risk=float(abs(target - entry) / risk_distance),
             effective_reward_risk=round(float(effective_rr), 6),
             estimated_loss_cash=round(float(stop_cash), 6), estimated_cost_cash=round(float(cost_cash), 6),

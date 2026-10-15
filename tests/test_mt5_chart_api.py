@@ -126,6 +126,7 @@ class ChartAPITests(unittest.IsolatedAsyncioTestCase):
             self.snapshot["payload"]["quote"]["time"] = later.isoformat()
             self.snapshot["payload"]["as_of"] = later.isoformat()
             self.snapshot["payload"]["risk_context"]["as_of"] = later.isoformat()
+            self.snapshot["payload"]["session_context"]["as_of"] = later.isoformat()
             with patch.object(mt5_api, "now_utc", return_value=later):
                 self.assertEqual((await self.chart()).json(), {"proposal": None})
 

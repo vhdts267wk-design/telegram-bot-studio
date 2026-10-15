@@ -32,6 +32,10 @@ class MultiTimeframeTests(unittest.TestCase):
             if name == "M5" and count >= 2:
                 bars[-2].update(open=1999.7, high=1999.95, low=1999.3, close=1999.8)
                 bars[-1].update(open=1999.8, high=2000.15, low=1999.65, close=2000.0)
+            if name == "M30" and count >= 10:
+                # Keep the known opposing range level beyond the fixed TP1.
+                # Tests of obstructions replace this one real closed wick.
+                bars[-10]["high"] = 2010.0
             if sell:
                 for bar in bars:
                     bar.update(open=round(4000 - bar["open"], 6),
@@ -44,6 +48,11 @@ class MultiTimeframeTests(unittest.TestCase):
             "timeframe": "M15", "as_of": now.isoformat(), "broker_utc_offset_minutes": broker_offset,
             "quote": {"bid": 1999.997 if sell else 2000.001,
                       "ask": 1999.999 if sell else 2000.003, "time": now.isoformat()},
+            "session_context": {
+                "source": "mt5_symbol_info_session_trade", "verified": True, "as_of": now.isoformat(),
+                "session_open": now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(),
+                "session_close": (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).isoformat(),
+            },
             "execution": {"tick_size": 0.001, "point": 0.001, "digits": 3, "stops_level": 5},
             "timeframes": frames, "candles": deepcopy(frames["M15"]),
             "risk_context": {
@@ -79,7 +88,9 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assertEqual(result["direction_bar_time"], feed["timeframes"]["M15"][-1]["time"])
         self.assertEqual(result["confirmation_bar_time"], feed["timeframes"]["M5"][-1]["time"])
         self.assertEqual(result["display_timeframe"], "M1")
-        self.assertEqual(result["deadline"], (self.now + timedelta(hours=1)).isoformat())
+        self.assertEqual(result["deadline"], (self.now + timedelta(hours=1, seconds=10)).isoformat())
+        self.assertEqual(result["trade_timing"]["entry_deadline"], (self.now + timedelta(seconds=10)).isoformat())
+        self.assertEqual(result["trade_timing"]["max_hold_seconds"], 3600)
         self.assertEqual(result["horizon_seconds"], 3600)
         self.assertEqual(result["broker_fingerprint"], "a" * 64)
         self.assertIs(result["provisional"], False)
@@ -100,6 +111,69 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assertEqual(Decimal(str(result["stop"])) - Decimal(str(result["entry"])), risk)
         self.assertEqual(Decimal(str(result["entry"])) - Decimal(str(result["target"])), 2 * risk)
         self.assertEqual(result["nominal_reward_risk"], 2)
+
+    def test_known_m30_level_inside_fixed_target_path_blocks_both_directions(self):
+        for sell in (False, True):
+            feed = self.feed(sell=sell)
+            for bar in feed["timeframes"]["M30"]:
+                if sell:
+                    bar["low"] = max(bar["low"], 1999.7)
+                else:
+                    bar["high"] = min(bar["high"], 2000.3)
+            result = self.analyze(feed)
+            self.assert_waiting(result, "blocked", "m30_level_blocks_target")
+            for field in ("stop", "target", "target2", "entry_zone_low", "entry_zone_high"):
+                self.assertNotIn(field, result)
+
+    def test_target_path_is_inclusive_at_entry_and_tp1_and_does_not_move_targets(self):
+        for direction, entry, target, key in (("BUY", 2000.0, 2002.0, "resistance"),
+                                               ("SELL", 2000.0, 1998.0, "support")):
+            for level in (entry, target, 2000.5 if direction == "BUY" else 1999.5):
+                self.assertTrue(mtf.target_crosses_m30_level(direction, entry, target, {key: level}))
+            for level in (None, 2002.001 if direction == "BUY" else 1997.999):
+                self.assertFalse(mtf.target_crosses_m30_level(direction, entry, target, {key: level}))
+
+    def test_reported_oct14_sell_is_rejected_by_preexisting_m30_support(self):
+        self.assertTrue(mtf.target_crosses_m30_level(
+            "SELL", 4090.08, 4049.35, {"support": 4079.28},
+        ))
+        self.assertTrue(mtf.target_crosses_m30_level(
+            "SELL", 4093.83, 4063.09, {"support": 4079.28},
+        ))
+
+    def test_live_quote_only_m30_break_waits_for_completed_m1_close_both_directions(self):
+        for sell, experimental in ((False, False), (True, False), (False, True), (True, True)):
+            feed = self.feed(sell=sell)
+            def evaluate():
+                return mtf.analyze_multi_timeframe(feed, self.now, experimental_demo=experimental)
+            level = 1999.998 if sell else 2000.002
+            for bar in feed["timeframes"]["M30"]:
+                if sell:
+                    bar["low"] = max(bar["low"], level)
+                else:
+                    bar["high"] = min(bar["high"], level)
+            feed["quote"].update(bid=1999.995 if sell else 2000.003,
+                                 ask=1999.997 if sell else 2000.005)
+            # The live quote and even an M1 wick crossed the range, but its
+            # completed close still has to confirm that opposing level.
+            result = evaluate()
+            self.assert_waiting(result, "blocked", "m30_break_not_confirmed")
+            self.assertIsNone(result["timeframe_context"]["support" if sell else "resistance"])
+            feed["timeframes"]["M1"][-1]["close"] = level
+            self.assert_waiting(evaluate(), "blocked", "m30_break_not_confirmed")
+            feed["timeframes"]["M1"][-1]["close"] = 1999.996 if sell else 2000.004
+            result = evaluate()
+            self.assertEqual(result["state"], "signal", result)
+            self.assertEqual(result["direction"], "SELL" if sell else "BUY")
+            self.assertEqual(result["nominal_reward_risk"], 2)
+
+    def test_m30_break_confirmation_is_strict_and_a_quote_alone_is_insufficient(self):
+        for direction, price, before, after in (("BUY", 2001.0, 1999.0, 2000.001),
+                                                ("SELL", 1999.0, 2001.0, 1999.999)):
+            for close in (before, 2000.0):
+                self.assertTrue(mtf.unconfirmed_m30_break(direction, price, close, 2000.0))
+            self.assertFalse(mtf.unconfirmed_m30_break(direction, price, after, 2000.0))
+            self.assertFalse(mtf.unconfirmed_m30_break(direction, 2000.0, before, 2000.0))
 
     def test_four_frame_context_is_qualitative_and_m30_levels_use_only_recent_closed_range(self):
         for sell in (False, True):
@@ -138,7 +212,7 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assertEqual(result["state"], "signal", result)
         self.assertEqual(result["timeframe_context"]["levels_timeframe"], "M30")
         self.assertEqual(set(result["context_bar_times"]), {"M30"})
-        self.assertEqual(result["strategy_version"], 6)
+        self.assertEqual(result["strategy_version"], 8)
         feed["timeframes"]["M30"].pop(0)
         self.assert_waiting(self.analyze(feed), "warmup", "insufficient_closed_history")
         legacy = self.feed()
@@ -362,15 +436,17 @@ class MultiTimeframeTests(unittest.TestCase):
             feed["risk_context"]["as_of"] = (self.now - timedelta(seconds=seconds)).isoformat()
             self.assert_waiting(self.analyze(feed), "blocked", "stale_risk_context")
 
-    def test_m1_timing_75_seconds_boundary_and_higher_frame_no_lookahead(self):
-        for seconds, state in ((75, "signal"), (76, "stale")):
+    def test_m1_timing_75_seconds_bound_still_rejects_expired_entry_window(self):
+        for seconds, state in ((75, "blocked"), (76, "stale")):
             clock = self.now + timedelta(seconds=seconds)
             feed = self.feed()
             feed["as_of"] = clock.isoformat()
             feed["risk_context"]["as_of"] = clock.isoformat()
             feed["quote"]["time"] = clock.isoformat()
+            feed["session_context"]["as_of"] = clock.isoformat()
             result = self.analyze(feed, now=clock)
             self.assertEqual(result["state"], state, result)
+            self.assertEqual(result["reason"], "entry_window_expired" if seconds == 75 else "stale_m1_timing")
         feed = self.feed()
         for bar in feed["timeframes"]["M1"]:
             bar["time"] = (datetime.fromisoformat(bar["time"]) - timedelta(minutes=1)).isoformat()
@@ -500,8 +576,8 @@ class MultiTimeframeTests(unittest.TestCase):
     def test_session_requires_weekday_and_whole60_minute_horizon_before19utc(self):
         for stamp, expected in (("2026-10-06T05:59:00+00:00", "blocked"),
                                 ("2026-10-06T06:00:00+00:00", "signal"),
-                                ("2026-10-06T17:59:50+00:00", "signal"),
-                                ("2026-10-06T17:59:51+00:00", "blocked"),
+                                ("2026-10-06T17:59:10+00:00", "signal"),
+                                ("2026-10-06T17:59:11+00:00", "blocked"),
                                 ("2026-10-06T18:00:00+00:00", "blocked"),
                                 ("2026-10-10T12:30:00+00:00", "blocked")):
             clock = datetime.fromisoformat(stamp)
@@ -548,8 +624,8 @@ class MultiTimeframeTests(unittest.TestCase):
 
     def test_policy_identity_is_detached_and_hash_ignores_crlf_conversion(self):
         identity = mtf.strategy_identity()
-        self.assertEqual(identity["strategy_id"], "mtf-ema-pullback-60m-v6")
-        self.assertEqual(identity["policy_id"], "mtf-manual-demo-cost-risk-v6")
+        self.assertEqual(identity["strategy_id"], "mtf-ema-pullback-60m-v8")
+        self.assertEqual(identity["policy_id"], "mtf-manual-demo-cost-risk-v8")
         self.assertRegex(identity["fingerprint"], r"^[0-9a-f]{64}$")
         identity["strategy_id"] = "forged"
         self.assertEqual(mtf.strategy_identity()["strategy_id"], mtf.STRATEGY_ID)

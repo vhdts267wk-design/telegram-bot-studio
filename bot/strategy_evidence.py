@@ -18,7 +18,7 @@ import re
 from types import MappingProxyType
 
 
-STRATEGY_ID = "mtf-ema-pullback-60m-v6"
+STRATEGY_ID = "mtf-ema-pullback-60m-v8"
 HORIZON_SECONDS = 3600
 MIN_OOS_TRADES = 200
 MIN_LOWER_BOUND = 0.70

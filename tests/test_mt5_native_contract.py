@@ -45,6 +45,15 @@ class NativeFourFrameContractTests(unittest.TestCase):
             with self.subTest(experimental=experimental), self.assertRaises(native.TicketError):
                 native.require_qualified(value, NOW)
 
+    def test_untimed_m30_profiles_cannot_prepare_a_ticket(self):
+        for experimental in (False, True):
+            value = replace(draft(experimental=experimental),
+                            strategy_id="mtf-ema-pullback-60m-demo-v7" if experimental else "mtf-ema-pullback-60m-v6",
+                            strategy_version=7 if experimental else 6,
+                            policy_id="mtf-manual-demo-estimated-cost-risk-v7" if experimental else "mtf-manual-demo-cost-risk-v6")
+            with self.subTest(experimental=experimental), self.assertRaises(native.TicketError):
+                native.require_qualified(value, NOW)
+
     def test_prior_h1_profiles_cannot_prepare_a_ticket_with_new_m30_context(self):
         for experimental in (False, True):
             value = replace(draft(experimental=experimental),

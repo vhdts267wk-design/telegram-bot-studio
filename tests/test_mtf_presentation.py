@@ -1,10 +1,10 @@
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import unittest
 from unittest.mock import patch
 
-from bot import mtf_presentation as presentation, mtf_runtime, multi_timeframe
+from bot import mtf_presentation as presentation, mtf_runtime, multi_timeframe, trade_timing
 from tests import test_mtf_runtime as fixtures
 from tests import test_multi_timeframe as candle_fixtures
 
@@ -22,6 +22,38 @@ class MtfPresentationTests(unittest.TestCase):
         result = mtf_runtime.evaluate_feed(self.feed if feed is None else feed, self.now)
         self.assertEqual(result["state"], "signal", result)
         return result
+
+    def test_lebanon_clock_includes_date_seconds_and_seasonal_offset(self):
+        self.assertEqual(presentation.lebanon_time("2026-10-14T13:56:00+00:00"),
+                         "2026-10-14 16:56:00 بتوقيت لبنان (UTC+03:00)")
+        self.assertEqual(presentation.lebanon_time("2026-01-14T13:56:30+00:00"),
+                         "2026-01-14 15:56:30 بتوقيت لبنان (UTC+02:00)")
+        self.assertIn("2026-10-15 01:30:00", presentation.lebanon_time("2026-10-14T22:30:00Z"))
+        with self.assertRaises(ValueError):
+            presentation.lebanon_time(datetime(2026, 10, 14, 13, 56))
+
+    def test_timing_plan_distinguishes_manual_exit_from_conditional_demo_guard(self):
+        decision = datetime(2026, 10, 14, 13, 56, tzinfo=timezone.utc)
+        plan = trade_timing.build_trade_timing({
+            "source": trade_timing.SESSION_SOURCE, "verified": True, "as_of": decision.isoformat(),
+            "session_open": "2026-10-14T00:00:00+00:00", "session_close": "2026-10-14T21:00:00+00:00",
+        }, decision, decision, 30)
+        payload = {"bar_time": (decision - timedelta(minutes=1)).isoformat(), "trade_timing": plan}
+        original = deepcopy(payload)
+        manual = "\n".join(presentation.timing_lines(payload))
+        for marker in ("2026-10-14 16:56:00", "2026-10-14 16:56:30", "2026-10-14 17:56:30",
+                       "60 دقيقة", "الخروج يدوي", "التنبيه وحده ما بيسكّرها", "15 دقيقة"):
+            self.assertIn(marker, manual)
+        demo = "\n".join(presentation.timing_lines(payload, demo_execution=True))
+        self.assertIn("فقط مع جسر Demo المحدث والمتصل", demo)
+        self.assertIn("انتظر تأكيد تفعيل", demo)
+        self.assertNotIn("الخروج يدوي", demo)
+        shorter = "\n".join(presentation.timing_lines(payload, expires_at=decision + timedelta(seconds=20)))
+        self.assertIn("2026-10-14 16:56:20", shorter)
+        self.assertEqual(payload, original)
+        invalid = deepcopy(payload); invalid["trade_timing"]["latest_exit_at"] = "2026-10-14T20:00:00+00:00"
+        self.assertEqual(presentation.timing_lines(invalid, demo_execution=True), [])
+        self.assertEqual(presentation.timing_lines({}), [])
 
     def test_unqualified_alignment_and_feed_confidence_never_display_trade(self):
         with fixtures.pinned_synthetic_evidence(self.feed, self.now):

@@ -30,15 +30,25 @@ class IndicatorContractTests(unittest.TestCase):
                 return self.source[start:index + 1]
         self.fail(f"Unclosed function: {declaration}")
 
-    def test_indicator_has_only_display_capabilities(self):
+    def test_indicator_has_only_display_and_bound_readonly_broker_metadata_capabilities(self):
         self.assertIn("#property indicator_chart_window", self.source)
         forbidden = r"\b(?:OrderSend|OrderSendAsync|OrderCheck|CTrade|WebRequest|SocketCreate|ShellExecuteW|FileWrite|FileDelete|FileMove|FileCopy|GlobalVariableSet|OBJ_BUTTON)\b|#import\b"
         self.assertIsNone(re.search(forbidden, self.source))
         self.assertEqual(re.findall(r"#include\s+([^\r\n]+)", self.source), [r"<Canvas\Canvas.mqh>"])
         self.assertIn("FILE_READ|FILE_BIN|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE", self.source)
-        self.assertNotIn("FILE_WRITE", self.source)
-        self.assertNotRegex(self.source, r"\b(?:FileWrite\w*|SymbolInfoSessionQuote|SymbolInfoSessionTrade)\s*\(")
-        self.assertEqual(self.source.count("FileOpen("), 2)
+        publisher = self.function_source("void PublishTradeSession()")
+        remainder = self.source.replace(publisher, "")
+        self.assertNotIn("FILE_WRITE", remainder)
+        self.assertNotRegex(remainder, r"\bFileWrite\w*\s*\(")
+        self.assertEqual(self.source.count("FileWriteArray("), 1)
+        self.assertIn("length>0 && length<=2048", publisher)
+        self.assertIn("AccountBindingMatches(fields[6],fields[7])", publisher)
+        self.assertIn("(long)now>=expires", publisher)
+        self.assertIn('string target="MT5Bot\\\\sessions_"+g_terminal_key+".csv"', publisher)
+        schedule = self.function_source("bool CurrentTradeSession(")
+        self.assertEqual(schedule.count("SymbolInfoSessionTrade("), 1)
+        self.assertNotIn("SymbolInfoSessionQuote(", self.source)
+        self.assertEqual(self.source.count("FileOpen("), 4)
         self.assertIn("g_panel.CreateBitmapLabel(", self.source)
         self.assertIn('ObjectSetString(0,name,OBJPROP_TOOLTIP,"\\n")', self.source)
         self.assertIn("EventSetTimer(1)", self.source)
@@ -85,9 +95,9 @@ class IndicatorContractTests(unittest.TestCase):
     def test_four_frame_panel_has_only_view_actions_and_visible_version(self):
         panel = self.source.split("bool DrawPanel(", 1)[1].split("void HandlePanelClick(", 1)[0]
         click = self.source.split("void HandlePanelClick(", 1)[1].split("void ClearLevels()", 1)[0]
-        self.assertIn('#property version   "2.16"', self.source)
-        self.assertIn('PanelText(168,20,"2.16"', panel)
-        self.assertIn('INDICATOR_SHORTNAME,"MT5 Bot Panel 2.16"', self.source)
+        self.assertIn('#property version   "2.17"', self.source)
+        self.assertIn('PanelText(168,20,"2.17"', panel)
+        self.assertIn('INDICATOR_SHORTNAME,"MT5 Bot Panel 2.17"', self.source)
         self.assertIn('"M30 / M15 / M5 / M1"', panel)
         self.assertIn('string readiness_frames[]={"M30","M15","M5","M1"}', panel)
         self.assertIn('string frames[]={"M1","M5","M15","M30"}', panel)
@@ -303,8 +313,8 @@ class IndicatorContractTests(unittest.TestCase):
             "entry": 4000.00, "entry_zone_low": 3999.00, "entry_zone_high": 4001.00,
             "stop": 3990.00, "target": 4020.00, "price_digits": 2, "execution": execution,
             "bar_time": "2026-10-05T16:21:00Z", "expires_at": "2026-10-05T16:22:10Z",
-            "strategy_id": "mtf-ema-pullback-60m-v6", "strategy_version": 6,
-            "policy_id": "mtf-manual-demo-cost-risk-v6", "horizon_seconds": 3600,
+            "strategy_id": "mtf-ema-pullback-60m-v8", "strategy_version": 8,
+            "policy_id": "mtf-manual-demo-cost-risk-v8", "horizon_seconds": 3600,
             "strategy_fingerprint": "a" * 64, "qualification_id": "b" * 64,
             "direction_bar_time": "2026-10-05T16:00:00Z",
             "confirmation_bar_time": "2026-10-05T16:15:00Z",

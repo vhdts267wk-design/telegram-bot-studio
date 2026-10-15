@@ -26,12 +26,14 @@ try:
     from bridge import mt5_trade_bridge as trade
     from bridge import mt5_manual_bridge as manual
     from bridge import mt5_chart_overlay as chart
+    from bridge import mt5_owned_exits as owned_exits
     from bridge.mt5_history_contract import closed_history_sha256
 except ModuleNotFoundError:
     import mt5_market_bridge as market
     import mt5_trade_bridge as trade
     import mt5_manual_bridge as manual
     import mt5_chart_overlay as chart
+    import mt5_owned_exits as owned_exits
     from mt5_history_contract import closed_history_sha256
 
 # Direct script starts put bridge/ on sys.path. The pure strategy modules are
@@ -215,10 +217,8 @@ def prepare_order(mt5, settings, ledger, offer, clock=trade.now_utc):
         raise trade.GuardError("The broker execution policy is unavailable.")
     if execution in (0, 1) or filling & 1:
         policy = mt5.ORDER_FILLING_FOK
-    elif filling & 2:
-        policy = mt5.ORDER_FILLING_IOC
     else:
-        raise trade.GuardError("No supported cancellable filling policy is available.")
+        raise trade.GuardError("Timed Demo entries require FOK; partial entry management is unsupported.")
     digest = hashlib.sha256(offer["id"].encode("ascii")).hexdigest()
     order = {"action": mt5.TRADE_ACTION_DEAL, "symbol": settings.market.symbol,
              "volume": float(trade.DEMO_VOLUME), "type": mt5.ORDER_TYPE_BUY if payload["direction"] == "BUY" else mt5.ORDER_TYPE_SELL,
@@ -265,8 +265,14 @@ def execute_offer(mt5, settings, ledger, offer, clock=trade.now_utc):
         if {k: v for k, v in prepared.request.items() if k not in ("price", "deviation")} != {k: v for k, v in final.request.items() if k not in ("price", "deviation")}:
             raise trade.GuardError("A fixed checked order field changed.")
         final_guard(mt5, settings, ledger, offer, final, clock)
+        exit_ledger = owned_exits.ExitLedger(ledger)
+        exit_ledger.stage(offer, final.request, clock())
+        # The synchronous durable intent write can consume the last part of
+        # the entry window. Recheck before the single broker submission.
+        final_guard(mt5, settings, ledger, offer, final, clock)
         sent = True
         response = mt5.order_send(final.request)  # One durable attempt; NEVER retry.
+        exit_ledger.entry_response(offer["id"], response)
         code, ticket = trade.safe_integer(getattr(response, "retcode", None)), trade.safe_integer(getattr(response, "order", None))
         result = {"status": "unknown", "code": code}
         if code == getattr(mt5, "TRADE_RETCODE_DONE", 10009):
@@ -274,9 +280,12 @@ def execute_offer(mt5, settings, ledger, offer, clock=trade.now_utc):
                 result = {"status": "filled", "code": code, "executed_at": trade.iso_date(clock())}
         elif code in trade.REJECTION_CODES:
             result = {"status": "failed", "code": code}
+            exit_ledger.entry_rejected(offer["id"])
         if ticket:
             result["order_ticket"] = ticket
     except Exception as error:
+        if not sent and "exit_ledger" in locals():
+            exit_ledger.entry_rejected(offer["id"])
         code = result.get("code", 0) if sent else (error.code if isinstance(error, trade.GuardError) else 0)
         result = {"status": "unknown" if sent else "failed", "code": trade.safe_integer(code)}
     ledger.complete(trade.uuid_text(offer["id"]), result)
@@ -286,7 +295,8 @@ def execute_offer(mt5, settings, ledger, offer, clock=trade.now_utc):
 
 def api_post(settings, route, payload):
     routes = {"market": "/api/market/feed", "register": "/api/mt5/register",
-              "poll": "/api/mt5/demo/poll", "result": "/api/mt5/demo/result", "chart": "/api/mt5/demo/chart"}
+              "poll": "/api/mt5/demo/poll", "result": "/api/mt5/demo/result", "chart": "/api/mt5/demo/chart",
+              "exit-result": "/api/mt5/demo/exit-result"}
     if route not in routes:
         raise trade.GuardError("Invalid Demo bridge route.")
     market.validate_feed_url(settings.market.url)
@@ -310,6 +320,13 @@ def api_post(settings, route, payload):
 
 def flush_results(settings, ledger, post=api_post):
     trade.flush_results(settings, ledger, post)
+
+
+def flush_exit_events(settings, ledger, post=api_post):
+    exits = owned_exits.ExitLedger(ledger)
+    for event in exits.pending_events():
+        post(settings, "exit-result", {"device_id": ledger.device_id, **event})
+        exits.acknowledge(event["event"]["event_id"])
 
 
 def refresh_chart(settings, device_id, exporter, feed, *, post=api_post, clock=trade.now_utc, fresh_feed=None):
@@ -358,15 +375,20 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
             raise trade.GuardError("The existing Demo terminal could not be connected.")
         initialized = True
         account = account_guard(mt5, settings, ledger, require_empty=False)
+        transport = post
+        def watched_post(settings, route, payload):
+            # Every potentially slow HTTP request first gives due local exits
+            # a chance to run. There is no HTTP recursion in process_exits.
+            owned_exits.process_exits(mt5, settings, ledger, account_guard, clock)
+            return transport(settings, route, payload)
+        post = watched_post
         info = mt5.terminal_info()
         factory = exporter_factory or chart.ChartExporter.from_terminal_info
         exporter = factory(info, settings.market, account)
         exporter.clear(clock())
         code, registration = trade.pairing_registration(settings, ledger)
-        registered = post(settings, "register", registration)
+        registered = None
         print("Demo approval helper ready. Only an explicit Telegram Accept can submit one Demo 0.01 order with fixed SL/TP.", flush=True)
-        if registered.get("paired") is not True:
-            print("In your private bot chat, send: /connect_mt5 " + code, flush=True)
         next_feed, latest_feed = 0.0, None
         network_retry_after = 0.0
         outage_reported = False
@@ -374,7 +396,19 @@ def run_bridge(mt5, settings, *, post=api_post, clock=trade.now_utc, sleep=time.
         while trade.terminal_is_running(settings.market.terminal):
             try:
                 account_guard(mt5, settings, ledger, require_empty=False)
+                # Local owned exits precede every HTTP call and never depend
+                # on candle capture or a working server connection.
+                owned_exits.process_exits(mt5, settings, ledger, account_guard, clock)
+                cycle_started = time.monotonic()
+                if registered is None:
+                    if cycle_started < network_retry_after:
+                        sleep(POLL_SECONDS)
+                        continue
+                    registered = post(settings, "register", registration)
+                    if registered.get("paired") is not True:
+                        print("In your private bot chat, send: /connect_mt5 " + code, flush=True)
                 flush_results(settings, ledger, post)
+                flush_exit_events(settings, ledger, post)
                 cycle_started = time.monotonic()
                 payload = capture_feed(mt5, settings, ledger, clock)
                 if latest_feed is not None:

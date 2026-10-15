@@ -122,7 +122,7 @@ class StrategyEvidenceTests(unittest.TestCase):
         self.assertEqual({item["timeframe"] for item in value["dataset"]["files"] if item["kind"] == "candles"},
                          {"M30", "M15", "M5", "M1"})
         self.assertTrue(self.assess(value).qualified)
-        for old_id in ("mtf-ema-pullback-60m-v2", "mtf-ema-pullback-60m-v4"):
+        for old_id in ("mtf-ema-pullback-60m-v2", "mtf-ema-pullback-60m-v4", "mtf-ema-pullback-60m-v6"):
             value = report()
             value["strategy"]["strategy_id"] = old_id
             self.assertFalse(self.assess(value).qualified)

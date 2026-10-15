@@ -324,7 +324,7 @@ def build_payload(mt5: Any, settings: Settings, now: datetime | None = None) -> 
     frames = {label: closed_candles(mt5, settings, label, seconds, now_seconds) for label, seconds in TIMEFRAMES.items()}
     risk = build_risk_context(mt5, settings, bid, ask, now)
     check_terminal(mt5, settings.terminal)
-    return {
+    payload = {
         "schema_version": 3, "as_of": now.isoformat().replace("+00:00", "Z"),
         "broker_utc_offset_minutes": settings.broker_utc_offset_minutes,
         "symbol": settings.symbol,
@@ -333,6 +333,14 @@ def build_payload(mt5: Any, settings: Settings, now: datetime | None = None) -> 
         "quote": {"bid": bid, "ask": ask, "time": utc_timestamp(quote_time)},
         "candles": frames["M15"], "timeframes": frames, "risk_context": risk,
     }
+    try:
+        from bridge.mt5_session_context import capture_session_context
+    except ModuleNotFoundError:
+        from mt5_session_context import capture_session_context
+    session = capture_session_context(mt5, settings, now)
+    if session is not None:
+        payload["session_context"] = session
+    return payload
 
 
 def post_payload(settings: Settings, payload: dict) -> None:

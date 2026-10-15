@@ -27,6 +27,7 @@ class DemoNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.offer["payload"]["closed_history_sha256"] = closed_history_sha256(self.snapshot["payload"])
         self.offer["expires_at"] = delivery.NOW + timedelta(seconds=10)
         self.query.data = f"mt5demo:a:{delivery.OFFER_ID.hex}"
+        self.start(patch.object(notifications.mt5_exit_events, "list_notifications", AsyncMock(return_value=[])))
 
     async def test_accept_queues_once_and_never_calls_execution_in_bot(self):
         await notifications.demo_decision_callback(self.update, self.context)

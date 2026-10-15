@@ -2,8 +2,9 @@
 
 from datetime import datetime, timedelta, timezone
 import math
+from zoneinfo import ZoneInfo
 
-from bot import mtf_runtime, multi_timeframe
+from bot import mtf_runtime, multi_timeframe, trade_timing
 
 REASONS = {
     "evidence_unavailable": "لم تثبت الأدلة خارج العينة شرط 70% و200 صفقة بعد التكاليف.",
@@ -17,6 +18,12 @@ REASONS = {
     "stale_m1_timing": "شمعة توقيت الدخول M1 قديمة.",
     "entry_window_expired": "انتهت نافذة الدخول: 10 ثوانٍ فقط بعد إغلاق شمعة M1؛ انتظر إشارة جديدة.",
     "outside_full_horizon_session": "الوقت خارج نافذة السيولة المحددة أو لا يتسع لمدة 60 دقيقة.",
+    "broker_session_unavailable": "جدول جلسة الوسيط غير موثّق؛ ننتظر تأكيده من MT5 قبل أي إشارة.",
+    "invalid_broker_session": "بيانات جلسة الوسيط أو خطة الوقت غير صالحة؛ الدخول موقوف.",
+    "stale_broker_session": "تحديث جدول جلسة الوسيط قديم؛ ننتظر تحديث MT5.",
+    "outside_broker_session": "جلسة تداول الوسيط مغلقة حالياً؛ ننتظر الجلسة التالية.",
+    "m30_level_blocks_target": "يوجد دعم أو مقاومة M30 بين الدخول والهدف الأول؛ ننتظر كسره وتأكيد فرصة جديدة.",
+    "m30_break_not_confirmed": "السعر تجاوز مستوى M30، بس شمعة M1 المكتملة بعد ما أكدت الكسر؛ ننتظر إغلاقاً واضحاً بعد المستوى.",
     "existing_exposure": "توجد صفقات أو أوامر معلّقة بالحساب.",
     "insufficient_free_margin": "الهامش المتاح لا يجتاز الحد المطلوب.",
     "flat_m15_trend": "تأكيد الاتجاه على M15 غير واضح.",
@@ -39,6 +46,7 @@ FRAME_ROLES = (("M30", 1800, "الاتجاه العام"),
                ("M15", 900, "تأكيد الاتجاه"), ("M5", 300, "إشارة الدخول"),
                ("M1", 60, "توقيت الدخول"))
 TREND_LABELS = {"BUY": "صاعد", "SELL": "هابط", "NEUTRAL": "محايد"}
+LEBANON_TIMEZONE = ZoneInfo("Asia/Beirut")
 
 
 def context_lines(result, digits=2):
@@ -73,9 +81,40 @@ def context_lines(result, digits=2):
 def _time(value):
     if isinstance(value, str):
         value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if not isinstance(value, datetime) or value.tzinfo is None:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("Aware timestamp required")
     return value.astimezone(timezone.utc)
+
+
+def lebanon_time(value):
+    """Display a dated local clock with the offset for that exact instant."""
+    local = _time(value).astimezone(LEBANON_TIMEZONE)
+    offset = local.strftime("%z")
+    return f"{local:%Y-%m-%d %H:%M:%S} بتوقيت لبنان (UTC{offset[:3]}:{offset[3:]})"
+
+
+def timing_lines(result, *, expires_at=None, demo_execution=False, include_entry=True):
+    """Present a validated frozen plan without implying a connected executor."""
+    timing = result.get("trade_timing") if type(result) is dict else None
+    if not trade_timing.validate_trade_timing(
+        timing, bar_time=result.get("bar_time") if type(result) is dict else None,
+        require_entry_open=False,
+    ):
+        return []
+    deadline = _time(timing["entry_deadline"])
+    if expires_at is not None:
+        deadline = min(deadline, _time(expires_at))
+    lines = [f"وقت إغلاق شمعة الإشارة: {lebanon_time(timing['signal_at'])}."]
+    if include_entry:
+        seconds = int((_time(timing["entry_deadline"]) - _time(timing["signal_at"])).total_seconds())
+        lines.append(f"مهلة الدخول: {seconds} ثانية من إغلاق M1؛ آخر وقت للدخول: {lebanon_time(deadline)}.")
+    lines.extend([
+        f"مدة الصفقة: حد أقصى 60 دقيقة من التنفيذ؛ آخر موعد مخطّط للخروج: {lebanon_time(timing['latest_exit_at'])}.",
+        f"حدّ الجلسة للخروج: {lebanon_time(timing['session_exit_at'])}؛ قبل إقفال الوسيط بـ15 دقيقة أو نهاية نافذة التحليل، أيهما أبكر.",
+        ("خروج آلي فقط مع جسر Demo المحدث والمتصل؛ انتظر تأكيد تفعيل حماية الخروج بعد التنفيذ."
+         if demo_execution else "الخروج يدوي: سكّر الصفقة قبل الموعد المحدّد إذا ما وصلت للوقف أو الهدف؛ التنبيه وحده ما بيسكّرها."),
+    ])
+    return lines
 
 
 def _experimental(result):
@@ -145,6 +184,7 @@ def format_proposal(result, *, symbol="XAUUSD", execution_enabled=False, manual_
             f"الدخول المقترح: {entry:.{digits}f}",
             f"منطقة الدخول: {low:.{digits}f} – {high:.{digits}f}",
             f"SL: {stop:.{digits}f} | TP1: {target:.{digits}f} | TP2: {target2:.{digits}f}",
+            *timing_lines(result, demo_execution=mtf_runtime.demo_orders_enabled()),
             f"العائد إلى المخاطرة: {result['nominal_reward_risk']:.2f}:1؛ بعد التكاليف المقدّرة {result['effective_reward_risk']:.2f}:1.",
             f"السبب: توافق M30 مع تأكيد M15، ارتداد M5 مؤكّد{' خلال آخر 3 شموع قبل شمعة التأكيد' if experimental else ''}، وكسر M1 بإغلاق متوافق، مع اجتياز فلاتر المخاطر والسبريد والنشاط؛ نافذة الدخول {window} من إغلاق M1.",
             f"الإلغاء: مرور {window} بعد إغلاق M1، انعكاس الاتجاه أو التأكيد، تدهور السبريد أو حداثة البيانات أو المخاطر، أو تجاوز انحراف السعر والسبريد معاً 0.1R. يبقى الوقف والهدف ثابتين.",
@@ -219,7 +259,7 @@ def format_analysis(feed, result, now, *, received_at=None, include_proposal=Tru
             else:
                 indicators[frame] = multi_timeframe._indicators(suffix)
                 trend = TREND_LABELS[multi_timeframe._trend(suffix, indicators[frame], strict=frame not in {"M1", "M5"})]
-                lines.append(f"{frame} — {role}: ميل {trend}؛ آخر إغلاق {_time(suffix[-1]['time']) + timedelta(seconds=seconds):%H:%M} UTC.")
+                lines.append(f"{frame} — {role}: ميل {trend}؛ آخر إغلاق {lebanon_time(_time(suffix[-1]['time']) + timedelta(seconds=seconds))}.")
         has_context = len(indicators) == len(FRAME_ROLES)
         if has_context:
             observed_context = multi_timeframe._timeframe_context(validated_frames, indicators, quote["bid"], quote["ask"])

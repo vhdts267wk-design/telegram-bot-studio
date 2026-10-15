@@ -27,8 +27,8 @@ def proposal():
         "stop": 2490.0, "target": 2520.0, "price_digits": 2,
         "execution": deepcopy(EXECUTION), "bar_time": (NOW - timedelta(minutes=1)).isoformat(),
         "expires_at": (NOW + timedelta(minutes=4)).isoformat(),
-        "strategy_id": "mtf-ema-pullback-60m-v6", "strategy_version": 6,
-        "policy_id": "mtf-manual-demo-cost-risk-v6", "horizon_seconds": 3600,
+        "strategy_id": "mtf-ema-pullback-60m-v8", "strategy_version": 8,
+        "policy_id": "mtf-manual-demo-cost-risk-v8", "horizon_seconds": 3600,
         "strategy_fingerprint": "a" * 64, "qualification_id": "b" * 64,
         "direction_bar_time": (NOW - timedelta(minutes=15)).isoformat(),
         "confirmation_bar_time": (NOW - timedelta(minutes=5)).isoformat(),
@@ -44,8 +44,8 @@ def proposal():
 def experimental_proposal():
     value = proposal()
     value.pop("qualification_id")
-    value.update(strategy_id="mtf-ema-pullback-60m-demo-v7", strategy_version=7,
-                 policy_id="mtf-manual-demo-estimated-cost-risk-v7", signal_mode="experimental_demo",
+    value.update(strategy_id="mtf-ema-pullback-60m-demo-v9", strategy_version=9,
+                 policy_id="mtf-manual-demo-estimated-cost-risk-v9", signal_mode="experimental_demo",
                  provisional=True, entry_window_seconds=30, expires_at=(NOW + timedelta(seconds=30)).isoformat(),
                  cost_assumptions={"verified": False, "method": "spread_tick_floor_v1", "commission_round_turn": 0.2,
                                    "slippage_price": 0.1, "spread_price": 0.2, "tick_size": 0.01})
@@ -146,7 +146,7 @@ class ValidationTests(unittest.TestCase):
         later = NOW + timedelta(seconds=20)
         self.assertTrue(self.validate(value, quote=dict(QUOTE, time=later.isoformat()), now=later).experimental)
         self.assertFalse(self.validate().experimental)
-        for field, changed in (("strategy_id", "mtf-ema-pullback-60m-v6"), ("provisional", False),
+        for field, changed in (("strategy_id", "mtf-ema-pullback-60m-v8"), ("provisional", False),
                                ("strategy_version", 1), ("entry_window_seconds", 10),
                                ("qualification_id", "b" * 64), ("cost_assumptions", None),
                                ("expires_at", (NOW + timedelta(seconds=31)).isoformat())):
@@ -232,6 +232,15 @@ class ValidationTests(unittest.TestCase):
             value.update(strategy_id="mtf-ema-pullback-60m-demo-v3" if experimental else "mtf-ema-pullback-60m-v2",
                          strategy_version=3 if experimental else 2,
                          policy_id="mtf-manual-demo-estimated-cost-risk-v3" if experimental else "mtf-manual-demo-cost-risk-v2")
+            with self.subTest(experimental=experimental), self.assertRaises(chart.OverlayError):
+                self.validate(value)
+
+    def test_untimed_m30_strategy_profiles_are_rejected_by_the_timed_helper(self):
+        for experimental in (False, True):
+            value = experimental_proposal() if experimental else proposal()
+            value.update(strategy_id="mtf-ema-pullback-60m-demo-v7" if experimental else "mtf-ema-pullback-60m-v6",
+                         strategy_version=7 if experimental else 6,
+                         policy_id="mtf-manual-demo-estimated-cost-risk-v7" if experimental else "mtf-manual-demo-cost-risk-v6")
             with self.subTest(experimental=experimental), self.assertRaises(chart.OverlayError):
                 self.validate(value)
 

@@ -179,7 +179,15 @@ def eligible_result(result, now=None):
             return False
         if not timeframe_context_valid(result):
             return False
+        from bot import trade_timing
+        if (not trade_timing.validate_trade_timing(result.get("trade_timing"), clock, result.get("bar_time"))
+                or result["trade_timing"]["evaluated_at"] != result.get("decision_time")
+                or result["trade_timing"]["latest_exit_at"] != result.get("deadline")):
+            return False
         experimental = is_experimental_result(result)
+        if multi_timeframe._utc(result["trade_timing"]["entry_deadline"]) != (
+                multi_timeframe._utc(result["bar_time"]) + timedelta(seconds=60 + entry_window_seconds(result))):
+            return False
         if experimental != (signal_mode() == multi_timeframe.EXPERIMENTAL_SIGNAL_MODE):
             return False
         if experimental:
@@ -232,6 +240,8 @@ def eligible_result(result, now=None):
         if low != expected_low or high != expected_high:
             return False
         if not (stop < low <= entry <= high < target <= target2 if result.get("direction") == "BUY" else target2 <= target < low <= entry <= high < stop if result.get("direction") == "SELL" else False):
+            return False
+        if multi_timeframe.target_crosses_m30_level(result["direction"], result["entry"], result["target"], result["timeframe_context"]):
             return False
         if experimental:
             return _experimental_costs_valid(result, risk, tick)
@@ -314,6 +324,9 @@ def eligible_payload(payload, feed, now=None):
         current = (multi_timeframe.analyze_multi_timeframe(prepared, clock, experimental_demo=True)
                    if experimental else multi_timeframe.analyze_multi_timeframe(prepared, clock))
         if current.get("state") != "signal" or current.get("direction") != payload.get("direction"):
+            return False
+        if any(current["trade_timing"].get(key) != payload["trade_timing"].get(key)
+               for key in current["trade_timing"] if key != "evaluated_at"):
             return False
         if any(current.get(key) != payload.get(key) for key in (
             "bar_time", "direction_bar_time", "confirmation_bar_time", "strategy_fingerprint", "broker_fingerprint", "execution",

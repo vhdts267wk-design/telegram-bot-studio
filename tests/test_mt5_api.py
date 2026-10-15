@@ -1,6 +1,8 @@
 """Legacy execution stays closed; manual registration remains private."""
 
 from contextlib import ExitStack
+from copy import deepcopy
+from datetime import timedelta
 import json
 import os
 from types import SimpleNamespace
@@ -11,7 +13,7 @@ from uuid import UUID
 from fastapi import FastAPI
 import httpx
 
-from bot import mt5_api, market_monitor as monitor
+from bot import mt5_api, market_monitor as monitor, multi_timeframe
 from bot.config import Settings
 from bot.panel.app import create_app
 from tests import test_multi_timeframe as candle_fixtures
@@ -143,3 +145,36 @@ class BridgeConfigurationTests(unittest.TestCase):
             malformed = feed(); malformed["execution"][field] = value
             with self.assertRaises(ValueError):
                 monitor.validate_feed(malformed, NOW)
+
+    def test_verified_broker_session_is_preserved_and_absence_keeps_feed_but_blocks_signal(self):
+        payload = feed()
+        clean = monitor.validate_feed(payload, NOW)
+        self.assertEqual(clean["session_context"], payload["session_context"])
+        self.assertEqual(multi_timeframe.analyze_multi_timeframe(clean, NOW)["state"], "signal")
+        del payload["session_context"]
+        clean = monitor.validate_feed(payload, NOW)
+        self.assertNotIn("session_context", clean)
+        result = multi_timeframe.analyze_multi_timeframe(clean, NOW)
+        self.assertEqual((result["state"], result["reason"]), ("blocked", "broker_session_unavailable"))
+        self.assertNotIn("entry", result)
+
+    def test_unverified_stale_future_or_malformed_broker_session_is_rejected(self):
+        base = feed()
+        mutations = (
+            {"verified": False}, {"verified": 1}, {"source": "guessed_broker_hours"},
+            {"as_of": (NOW - timedelta(seconds=30, microseconds=1)).isoformat()},
+            {"as_of": (NOW + timedelta(microseconds=1)).isoformat()},
+            {"session_close": base["session_context"]["session_open"]},
+            {"session_open": (NOW + timedelta(seconds=1)).isoformat()},
+            {"session_close": (NOW + timedelta(days=8)).isoformat()}, {"extra": True},
+        )
+        for mutation in mutations:
+            payload = deepcopy(base)
+            payload["session_context"].update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                monitor.validate_feed(payload, NOW)
+        for malformed in (None, [], {}):
+            payload = deepcopy(base)
+            payload["session_context"] = malformed
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                monitor.validate_feed(payload, NOW)
