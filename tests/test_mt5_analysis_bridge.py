@@ -72,6 +72,7 @@ class AnalysisBridgeTests(unittest.TestCase):
         self.assertEqual(payload["execution"], {"tick_size": 0.01, "point": 0.01, "digits": 2, "stops_level": 10})
         self.assertEqual(set(payload["timeframes"]), {"M30", "M15", "M5", "M1"})
         self.assertNotIn("device_id", payload)
+        self.assertIs(payload["analysis_only"], True)
         self.assertEqual(chart.feed_readiness(payload, symbol="XAUUSD", broker_offset_minutes=0,
                                               observed_at=self.now)[0], [64] * 4)
         self.assertEqual(self.exporter.publish.call_args.args, (None,))
@@ -96,6 +97,7 @@ class AnalysisBridgeTests(unittest.TestCase):
         self.assertEqual(self.run_once(), 0)
         payload = self.post.call_args.args[1]
         cleaned = validate_feed(payload, self.now, "XAUUSD")
+        self.assertIs(cleaned["analysis_only"], True)
         self.assertEqual(cleaned["execution"], payload["execution"])
         self.assertEqual({frame: len(rows) for frame, rows in cleaned["timeframes"].items()},
                          {frame: 64 for frame in market.TIMEFRAMES})

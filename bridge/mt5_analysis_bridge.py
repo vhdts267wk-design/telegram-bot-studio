@@ -96,6 +96,7 @@ def run_bridge(mt5, settings, *, once=False, post=None, clock=None,
                 account_binding(mt5, settings, binding)
                 payload = market.build_payload(mt5, settings, clock())
                 payload["execution"] = execution_metadata(mt5.symbol_info(settings.symbol))
+                payload["analysis_only"] = True
                 account_binding(mt5, settings, binding)
                 post(settings, payload)
                 # Network latency must not let an account switch renew its display.

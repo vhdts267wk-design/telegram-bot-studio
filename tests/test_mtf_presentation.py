@@ -82,6 +82,17 @@ class MtfPresentationTests(unittest.TestCase):
             self.assertEqual(result, original)
             self.assertNotIn("http", text)
 
+    def test_analysis_only_proposal_has_times_without_execution_instructions(self):
+        with fixtures.pinned_synthetic_evidence(self.feed, self.now), patch.dict(os.environ, {
+            "MT5_DEMO_ORDERS_ENABLED": "true", "MT5_MANUAL_TICKETS_ENABLED": "true", "MARKET_SOURCE": "mt5",
+        }):
+            result = self.qualified()
+            text = presentation.format_proposal(result, analysis_only=True)
+        for marker in ("بتوقيت لبنان", "آخر موعد مخطّط للخروج", "هذا الربط للتحليل", "تنبيه تحليل فقط"):
+            self.assertIn(marker, text)
+        for marker in ("Accept", "Decline", "Buy أو Sell بنفسك", "تأكيد تفعيل حماية"):
+            self.assertNotIn(marker, text)
+
     def test_expired_entry_window_explains_waiting_even_with_fresh_market_data(self):
         with fixtures.pinned_synthetic_evidence(self.feed, self.now):
             result = self.qualified()

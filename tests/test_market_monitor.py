@@ -59,6 +59,21 @@ def reference_samples(periods=20, *, sparse_last=False):
 
 
 class BrokerFeedTests(unittest.TestCase):
+    def test_analysis_only_marker_is_explicit_and_cannot_share_device_binding(self):
+        feed = broker_feed()
+        feed["analysis_only"] = True
+        self.assertIs(monitor.validate_feed(feed, NOW)["analysis_only"], True)
+        for value in (False, "true", 1, None, {}):
+            invalid = copy.deepcopy(feed); invalid["analysis_only"] = value
+            with self.subTest(marker=value), self.assertRaises(ValueError):
+                monitor.validate_feed(invalid, NOW)
+        for device in (str(UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")), None):
+            invalid = copy.deepcopy(feed); invalid["device_id"] = device
+            with self.subTest(device=device), self.assertRaises(ValueError):
+                monitor.validate_feed(invalid, NOW)
+        legacy = broker_feed()
+        self.assertNotIn("analysis_only", monitor.validate_feed(legacy, NOW))
+
     def test_valid_completed_broker_history_is_preserved_and_normalized(self):
         original = broker_feed()
         result = monitor.validate_feed(original, NOW)
@@ -421,7 +436,7 @@ class MarketServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.send_report(bot, 4401)
         bot.send_message.assert_not_awaited()
         self.service.market.assert_not_awaited()
-        cache.assert_not_awaited()
+        self.assertTrue(all(call.args[2] == "broker_feed" for call in cache.await_args_list))
         saved.assert_not_awaited()
 
     async def test_unwatch_while_signals_runs_prevents_queued_report(self):
@@ -731,6 +746,80 @@ class ManualReportDedupTests(unittest.IsolatedAsyncioTestCase):
         self.service.signals = AsyncMock(side_effect=AssertionError("Manual offer path owns signal delivery"))
         await self.service.send_report(self.bot, 4401, "synthetic-lease")
         self.service.signals.assert_not_awaited()
+        self.bot.send_message.assert_not_awaited()
+        self.assertNotIn("mtf_status:4401", self.cache)
+
+    async def test_explicit_analysis_feed_sends_one_plain_timed_alert_even_with_demo_enabled(self):
+        self.feed.pop("device_id")
+        self.feed["analysis_only"] = True
+        with patch.dict(monitor.os.environ, {"MT5_DEMO_ORDERS_ENABLED": "true"}):
+            await self.service.send_report(self.bot, 4401)
+            await self.service.send_report(self.bot, 4401)
+        self.bot.send_message.assert_awaited_once()
+        sent = self.bot.send_message.await_args
+        self.assertEqual(sent.args[0], 4401)
+        for marker in ("شراء BUY", "بتوقيت لبنان", "UTC+03:00", "آخر وقت للدخول", "60 دقيقة", "آخر موعد مخطّط للخروج",
+                       "هذا الربط للتحليل", "لا ينفّذ دخولاً أو خروجاً آلياً", "تنبيه تحليل فقط"):
+            self.assertIn(marker, sent.args[1])
+        for marker in ("Accept", "Decline", "Buy أو Sell بنفسك", "تأكيد تفعيل حماية"):
+            self.assertNotIn(marker, sent.args[1])
+        self.assertNotIn("reply_markup", sent.kwargs)
+        self.assertIn("mtf_status:4401", self.cache)
+        self.offer_read.assert_not_awaited()
+        self.device_read.assert_not_awaited()
+
+    async def test_unmarked_device_less_feed_does_not_bypass_durable_manual_delivery(self):
+        self.feed.pop("device_id")
+        self.service.signals = AsyncMock(side_effect=AssertionError("Missing explicit analysis mode"))
+        await self.service.send_report(self.bot, 4401)
+        self.service.signals.assert_not_awaited()
+        self.bot.send_message.assert_not_awaited()
+
+    async def test_explicit_analysis_feed_remains_read_only_with_manual_service_flag_off(self):
+        self.feed.pop("device_id")
+        self.feed["analysis_only"] = True
+        self.service.manual_tickets_enabled = False
+        with patch.dict(monitor.os.environ, {"MT5_DEMO_ORDERS_ENABLED": "true"}):
+            await self.service.send_report(self.bot, 4401)
+        self.bot.send_message.assert_awaited_once()
+        text = self.bot.send_message.await_args.args[1]
+        self.assertIn("تنبيه تحليل فقط", text)
+        self.assertIn("الخروج يدوي", text)
+        self.assertNotIn("Accept", text)
+        self.assertNotIn("reply_markup", self.bot.send_message.await_args.kwargs)
+
+    async def test_on_demand_analysis_signal_and_chart_keep_read_only_timing(self):
+        self.feed.pop("device_id")
+        self.feed["analysis_only"] = True
+        with patch.dict(monitor.os.environ, {"MT5_DEMO_ORDERS_ENABLED": "true"}):
+            result, text, identity = await self.service.signals()
+            chart = monitor.market_text(self.cache["broker_feed"], NOW, result=result, include_proposal=True)
+        self.assertEqual(result["state"], "signal", result)
+        self.assertIsNotNone(identity)
+        for displayed in (text, chart):
+            for marker in ("تنبيه تحليل فقط", "الخروج يدوي", "بتوقيت لبنان", "آخر وقت للدخول"):
+                self.assertIn(marker, displayed)
+            self.assertNotIn("Accept", displayed)
+            self.assertNotIn("Decline", displayed)
+
+    async def test_analysis_fallback_rechecks_marker_after_delivery_consent_await(self):
+        self.feed.pop("device_id")
+        self.feed["analysis_only"] = True
+        async def switch_to_owner_feed(*args):
+            self.feed.pop("analysis_only")
+            self.feed["device_id"] = str(self.device_id)
+            return True
+        with patch.object(monitor.market_store, "delivery_active", side_effect=switch_to_owner_feed) as active:
+            await self.service.send_report(self.bot, 4401, "synthetic-lease")
+        active.assert_awaited_once()
+        self.bot.send_message.assert_not_awaited()
+        self.assertNotIn("mtf_status:4401", self.cache)
+
+    async def test_explicit_analysis_feed_still_requires_current_risk_and_entry_window(self):
+        self.feed.pop("device_id")
+        self.feed["analysis_only"] = True
+        self.feed["risk_context"]["open_positions"] = 1
+        await self.service.send_report(self.bot, 4401)
         self.bot.send_message.assert_not_awaited()
         self.assertNotIn("mtf_status:4401", self.cache)
 

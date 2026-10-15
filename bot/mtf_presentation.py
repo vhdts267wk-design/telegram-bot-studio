@@ -93,7 +93,7 @@ def lebanon_time(value):
     return f"{local:%Y-%m-%d %H:%M:%S} بتوقيت لبنان (UTC{offset[:3]}:{offset[3:]})"
 
 
-def timing_lines(result, *, expires_at=None, demo_execution=False, include_entry=True):
+def timing_lines(result, *, expires_at=None, demo_execution=False, include_entry=True, analysis_only=False):
     """Present a validated frozen plan without implying a connected executor."""
     timing = result.get("trade_timing") if type(result) is dict else None
     if not trade_timing.validate_trade_timing(
@@ -111,7 +111,8 @@ def timing_lines(result, *, expires_at=None, demo_execution=False, include_entry
     lines.extend([
         f"مدة الصفقة: حد أقصى 60 دقيقة من التنفيذ؛ آخر موعد مخطّط للخروج: {lebanon_time(timing['latest_exit_at'])}.",
         f"حدّ الجلسة للخروج: {lebanon_time(timing['session_exit_at'])}؛ قبل إقفال الوسيط بـ15 دقيقة أو نهاية نافذة التحليل، أيهما أبكر.",
-        ("خروج آلي فقط مع جسر Demo المحدث والمتصل؛ انتظر تأكيد تفعيل حماية الخروج بعد التنفيذ."
+        ("خطة الوقت للمراجعة فقط؛ هذا الربط للتحليل ولا ينفّذ دخولاً أو خروجاً آلياً. الخروج يدوي لأي صفقة بتفتحها بنفسك."
+         if analysis_only else "خروج آلي فقط مع جسر Demo المحدث والمتصل؛ انتظر تأكيد تفعيل حماية الخروج بعد التنفيذ."
          if demo_execution else "الخروج يدوي: سكّر الصفقة قبل الموعد المحدّد إذا ما وصلت للوقف أو الهدف؛ التنبيه وحده ما بيسكّرها."),
     ])
     return lines
@@ -159,7 +160,7 @@ def status_text(result, *, include_context=True):
     return text
 
 
-def format_proposal(result, *, symbol="XAUUSD", execution_enabled=False, manual_ticket_enabled=False, include_context=True):
+def format_proposal(result, *, symbol="XAUUSD", execution_enabled=False, manual_ticket_enabled=False, include_context=True, analysis_only=False):
     if not mtf_runtime.eligible_result(result):
         if type(result) is dict and result.get("state") == "signal":
             result = _blocked_proposal(result)
@@ -184,7 +185,7 @@ def format_proposal(result, *, symbol="XAUUSD", execution_enabled=False, manual_
             f"الدخول المقترح: {entry:.{digits}f}",
             f"منطقة الدخول: {low:.{digits}f} – {high:.{digits}f}",
             f"SL: {stop:.{digits}f} | TP1: {target:.{digits}f} | TP2: {target2:.{digits}f}",
-            *timing_lines(result, demo_execution=mtf_runtime.demo_orders_enabled()),
+            *timing_lines(result, demo_execution=mtf_runtime.demo_orders_enabled(), analysis_only=analysis_only),
             f"العائد إلى المخاطرة: {result['nominal_reward_risk']:.2f}:1؛ بعد التكاليف المقدّرة {result['effective_reward_risk']:.2f}:1.",
             f"السبب: توافق M30 مع تأكيد M15، ارتداد M5 مؤكّد{' خلال آخر 3 شموع قبل شمعة التأكيد' if experimental else ''}، وكسر M1 بإغلاق متوافق، مع اجتياز فلاتر المخاطر والسبريد والنشاط؛ نافذة الدخول {window} من إغلاق M1.",
             f"الإلغاء: مرور {window} بعد إغلاق M1، انعكاس الاتجاه أو التأكيد، تدهور السبريد أو حداثة البيانات أو المخاطر، أو تجاوز انحراف السعر والسبريد معاً 0.1R. يبقى الوقف والهدف ثابتين.",
@@ -204,7 +205,8 @@ def format_proposal(result, *, symbol="XAUUSD", execution_enabled=False, manual_
             for metric in result.get("evidence_metrics", []):
                 lines.append(f"اختبار خارج العينة ({metric['scenario']}): {metric['wins']}/{metric['trades']} نجاح؛ النسبة الملاحظة {metric['win_rate']:.1%}، الحد الأدنى لفاصل الثقة 95%: {metric['lower_95']:.1%}.")
         lines.extend([
-            (f"Accept / Decline في إشعار الفرصة: Accept يطلب محاولة واحدة لفتح صفقة Demo بحجم 0.01 مع SL وTP1 خلال {window} من إغلاق M1؛ TP2 مرجع فقط. انتظر تأكيد MT5، ولا تُعاد محاولة التنفيذ تلقائياً."
+            ("تنبيه تحليل فقط، من دون أزرار موافقة أو طلب تجهيز أو تنفيذ صفقة. راجع الأوقات والمستويات؛ انتهاء مهلة الدخول يلغي هذه الفرصة."
+             if analysis_only else f"Accept / Decline في إشعار الفرصة: Accept يطلب محاولة واحدة لفتح صفقة Demo بحجم 0.01 مع SL وTP1 خلال {window} من إغلاق M1؛ TP2 مرجع فقط. انتظر تأكيد MT5، ولا تُعاد محاولة التنفيذ تلقائياً."
              if mtf_runtime.demo_orders_enabled() else
              f"التنفيذ بموافقتك اليدوية لكل صفقة: وافق على التجهيز خلال {window} من إغلاق M1؛ تراجع نافذة MT5 وتضغط Buy أو Sell بنفسك. إن فاتت النافذة انتظر إشارة جديدة."),
             "الأداء غير مثبت؛ اجتياز الشروط لا يثبت احتمال نجاح هذه الصفقة ولا يضمن الربح." if experimental else "النتيجة تقدير تاريخي مشروط بنموذج التنفيذ والتكاليف؛ ليست احتمالاً مثبتاً لهذه الصفقة أو ضماناً للربح.",
@@ -271,7 +273,8 @@ def format_analysis(feed, result, now, *, received_at=None, include_proposal=Tru
         if not qualified and result.get("state") == "signal":
             displayed = _blocked_proposal(result, clock)
         reference = "توجد إشارة Demo تجريبية — الأداء غير مثبت؛ التكاليف تقديرية، وتفاصيلها عبر /signals." if _experimental(result) else "توجد إشارة اجتازت بوابة الأدلة؛ تفاصيلها عبر /signals."
-        lines.append(format_proposal(displayed, symbol=feed.get("symbol", "XAUUSD"), include_context=not has_context) if include_proposal else reference if qualified else status_text(displayed, include_context=not has_context))
+        analysis_only = feed.get("analysis_only") is True and "device_id" not in feed
+        lines.append(format_proposal(displayed, symbol=feed.get("symbol", "XAUUSD"), include_context=not has_context, analysis_only=analysis_only) if include_proposal else reference if qualified else status_text(displayed, include_context=not has_context))
     except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
         lines.append(status_text(_status_context(result, {"state": "invalid"})))
     return "\n".join(lines)

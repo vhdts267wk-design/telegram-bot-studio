@@ -59,8 +59,10 @@ def _number(value):
 def validate_feed(payload, now, expected_symbol=None):
     """Validate broker data; legacy M15 alone never qualifies a new proposal."""
     required = {"symbol", "timeframe", "source", "quote", "candles"}
-    if not isinstance(payload, dict) or not required <= set(payload) or not set(payload) <= required | {"device_id", "execution", "schema_version", "timeframes", "risk_context", "as_of", "broker_utc_offset_minutes", "session_context"}:
+    if not isinstance(payload, dict) or not required <= set(payload) or not set(payload) <= required | {"device_id", "execution", "schema_version", "timeframes", "risk_context", "as_of", "broker_utc_offset_minutes", "session_context", "analysis_only"}:
         raise ValueError("Invalid feed")
+    if "analysis_only" in payload and (payload["analysis_only"] is not True or "device_id" in payload):
+        raise ValueError("Analysis-only feeds cannot claim an execution device")
     device_id = payload.get("device_id")
     if "device_id" in payload and (type(device_id) is not str or str(UUID(device_id)) != device_id):
         raise ValueError("Invalid market device")
@@ -119,6 +121,8 @@ def validate_feed(payload, now, expected_symbol=None):
     }
     if device_id is not None:
         cleaned["device_id"] = device_id
+    if payload.get("analysis_only") is True:
+        cleaned["analysis_only"] = True
     if "execution" in payload:
         execution = payload["execution"]
         if type(execution) is not dict or set(execution) != {"tick_size", "point", "digits", "stops_level"}:
@@ -201,6 +205,10 @@ def _mt5_identity(payload):
     if payload.get("device_id") is not None:
         identity += ":" + str(UUID(payload["device_id"]))
     return identity
+
+
+def _analysis_only_feed(payload):
+    return isinstance(payload, dict) and payload.get("analysis_only") is True and "device_id" not in payload
 
 
 def _stamp(value):
@@ -453,6 +461,7 @@ class MarketService:
                 result, symbol=source.removeprefix("MetaTrader 5 — "),
                 execution_enabled=self.trading_enabled,
                 manual_ticket_enabled=self.manual_tickets_enabled,
+                analysis_only=_analysis_only_feed(snapshot.get("payload") if isinstance(snapshot, dict) else None),
             )
         else:
             text = paper_signals.format_paper_signal(result, source=source)
@@ -599,11 +608,16 @@ class MarketService:
                 self.pool, self.bot_id, chat_id, lease_id, utc_now()
             )
         if self.source == "mt5":
+            initial = await market_store.get_cache(self.pool, self.bot_id, "broker_feed")
+            raw = initial.get("payload") if isinstance(initial, dict) else None
+            analysis_only = _analysis_only_feed(raw)
             if self.manual_tickets_enabled:
                 # The durable, owner-bound offer path sends the proposal with
                 # its preparation/approval buttons and exposes it to MT5.
-                # Never bypass its publication retries with a plain alert.
-                return
+                # A separate, explicit analysis-only feed has no execution
+                # device, so it may publish a plain observation instead.
+                if not analysis_only:
+                    return
             result, signal_text, signal_id = await self.signals()
             if result.get("state") != "signal" or not signal_id or await self.risk_pause(chat_id) is not None:
                 return
@@ -611,15 +625,18 @@ class MarketService:
             previous = await market_store.get_cache(self.pool, self.bot_id, delivery_key)
             if previous is not None and previous["payload"].get("token") == signal_id:
                 return
-            current = await market_store.get_cache(self.pool, self.bot_id, "broker_feed")
             if not await may_send():
+                return
+            current = await market_store.get_cache(self.pool, self.bot_id, "broker_feed")
+            raw = current.get("payload") if isinstance(current, dict) else None
+            if analysis_only and not _analysis_only_feed(raw):
                 return
             # Recheck after storage/consent awaits. Never deliver stale text or
             # let a legacy signal supplied by a caller bypass qualification.
             candidate = dict(result, workflow="manual_ticket")
             if current is None or not mtf_runtime.eligible_payload(candidate, current.get("payload"), utc_now()):
                 return
-            signal_text = chart_analysis.format_chart_proposal(result)
+            signal_text = chart_analysis.format_chart_proposal(result, analysis_only=_analysis_only_feed(raw))
             await bot.send_message(chat_id, signal_text, parse_mode=None)
             await market_store.save_cache(self.pool, self.bot_id, delivery_key, {"token": signal_id}, utc_now())
             return

@@ -32,6 +32,14 @@ implemented only in the explicitly enabled, updated Demo execution helper,
 following an owner-approved entry. New strategy profiles are incompatible with
 older helpers that do not manage timed exits.
 
+The analysis helper explicitly marks its authenticated snapshots
+`analysis_only: true` and supplies no execution device ID. Active subscribers
+can receive plain opportunity alerts with the same Lebanon timing even when
+the separate owner-approval workflow is enabled. These observations contain no
+execution buttons or automatic-close claims. Delivery rechecks the current feed
+after consent/storage awaits; a switch to an execution-device feed suppresses
+the plain fallback and leaves its durable approval path in control.
+
 For future Demo fills, a durable intent is saved before the one FOK entry
 attempt. The exit engine identifies the exact owned position through its
 account binding, order/deal identifiers, symbol, direction, volume, comment and
